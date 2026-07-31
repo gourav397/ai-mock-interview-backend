@@ -1,62 +1,36 @@
-const nodemailer = require("nodemailer");
+const { Resend } = require("resend");
+
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 const sendOTP = async (email, otp) => {
+  try {
+    console.log("📨 Sending OTP...");
+    console.log("Receiver:", email);
+    console.log("OTP:", otp);
 
-    try {
+    const { error } = await resend.emails.send({
+      from: "onboarding@resend.dev",
+      to: email,
+      subject: "AI Mock Interview OTP",
+      html: `
+        <h2>Your OTP is:</h2>
+        <h1>${otp}</h1>
+        <p>This OTP is valid for 5 minutes.</p>
+      `,
+    });
 
-        console.log("📨 Sending OTP...");
-        console.log("Receiver:", email);
-        console.log("OTP:", otp);
-
-
-        const transporter = nodemailer.createTransport({
-
-            host: "smtp.gmail.com",
-
-            port: 587,
-
-            secure: false,
-
-            requireTLS: true,
-
-            auth: {
-                user: process.env.EMAIL_USER,
-                pass: process.env.EMAIL_PASS
-            },
-
-            family: 4
-
-        });
-
-
-
-        await transporter.sendMail({
-
-            from: process.env.EMAIL_USER,
-
-            to: email,
-
-            subject: "AI Mock Interview OTP Verification",
-
-            text: `Your OTP is ${otp}. Valid for 5 minutes.`
-
-        });
-
-
-        console.log("✅ EMAIL SENT");
-
-
-    }
-    catch(error){
-
-        console.log("❌ EMAIL FAILED");
-        console.log(error.message);
-
-        throw error;
-
+    if (error) {
+      console.log("❌ EMAIL FAILED");
+      console.log(error);
+      throw new Error(error.message);
     }
 
+    console.log("✅ EMAIL SENT");
+  } catch (err) {
+    console.log("❌ EMAIL FAILED");
+    console.log(err.message);
+    throw err;
+  }
 };
-
 
 module.exports = sendOTP;
