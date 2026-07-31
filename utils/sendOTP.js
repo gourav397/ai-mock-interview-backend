@@ -1,8 +1,8 @@
 const nodemailer = require("nodemailer");
 
-const sendOTP = async(email, otp)=>{
+const sendOTP = async (email, otp) => {
 
-    try{
+    try {
 
         console.log("📨 Sending OTP...");
         console.log("Receiver:", email);
@@ -11,16 +11,20 @@ const sendOTP = async(email, otp)=>{
 
         const transporter = nodemailer.createTransport({
 
-            service:"gmail",
+            host: "smtp.gmail.com",
 
-            auth:{
-                user:process.env.EMAIL_USER,
-                pass:process.env.EMAIL_PASS
+            port: 587,
+
+            secure: false,
+
+            requireTLS: true,
+
+            auth: {
+                user: process.env.EMAIL_USER,
+                pass: process.env.EMAIL_PASS
             },
 
-            tls:{
-                rejectUnauthorized:false
-            }
+            family: 4
 
         });
 
@@ -28,22 +32,18 @@ const sendOTP = async(email, otp)=>{
 
         await transporter.sendMail({
 
-            from:process.env.EMAIL_USER,
+            from: process.env.EMAIL_USER,
 
-            to:email,
+            to: email,
 
-            subject:"AI Mock Interview - Email Verification OTP",
+            subject: "AI Mock Interview OTP Verification",
 
-            text:`Your OTP is ${otp}. It is valid for 5 minutes.`
+            text: `Your OTP is ${otp}. Valid for 5 minutes.`
 
         });
 
 
-
         console.log("✅ EMAIL SENT");
-
-
-        return true;
 
 
     }
