@@ -1,95 +1,62 @@
 const nodemailer = require("nodemailer");
 
+const sendOTP = async(email, otp)=>{
 
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false,
+    try{
 
-  family: 4,
+        console.log("📨 Sending OTP...");
+        console.log("Receiver:", email);
+        console.log("OTP:", otp);
 
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  }
-});
 
-  service:"gmail",
+        const transporter = nodemailer.createTransport({
 
-  auth:{
+            service:"gmail",
 
-    user:process.env.EMAIL_USER,
+            auth:{
+                user:process.env.EMAIL_USER,
+                pass:process.env.EMAIL_PASS
+            },
 
-    pass:process.env.EMAIL_PASS
+            tls:{
+                rejectUnauthorized:false
+            }
 
-  }
-
-});
+        });
 
 
 
-const sendOTP = async(email,otp)=>{
+        await transporter.sendMail({
 
-try{
+            from:process.env.EMAIL_USER,
 
+            to:email,
 
-console.log("📨 Sending OTP...");
-console.log("Receiver:",email);
-console.log("OTP:",otp);
+            subject:"AI Mock Interview - Email Verification OTP",
 
+            text:`Your OTP is ${otp}. It is valid for 5 minutes.`
 
-
-const info = await transporter.sendMail({
-
-from:`"AI Mock Interview" <${process.env.EMAIL_USER}>`,
-
-to:email,
-
-subject:"AI Mock Interview OTP Verification",
-
-html:`
-
-<h2>Email Verification</h2>
-
-<p>Your OTP is:</p>
-
-<h1>${otp}</h1>
-
-<p>Valid for 5 minutes</p>
-
-`
-
-});
+        });
 
 
 
-console.log("✅ EMAIL SENT");
-
-console.log(info.response);
+        console.log("✅ EMAIL SENT");
 
 
-
-return true;
-
+        return true;
 
 
-}
-catch(error){
+    }
+    catch(error){
 
+        console.log("❌ EMAIL FAILED");
+        console.log(error.message);
 
-console.log("❌ EMAIL FAILED");
+        throw error;
 
-console.log(error.message);
-
-
-throw error;
-
-
-}
-
+    }
 
 };
-
 
 
 module.exports = sendOTP;
