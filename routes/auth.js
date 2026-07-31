@@ -6,68 +6,98 @@ const User = require("../models/User");
 
 const router = express.Router();
 
+const otpGenerator = require("otp-generator");
+const sendOTP = require("../utils/sendOTP");
+
 
 const JWT_SECRET = "secretkey";
 
 
-// =====================
-// SIGNUP
-// =====================
+// ==========================
+// SEND OTP
+// ==========================
 
-router.post("/signup", async (req, res) => {
+router.post("/send-otp", async (req, res) => {
+
+console.log("🔥 SEND OTP HIT");
+console.log(req.body);
 
   try {
 
-    const {
-      name,
-      email,
-      password
-    } = req.body;
+    const { email } = req.body;
+
+    if(!email){
+      return res.status(400).json({
+        message:"Email required"
+      });
+    }
+
+
+    const cleanEmail = email.trim().toLowerCase();
 
 
     const existingUser = await User.findOne({
-      email: email.trim()
+      email: cleanEmail,
+      isVerified:true
     });
 
 
-    if (existingUser) {
+    if(existingUser){
 
       return res.status(400).json({
-        message: "User already exists"
+        message:"Email already registered"
       });
 
     }
 
 
 
-    const hashedPassword = await bcrypt.hash(
-      password,
-      10
-    );
+    const otp = otpGenerator.generate(6,{
 
-
-
-    const user = new User({
-
-      name,
-
-      email: email.trim(),
-
-      password: hashedPassword,
-
-      role: "student"
+      upperCaseAlphabets:false,
+      lowerCaseAlphabets:false,
+      specialChars:false
 
     });
 
 
 
-    await user.save();
+    await User.findOneAndUpdate(
+
+      {
+        email:cleanEmail
+      },
+
+      {
+
+        email:cleanEmail,
+
+        otp,
+
+        otpExpiry:
+        Date.now() + 5 * 60 * 1000
+
+      },
+
+      {
+        upsert:true,
+        new:true
+      }
+
+    );
+
+
+
+    await sendOTP(
+      cleanEmail,
+      otp
+    );
 
 
 
     res.json({
 
-      message: "Account created successfully"
+      message:"OTP sent successfully"
 
     });
 
@@ -84,33 +114,36 @@ router.post("/signup", async (req, res) => {
 
   }
 
-
 });
 
 
 
 
 
-// =====================
-// LOGIN
-// =====================
+
+// ==========================
+// VERIFY OTP
+// ==========================
 
 
-router.post("/login", async(req,res)=>{
+router.post("/verify-otp", async(req,res)=>{
 
 
 try{
 
 
-const email = req.body.email.trim();
+const {
 
-const password = req.body.password;
+email,
+otp
+
+}=req.body;
 
 
 
 const user = await User.findOne({
 
-email
+email:email.trim().toLowerCase()
 
 });
 
@@ -130,7 +163,265 @@ message:"User not found"
 
 
 
-const isMatch = await bcrypt.compare(
+
+if(user.otp !== otp){
+
+
+return res.status(400).json({
+
+message:"Invalid OTP"
+
+});
+
+
+}
+
+
+
+
+
+if(user.otpExpiry < Date.now()){
+
+
+return res.status(400).json({
+
+message:"OTP expired"
+
+});
+
+
+}
+
+
+
+
+
+user.isVerified = true;
+
+user.otp = null;
+
+user.otpExpiry = null;
+
+
+await user.save();
+
+
+
+
+
+res.json({
+
+message:"Email verified successfully"
+
+});
+
+
+
+
+}
+catch(error){
+
+
+res.status(500).json({
+
+message:error.message
+
+});
+
+
+}
+
+
+
+});
+
+
+
+
+
+
+
+// ==========================
+// SIGNUP
+// ==========================
+
+
+router.post("/signup", async(req,res)=>{
+
+
+try{
+
+
+const {
+
+name,
+email,
+password
+
+
+}=req.body;
+
+
+
+const cleanEmail =
+email.trim().toLowerCase();
+
+
+
+
+const user = await User.findOne({
+
+email:cleanEmail
+
+});
+
+
+
+
+if(!user){
+
+
+return res.status(400).json({
+
+message:"Please verify email first"
+
+});
+
+
+}
+
+
+
+
+
+if(!user.isVerified){
+
+
+return res.status(400).json({
+
+message:"Email not verified"
+
+});
+
+
+}
+
+
+
+
+const hashedPassword =
+await bcrypt.hash(password,10);
+
+
+
+
+user.name=name;
+
+user.password=hashedPassword;
+
+user.role="student";
+
+
+await user.save();
+
+
+
+
+res.json({
+
+message:"Account created successfully"
+
+});
+
+
+
+}
+catch(error){
+
+
+res.status(500).json({
+
+message:error.message
+
+});
+
+
+}
+
+
+
+});
+
+
+
+
+
+
+
+
+// ==========================
+// LOGIN
+// ==========================
+
+
+router.post("/login",async(req,res)=>{
+
+
+try{
+
+
+const {
+
+email,
+password
+
+}=req.body;
+
+
+
+
+const user = await User.findOne({
+
+email:email.trim().toLowerCase()
+
+});
+
+
+
+
+
+if(!user){
+
+
+return res.status(400).json({
+
+message:"User not found"
+
+});
+
+
+}
+
+
+
+
+if(!user.isVerified){
+
+
+return res.status(400).json({
+
+message:"Please verify email first"
+
+});
+
+
+}
+
+
+
+
+const match =
+await bcrypt.compare(
 
 password,
 
@@ -140,7 +431,8 @@ user.password
 
 
 
-if(!isMatch){
+
+if(!match){
 
 
 return res.status(400).json({
@@ -151,6 +443,7 @@ message:"Invalid password"
 
 
 }
+
 
 
 
@@ -178,15 +471,16 @@ expiresIn:"7d"
 
 
 
+
 res.json({
 
 message:"Login successful",
-
 
 token,
 
 
 user:{
+
 
 id:user._id,
 
@@ -196,6 +490,7 @@ email:user.email,
 
 role:user.role
 
+
 }
 
 
@@ -203,8 +498,9 @@ role:user.role
 
 
 
-}
 
+
+}
 catch(error){
 
 
@@ -218,7 +514,9 @@ message:error.message
 }
 
 
+
 });
+
 
 
 
