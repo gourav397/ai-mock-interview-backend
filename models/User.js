@@ -1,78 +1,55 @@
 const mongoose = require("mongoose");
 
+const userSchema = new mongoose.Schema({
 
-const userSchema = new mongoose.Schema(
+    name:{
+        type:String,
+        required:false,
+        default:""
+    },
 
-{
-  name: {
+    email:{
+        type:String,
+        required:true,
+        unique:true,
+        lowercase:true,
+        trim:true
+    },
 
-    type: String,
-    required: true
+    password:{
+        type:String,
+        required:false,
+        default:""
+    },
 
-  },
+    otp:{
+        type:String,
+        default:null
+    },
 
+    otpExpiry:{
+        type:Date,
+        default:null
+    },
 
-  email: {
+    isVerified:{
+        type:Boolean,
+        default:false
+    },
 
-    type: String,
-    required: true,
-    unique: true,
-    lowercase: true,
-    trim: true
+    role:{
+        type:String,
+        default:"student"
+    },
 
-  },
+    isActive:{
+        type:Boolean,
+        default:true
+    }
 
-
-  password: {
-
-    type: String,
-    required: true
-
-  },
-
-  otp: {
-  type: String,
-  default: null
-},
-
-otpExpiry: {
-  type: Date,
-  default: null
-},
-
-isVerified: {
-  type: Boolean,
-  default: false
-},
-
-
-  role: {
-
-    type: String,
-    enum: ["student", "admin"],
-    default: "student"
-
-  },
+},{
+    timestamps:true
+});
 
 
-  isActive: {
-
-    type: Boolean,
-    default: true
-
-  },
-
-
-  createdAt: {
-
-    type: Date,
-    default: Date.now
-
-  }
-
-}
-
-);
-
-
-module.exports = mongoose.model("User", userSchema);
+module.exports = mongoose.model("User",userSchema);

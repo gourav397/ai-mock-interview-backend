@@ -1,3 +1,21 @@
+### SEND OTP
+POST http://localhost:5000/api/auth/send-otp
+Content-Type: application/json
+
+{
+  "email": "gourav@test.com"
+}
+
+### VERIFY OTP (OTP email se daalo)
+POST http://localhost:5000/api/auth/verify-otp
+Content-Type: application/json
+
+{
+  "email": "gourav@test.com",
+  "otp": "123456"
+}
+
+### SIGNUP
 POST http://localhost:5000/api/auth/signup
 Content-Type: application/json
 
@@ -7,8 +25,7 @@ Content-Type: application/json
   "password": "123456"
 }
 
-###
-
+### LOGIN
 POST http://localhost:5000/api/auth/login
 Content-Type: application/json
 
@@ -17,60 +34,6 @@ Content-Type: application/json
   "password": "123456"
 }
 
-###
-
+### GET PROFILE
 GET http://localhost:5000/api/user/profile
-Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjZhNWIyOTc2NTZlYTAwZGMwMWVjOWE5ZiIsImlhdCI6MTc4NDM2MTI3MywiZXhwIjoxNzg0OTY2MDczfQ.tllYzHoYIFdoPvMjoeuc1kH2pRsNnKZgVJMSJ8Xi0g0
-
-POST http://localhost:5000/api/auth/login
-Content-Type: application/json
-
-{
-  "email": "gourav@test.com",
-  "password": "123456"
-}
-
-
-POST http://localhost:5000/api/auth/login
-Content-Type: application/json
-
-{
-  "email": "gourav@test.com",
-  "password": "123456"
-}
-
-
-###
-
-POST http://localhost:5000/api/questions/upload
-Content-Type: application/json
-
-[
-  {
-    "exam":"HSSC CET",
-    "category":"Haryana GK",
-    "subject":"General Knowledge",
-    "topic":"Haryana Important Facts",
-    "difficulty":"Medium",
-    "question":"Haryana ka gathan kab hua?",
-    "options":[
-      {
-        "text":"1 November 1966",
-        "explanation":"Haryana Punjab se alag hokar 1 November 1966 ko bana."
-      },
-      {
-        "text":"15 August 1947",
-        "explanation":"Ye Bharat ki independence date hai."
-      },
-      {
-        "text":"26 January 1950",
-        "explanation":"Ye Constitution lagu hone ki date hai."
-      },
-      {
-        "text":"2 October 1950",
-        "explanation":"Ye Gandhi Jayanti hai."
-      }
-    ],
-    "correctAnswer":"1 November 1966"
-  }
-]
+Authorization: Bearer <YOUR_TOKEN_HERE>
