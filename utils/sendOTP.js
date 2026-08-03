@@ -3,21 +3,22 @@ const nodemailer = require("nodemailer");
 
 const transporter = nodemailer.createTransport({
 
-    host: "smtp.gmail.com",
+    host:"smtp.gmail.com",
 
-    port: 587,
+    port:587,
 
-    secure: false,
+    secure:false,
 
-    requireTLS: true,
+    requireTLS:true,
 
-    auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS
+    family:4,
+
+    auth:{
+        user:process.env.EMAIL_USER,
+        pass:process.env.EMAIL_PASS
     }
 
 });
-
 
 
 const sendOTP = async(email, otp)=>{
@@ -25,24 +26,22 @@ const sendOTP = async(email, otp)=>{
     try{
 
         console.log("📨 Sending OTP...");
-        console.log("Receiver:", email);
-        console.log("OTP:", otp);
+        console.log("Receiver:",email);
+        console.log("OTP:",otp);
 
-
-        await transporter.verify();
 
         await transporter.sendMail({
 
-            from: process.env.EMAIL_USER,
+            from:process.env.EMAIL_USER,
 
-            to: email,
+            to:email,
 
-            subject: "AI Mock Interview OTP",
+            subject:"AI Mock Interview OTP",
 
-            html: `
-                <h2>Your OTP is:</h2>
-                <h1>${otp}</h1>
-                <p>This OTP is valid for 5 minutes.</p>
+            html:`
+            <h2>Your OTP is:</h2>
+            <h1>${otp}</h1>
+            <p>This OTP is valid for 5 minutes.</p>
             `
 
         });
@@ -55,14 +54,13 @@ const sendOTP = async(email, otp)=>{
     catch(error){
 
         console.log("❌ EMAIL FAILED");
-        console.log(error.message);
+        console.log(error);
 
         throw error;
 
     }
 
 };
-
 
 
 module.exports = sendOTP;
