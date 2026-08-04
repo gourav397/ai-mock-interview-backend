@@ -3,6 +3,12 @@ const multer = require("multer");
 const path = require("path");
 const extractText = require("../utils/extractText");
 
+const Resume=require("../models/Resume");
+
+const {
+generateResumeQuestions
+}=require("../utils/aiGenerator");
+
 const router = express.Router();
 
 const storage = multer.diskStorage({
@@ -20,50 +26,92 @@ const upload = multer({
 });
 
 router.post(
-    "/resume",
-    upload.single("resume"),
-    async (req, res) => {
+"/resume",
+upload.single("resume"),
+async(req,res)=>{
 
-        try {
 
-            if (!req.file) {
+try{
 
-                return res.status(400).json({
-                    success: false,
-                    message: "No file uploaded"
-                });
 
-            }
+if(!req.file){
 
-            const extractedText =
-                await extractText(req.file.path);
+return res.status(400).json({
 
-            res.json({
+message:"No file uploaded"
 
-                success: true,
+});
 
-                filename: req.file.filename,
+}
 
-                extractedText
 
-            });
 
-        }
-        catch (err) {
+const extractedText =
+await extractText(req.file.path);
 
-            console.log(err);
 
-            res.status(500).json({
 
-                success: false,
-
-                message: err.message
-
-            });
-
-        }
-
-    }
+console.log(
+"RESUME TEXT:",
+extractedText.substring(0,200)
 );
+
+
+
+const questions =
+await generateResumeQuestions(
+extractedText,
+10
+);
+
+
+
+const resume =
+await Resume.create({
+
+filename:req.file.filename,
+
+text:extractedText,
+
+questions
+
+});
+
+
+
+
+res.json({
+
+success:true,
+
+message:"Resume analyzed",
+
+resumeId:resume._id,
+
+questions
+
+
+});
+
+
+
+}
+catch(err){
+
+
+console.log(err);
+
+
+res.status(500).json({
+
+message:err.message
+
+});
+
+
+}
+
+
+});
 
 module.exports = router;
