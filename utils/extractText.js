@@ -1,17 +1,15 @@
 const fs = require("fs");
 const pdfParse = require("pdf-parse");
-console.log("PDF PARSE TYPE =", typeof pdfParse);
-console.log(pdfParse);
 const mammoth = require("mammoth");
 const path = require("path");
 
 
-async function extractText(filePath){
+async function extractText(filePath) {
 
     const ext = path.extname(filePath).toLowerCase();
 
 
-    if(ext === ".pdf"){
+    if (ext === ".pdf") {
 
         const buffer = fs.readFileSync(filePath);
 
@@ -22,11 +20,10 @@ async function extractText(filePath){
     }
 
 
-
-    if(ext === ".docx"){
+    if (ext === ".docx") {
 
         const result = await mammoth.extractRawText({
-            path:filePath
+            path: filePath
         });
 
         return result.value;
@@ -34,8 +31,7 @@ async function extractText(filePath){
     }
 
 
-
-    if(ext === ".txt"){
+    if (ext === ".txt") {
 
         return fs.readFileSync(
             filePath,
