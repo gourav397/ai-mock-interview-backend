@@ -2,7 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const path = require("path");
-
+const uploadRoutes = require("./routes/upload");
 dotenv.config({
   path: "./.env"
 });
@@ -86,6 +86,7 @@ app.use("/api/ai-interview", aiInterviewRoutes);
 
 app.use("/api/results", resultRoutes);
 
+app.use("/api/upload", uploadRoutes);
 
 
 
