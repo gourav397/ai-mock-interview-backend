@@ -1,38 +1,41 @@
 const fs = require("fs");
-const pdf = require("pdf-parse");
+const pdfParse = require("pdf-parse");
+console.log("PDF PARSE TYPE =", typeof pdfParse);
+console.log(pdfParse);
 const mammoth = require("mammoth");
 const path = require("path");
 
-async function extractText(filePath) {
 
-    const ext =
-        path.extname(filePath).toLowerCase();
+async function extractText(filePath){
 
-    if (ext === ".pdf") {
+    const ext = path.extname(filePath).toLowerCase();
 
-        const data =
-            await pdf(
-                fs.readFileSync(filePath)
-            );
+
+    if(ext === ".pdf"){
+
+        const buffer = fs.readFileSync(filePath);
+
+        const data = await pdfParse(buffer);
 
         return data.text;
 
     }
 
-    if (ext === ".docx") {
 
-        const result =
-            await mammoth.extractRawText({
 
-                path: filePath
+    if(ext === ".docx"){
 
-            });
+        const result = await mammoth.extractRawText({
+            path:filePath
+        });
 
         return result.value;
 
     }
 
-    if (ext === ".txt") {
+
+
+    if(ext === ".txt"){
 
         return fs.readFileSync(
             filePath,
@@ -41,8 +44,10 @@ async function extractText(filePath) {
 
     }
 
-    throw new Error("Unsupported File");
+
+    throw new Error("Unsupported File Type");
 
 }
+
 
 module.exports = extractText;
