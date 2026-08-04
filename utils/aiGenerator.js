@@ -1,7 +1,7 @@
 require("dotenv").config();
 
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-2.5-flash"; // 404 aaye to "gemini-3-flash" try karo
+const MODEL = "gemini-2.0-flash"; // 404 aaye to "gemini-3-flash" try karo
 
 async function callGemini(prompt, timeoutMs = 90000) {
   if (!API_KEY) throw new Error("GEMINI_API_KEY missing in .env");
