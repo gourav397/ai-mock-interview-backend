@@ -4,7 +4,7 @@ const key = process.env.GEMINI_API_KEY;
 console.log("KEY:", key ? "✅ MILA -> " + key.slice(0, 8) + "..." : "❌ UNDEFINED");
 if (!key) process.exit(1);
 
-const MODEL = "gemini-2.0-flash";
+const MODEL = "gemini-3.5-flash";
 
 fetch(
   `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${key}`,

@@ -4,60 +4,103 @@ const API_KEY = process.env.GEMINI_API_KEY;
 const MODEL = "gemini-3.5-flash"; // 404 aaye to "gemini-3-flash" try karo
 
 async function callGemini(prompt, timeoutMs = 90000) {
-  if (!API_KEY) throw new Error("GEMINI_API_KEY missing in .env");
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+let attempts = 3;
 
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 8192 }
-        }),
-        signal: controller.signal
-      }
-    );
 
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`Gemini HTTP ${res.status}: ${body.slice(0, 600)}`);
-    }
+while(attempts--){
 
-    const data = await res.json();
-    const parts = data?.candidates?.[0]?.content?.parts || [];
-    const text = parts.map((p) => p.text || "").join("").trim();
+try{
 
-    if (!text) {
-      throw new Error(
-        "Gemini empty reply. finishReason: " +
-          (data?.candidates?.[0]?.finishReason || "?") +
-          " | blocked: " +
-          JSON.stringify(data?.promptFeedback || {})
-      );
-    }
-    return text;
-  } finally {
-    clearTimeout(timer);
-  }
+const res = await fetch(
+`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`,
+{
+method:"POST",
+
+headers:{
+"Content-Type":"application/json"
+},
+
+body:JSON.stringify({
+
+contents:[
+{
+parts:[
+{
+text:prompt
+}
+]
+}
+],
+
+generationConfig:{
+temperature:0.5,
+maxOutputTokens:4096
 }
 
-function parseJsonArray(text) {
-  if (!text) return null;
-  const start = text.indexOf("[");
-  const end = text.lastIndexOf("]");
-  if (start !== -1 && end > start) text = text.slice(start, end + 1);
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    console.error("❌ JSON PARSE FAIL:", e.message);
-    console.error("RAW TEXT:", text.slice(0, 800));
-    return null;
-  }
+}
+
+)
+}
+);
+
+
+if(res.status===503){
+
+console.log("Gemini busy retrying...");
+
+await new Promise(
+resolve=>setTimeout(resolve,5000)
+);
+
+continue;
+
+}
+
+
+if(!res.ok){
+
+const body = await res.text();
+
+throw new Error(
+`Gemini HTTP ${res.status}: ${body}`
+);
+
+}
+
+
+const data = await res.json();
+
+
+const text =
+data?.candidates?.[0]
+?.content
+?.parts
+?.map(p=>p.text || "")
+?.join("")
+?.trim();
+
+
+if(!text){
+
+throw new Error("Gemini empty response");
+
+}
+
+
+return text;
+
+
+}
+catch(err){
+
+if(attempts===0)
+throw err;
+
+}
+
+}
+
 }
 
 async function generateQuestions(category, difficulty = "Medium", count = 10) {
@@ -97,31 +140,58 @@ JSON FORMAT:
 }
 
 async function generateResumeQuestions(resumeText, count = 10) {
-  const prompt = `
+
+const prompt = `
 You are an AI technical interviewer.
 
 Analyze this resume:
 
 ${resumeText}
 
-Generate ${count} interview questions based on this resume.
+Generate ${count} interview questions.
 
 Rules:
-1. Questions must be related to candidate skills, projects and experience.
-2. Mix technical and HR questions.
-3. Return ONLY valid JSON array. No markdown.
+1. Questions must be based on resume.
+2. Mix technical and HR.
+3. Return ONLY JSON array.
+4. No markdown.
+5. Every item must be object.
 
-JSON FORMAT:
+Format:
+
 [
- { "question": "", "type": "technical" },
- { "question": "", "type": "hr" }
+ {
+  "question":"Explain your project?",
+  "type":"technical"
+ }
 ]
 `;
 
-  const text = await callGemini(prompt);
-  const arr = parseJsonArray(text);
-  if (!Array.isArray(arr)) throw new Error("Gemini ne valid JSON array nahi diya");
-  return arr;
+
+const text = await callGemini(prompt);
+
+
+const arr = parseJsonArray(text);
+
+
+if(!Array.isArray(arr)){
+throw new Error("Invalid Gemini Questions");
+}
+
+
+// IMPORTANT FIX
+return arr.map(q=>({
+
+question:
+typeof q === "string"
+? q
+: q.question,
+
+type:
+q.type || "technical"
+
+}));
+
 }
 
 module.exports = { generateQuestions, generateResumeQuestions };
