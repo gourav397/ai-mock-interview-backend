@@ -1,4 +1,13 @@
 require("dotenv").config();
+
+console.log(
+"AI KEY CHECK:",
+process.env.GEMINI_API_KEY
+? "FOUND"
+: "MISSING"
+);
+
+const API_KEY = process.env.GEMINI_API_KEY;
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");

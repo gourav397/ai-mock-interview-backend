@@ -58,11 +58,28 @@ extractedText.substring(0,200)
 
 
 
-const questions =
-await generateResumeQuestions(
+let questions=[];
+
+try{
+
+questions = await generateResumeQuestions(
 extractedText,
 10
 );
+
+}
+catch(err){
+
+console.log("AI QUESTION ERROR:",err.message);
+
+questions=[
+{
+question:"AI service temporarily unavailable",
+type:"system"
+}
+];
+
+}
 
 
 

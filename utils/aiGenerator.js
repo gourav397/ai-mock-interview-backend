@@ -1,106 +1,91 @@
 require("dotenv").config();
 
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-3.5-flash"; // 404 aaye to "gemini-3-flash" try karo
+// "latest" alias = hamesha current best model, future me 404 kabhi nahi aayega
+const MODEL = "gemini-flash-latest";
 
-async function callGemini(prompt, timeoutMs = 90000) {
-
-let attempts = 3;
-
-
-while(attempts--){
-
-try{
-
-const res = await fetch(
-`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`,
-{
-method:"POST",
-
-headers:{
-"Content-Type":"application/json"
-},
-
-body:JSON.stringify({
-
-contents:[
-{
-parts:[
-{
-text:prompt
-}
-]
-}
-],
-
-generationConfig:{
-temperature:0.5,
-maxOutputTokens:4096
+function parseJsonArray(text) {
+  if (!text) return null;
+  const start = text.indexOf("[");
+  const end = text.lastIndexOf("]");
+  if (start !== -1 && end > start) text = text.slice(start, end + 1);
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    console.error("❌ JSON PARSE FAIL:", e.message);
+    console.error("RAW:", text.slice(0, 300));
+    return null;
+  }
 }
 
-}
+async function callGemini(prompt, timeoutMs = 120000) {
+  if (!API_KEY) throw new Error("GEMINI_API_KEY missing in .env");
 
-)
-}
-);
+  // Resume text chhota karo — 8000 chars kaafi hain analysis ke liye
+  if (prompt.length > 10000) {
+    prompt = prompt.slice(0, 10000) + "\n...[text truncated]";
+  }
 
+  let lastError;
 
-if(res.status===503){
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-console.log("Gemini busy retrying...");
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.5, maxOutputTokens: 8192 }
+          }),
+          signal: controller.signal
+        }
+      );
 
-await new Promise(
-resolve=>setTimeout(resolve,5000)
-);
+      clearTimeout(timer);
 
-continue;
+      // 503 (busy) / 429 (rate limit) = transient → retry with wait
+      if (res.status === 503 || res.status === 429) {
+        const wait = 5000 * attempt; // 5s, 10s, 15s, 20s
+        console.log(`⚠️ Gemini ${res.status} — retry ${attempt}/4 in ${wait / 1000}s`);
+        await new Promise((r) => setTimeout(r, wait));
+        lastError = new Error(`Gemini HTTP ${res.status} (after ${attempt} retries)`);
+        continue;
+      }
 
-}
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`Gemini HTTP ${res.status}: ${body.slice(0, 500)}`);
+      }
 
+      const data = await res.json();
+      const text =
+        data?.candidates?.[0]?.content?.parts
+          ?.map((p) => p.text || "")
+          .join("")
+          .trim();
 
-if(!res.ok){
+      if (!text) {
+        throw new Error("Gemini empty response: " + (data?.candidates?.[0]?.finishReason || "?"));
+      }
+      return text;
+    } catch (err) {
+      lastError = err;
+      // Timeout pe bhi retry karo
+      if (err.name === "AbortError") {
+        console.log(`⏰ Timeout — retry ${attempt}/4...`);
+        await new Promise((r) => setTimeout(r, 5000));
+        continue;
+      }
+      throw err; // baaki errors (404/400) direct throw
+    }
+  }
 
-const body = await res.text();
-
-throw new Error(
-`Gemini HTTP ${res.status}: ${body}`
-);
-
-}
-
-
-const data = await res.json();
-
-
-const text =
-data?.candidates?.[0]
-?.content
-?.parts
-?.map(p=>p.text || "")
-?.join("")
-?.trim();
-
-
-if(!text){
-
-throw new Error("Gemini empty response");
-
-}
-
-
-return text;
-
-
-}
-catch(err){
-
-if(attempts===0)
-throw err;
-
-}
-
-}
-
+  throw lastError;
 }
 
 async function generateQuestions(category, difficulty = "Medium", count = 10) {
@@ -140,8 +125,7 @@ JSON FORMAT:
 }
 
 async function generateResumeQuestions(resumeText, count = 10) {
-
-const prompt = `
+  const prompt = `
 You are an AI technical interviewer.
 
 Analyze this resume:
@@ -153,45 +137,28 @@ Generate ${count} interview questions.
 Rules:
 1. Questions must be based on resume.
 2. Mix technical and HR.
-3. Return ONLY JSON array.
-4. No markdown.
-5. Every item must be object.
+3. Return ONLY valid JSON array. No markdown.
+4. Every item must be an object with "question" and "type".
 
 Format:
-
 [
- {
-  "question":"Explain your project?",
-  "type":"technical"
- }
+ { "question": "Explain your project?", "type": "technical" },
+ { "question": "Tell me about yourself?", "type": "hr" }
 ]
 `;
 
+  const text = await callGemini(prompt);
+  const arr = parseJsonArray(text);
 
-const text = await callGemini(prompt);
+  if (!Array.isArray(arr)) {
+    console.error("❌ INVALID QUESTIONS FROM GEMINI");
+    return []; // error na dikhe, bas khali array — upload hamesha complete hoga
+  }
 
-
-const arr = parseJsonArray(text);
-
-
-if(!Array.isArray(arr)){
-throw new Error("Invalid Gemini Questions");
-}
-
-
-// IMPORTANT FIX
-return arr.map(q=>({
-
-question:
-typeof q === "string"
-? q
-: q.question,
-
-type:
-q.type || "technical"
-
-}));
-
+  return arr.map((q) => ({
+    question: typeof q === "string" ? q : q.question || "Question?",
+    type: q.type || "technical"
+  }));
 }
 
 module.exports = { generateQuestions, generateResumeQuestions };
