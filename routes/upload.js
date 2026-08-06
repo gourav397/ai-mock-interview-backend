@@ -3,133 +3,78 @@ const multer = require("multer");
 const path = require("path");
 const extractText = require("../utils/extractText");
 
-const Resume=require("../models/Resume");
+const Resume = require("../models/Resume");
 
 const {
-generateResumeQuestions
-}=require("../utils/aiGenerator");
+  generateResumeQuestions
+} = require("../utils/aiGenerator");
 
 const router = express.Router();
 
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, "uploads/");
-    },
-
-    filename: (req, file, cb) => {
-        cb(null, Date.now() + path.extname(file.originalname));
-    }
+  destination: (req, file, cb) => {
+    cb(null, "uploads/");
+  },
+  filename: (req, file, cb) => {
+    cb(null, Date.now() + path.extname(file.originalname));
+  }
 });
 
 const upload = multer({
-    storage
+  storage
 });
 
-router.post(
-"/resume",
-upload.single("resume"),
-async(req,res)=>{
+router.post("/resume", upload.single("resume"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: "No file uploaded" });
+    }
 
+    const extractedText = await extractText(req.file.path);
+    console.log("RESUME TEXT:", extractedText.substring(0, 200));
 
-try{
+    let questions = [];
 
+    try {
+      questions = await generateResumeQuestions(extractedText, 10);
+    } catch (err) {
+      console.log("AI QUESTION ERROR:", err.message);
+      questions = [
+        {
+          question: "AI service temporarily unavailable",
+          type: "system"
+        }
+      ];
+    }
 
-if(!req.file){
+    // ✅ GUARD: Gemini se jo bhi aaye — hamesha saaf array of objects
+    // (galat/malformed data ho to bhi crash nahi hoga, save ho jayega)
+    const safeQuestions = Array.isArray(questions)
+      ? questions
+          .filter((q) => q && q.question)
+          .map((q) => ({
+            question: String(q.question),
+            type: q.type || "technical"
+          }))
+      : [];
 
-return res.status(400).json({
+    const resume = await Resume.create({
+      filename: req.file.filename,
+      text: extractedText,
+      questions: safeQuestions
+    });
 
-message:"No file uploaded"
-
-});
-
-}
-
-
-
-const extractedText =
-await extractText(req.file.path);
-
-
-
-console.log(
-"RESUME TEXT:",
-extractedText.substring(0,200)
-);
-
-
-
-let questions=[];
-
-try{
-
-questions = await generateResumeQuestions(
-extractedText,
-10
-);
-
-}
-catch(err){
-
-console.log("AI QUESTION ERROR:",err.message);
-
-questions=[
-{
-question:"AI service temporarily unavailable",
-type:"system"
-}
-];
-
-}
-
-
-
-const resume =
-await Resume.create({
-
-filename:req.file.filename,
-
-text:extractedText,
-
-questions
-
-});
-
-
-
-
-res.json({
-
-success:true,
-
-message:"Resume analyzed",
-
-resumeId:resume._id,
-
-questions,
-
-extractedText   
-
-});
-
-
-
-}
-catch(err){
-
-
-console.log(err);
-
-
-res.status(500).json({
-
-message:err.message
-
-});
-
-
-}
-
-
+    res.json({
+      success: true,
+      message: "Resume analyzed",
+      resumeId: resume._id,
+      questions: safeQuestions,
+      extractedText
+    });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ message: err.message });
+  }
 });
 
 module.exports = router;

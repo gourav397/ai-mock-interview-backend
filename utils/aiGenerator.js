@@ -1,27 +1,12 @@
 require("dotenv").config();
 
 const API_KEY = process.env.GEMINI_API_KEY;
-// "latest" alias = hamesha current best model, future me 404 kabhi nahi aayega
 const MODEL = "gemini-flash-latest";
 
-function parseJsonArray(text) {
-  if (!text) return null;
-  const start = text.indexOf("[");
-  const end = text.lastIndexOf("]");
-  if (start !== -1 && end > start) text = text.slice(start, end + 1);
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    console.error("❌ JSON PARSE FAIL:", e.message);
-    console.error("RAW:", text.slice(0, 300));
-    return null;
-  }
-}
-
+// Gemini se STRICT JSON mangwayega (valid JSON ke alawa kuch nahi dega)
 async function callGemini(prompt, timeoutMs = 120000) {
   if (!API_KEY) throw new Error("GEMINI_API_KEY missing in .env");
 
-  // Resume text chhota karo — 8000 chars kaafi hain analysis ke liye
   if (prompt.length > 10000) {
     prompt = prompt.slice(0, 10000) + "\n...[text truncated]";
   }
@@ -40,7 +25,11 @@ async function callGemini(prompt, timeoutMs = 120000) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.5, maxOutputTokens: 8192 }
+            generationConfig: {
+              temperature: 0.5,
+              maxOutputTokens: 8192,
+              responseMimeType: "application/json" // ⬅️ YAHI KEY FIX
+            }
           }),
           signal: controller.signal
         }
@@ -48,9 +37,8 @@ async function callGemini(prompt, timeoutMs = 120000) {
 
       clearTimeout(timer);
 
-      // 503 (busy) / 429 (rate limit) = transient → retry with wait
       if (res.status === 503 || res.status === 429) {
-        const wait = 5000 * attempt; // 5s, 10s, 15s, 20s
+        const wait = 5000 * attempt;
         console.log(`⚠️ Gemini ${res.status} — retry ${attempt}/4 in ${wait / 1000}s`);
         await new Promise((r) => setTimeout(r, wait));
         lastError = new Error(`Gemini HTTP ${res.status} (after ${attempt} retries)`);
@@ -75,17 +63,41 @@ async function callGemini(prompt, timeoutMs = 120000) {
       return text;
     } catch (err) {
       lastError = err;
-      // Timeout pe bhi retry karo
       if (err.name === "AbortError") {
         console.log(`⏰ Timeout — retry ${attempt}/4...`);
         await new Promise((r) => setTimeout(r, 5000));
         continue;
       }
-      throw err; // baaki errors (404/400) direct throw
+      throw err;
     }
   }
 
   throw lastError;
+}
+
+// Robust parser — valid JSON + Gemini ka JS-style dono handle karega
+function parseJsonArray(text) {
+  if (!text) return null;
+
+  let start = text.indexOf("[");
+  let end = text.lastIndexOf("]");
+  if (start === -1 || end <= start) return null;
+  text = text.slice(start, end + 1);
+
+  // 1) Pehle seedha JSON try karo
+  try { return JSON.parse(text); } catch (e) {}
+
+  // 2) Agar fail ho — JS-style fix karke dobara try (single quotes -> double, keys quote)
+  try {
+    const fixed = text
+      .replace(/:\s*'([^']*)'/g, ': "$1"')
+      .replace(/:\s*`([^`]*)`/g, ': "$1"')
+      .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:/g, '$1"$2":');
+    return JSON.parse(fixed);
+  } catch (e) {}
+
+  console.error("❌ JSON PARSE FAIL — raw text:", text.slice(0, 300));
+  return null;
 }
 
 async function generateQuestions(category, difficulty = "Medium", count = 10) {
@@ -152,7 +164,7 @@ Format:
 
   if (!Array.isArray(arr)) {
     console.error("❌ INVALID QUESTIONS FROM GEMINI");
-    return []; // error na dikhe, bas khali array — upload hamesha complete hoga
+    return [];
   }
 
   return arr.map((q) => ({
