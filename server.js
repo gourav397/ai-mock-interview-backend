@@ -10,6 +10,7 @@ process.env.GEMINI_API_KEY
 const API_KEY = process.env.GEMINI_API_KEY;
 const express = require("express");
 const cors = require("cors");
+
 const dotenv = require("dotenv");
 const path = require("path");
 const uploadRoutes = require("./routes/upload");
@@ -19,7 +20,6 @@ dotenv.config({
 
 const connectDB = require("./config/db");
 const bulkUploader = require("./utils/bulkUploader");
-
 // Routes
 const authRoutes = require("./routes/auth");
 const questionRoutes = require("./routes/questions");
