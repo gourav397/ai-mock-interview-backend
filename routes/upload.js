@@ -105,8 +105,9 @@ message:"Resume analyzed",
 
 resumeId:resume._id,
 
-questions
+questions,
 
+extractedText   
 
 });
 
