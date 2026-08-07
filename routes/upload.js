@@ -36,7 +36,7 @@ router.post("/resume", upload.single("resume"), async (req, res) => {
     let questions = [];
 
     try {
-      questions = await generateResumeQuestions(extractedText, 10);
+      questions = await generateResumeQuestions(extractedText, 50);
     } catch (err) {
       console.log("AI QUESTION ERROR:", err.message);
       questions = [
@@ -50,13 +50,29 @@ router.post("/resume", upload.single("resume"), async (req, res) => {
     // ✅ GUARD: Gemini se jo bhi aaye — hamesha saaf array of objects
     // (galat/malformed data ho to bhi crash nahi hoga, save ho jayega)
     const safeQuestions = Array.isArray(questions)
-      ? questions
-          .filter((q) => q && q.question)
-          .map((q) => ({
-            question: String(q.question),
-            type: q.type || "technical"
-          }))
-      : [];
+  ? questions
+      .filter((q) => q && q.question)
+      .map((q) => ({
+        question: String(q.question),
+
+        type: q.type || "technical",
+
+        difficulty: q.difficulty || "Medium",
+
+        topic: q.topic || "",
+
+        page: q.page || 1,
+
+        correctAnswer: q.correctAnswer || "",
+
+        options: Array.isArray(q.options)
+          ? q.options.map((op) => ({
+              text: op.text || "",
+              explanation: op.explanation || ""
+            }))
+          : []
+      }))
+  : [];
 
     const resume = await Resume.create({
       filename: req.file.filename,
