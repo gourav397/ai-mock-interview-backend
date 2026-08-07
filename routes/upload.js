@@ -53,25 +53,26 @@ router.post("/resume", upload.single("resume"), async (req, res) => {
   ? questions
       .filter((q) => q && q.question)
       .map((q) => ({
-        question: String(q.question),
+  question: String(q.question),
+  type: q.type || "technical",
 
-        type: q.type || "technical",
+  topic: q.topic || "",
 
-        difficulty: q.difficulty || "Medium",
+  page: q.page || 1,
 
-        topic: q.topic || "",
+  difficulty: q.difficulty || "Medium",
 
-        page: q.page || 1,
-
-        correctAnswer: q.correctAnswer || "",
-
-        options: Array.isArray(q.options)
-          ? q.options.map((op) => ({
-              text: op.text || "",
-              explanation: op.explanation || ""
-            }))
-          : []
+  options: Array.isArray(q.options)
+    ? q.options.map((op)=>({
+        text: op.text || "",
+        explanation: op.explanation || ""
       }))
+    : [],
+
+  correctAnswer: q.correctAnswer || ""
+}))
+    
+    
   : [];
 
     const resume = await Resume.create({
