@@ -136,41 +136,116 @@ JSON FORMAT:
   return arr.map((q) => ({ category, difficulty, ...q }));
 }
 
-async function generateResumeQuestions(resumeText, count = 10) {
-  const prompt = `
-You are an AI technical interviewer.
+async function generateResumeQuestions(resumeText, count = 50) {
 
-Analyze this resume:
+const prompt = `
+You are an expert AI mock interviewer.
+
+Analyze this PDF/resume content:
 
 ${resumeText}
 
-Generate ${count} interview questions.
+Generate maximum ${count} important interview questions.
 
 Rules:
-1. Questions must be based on resume.
-2. Mix technical and HR.
-3. Return ONLY valid JSON array. No markdown.
-4. Every item must be an object with "question" and "type".
 
-Format:
+1. Questions must be created ONLY from the given PDF content.
+2. Select important topics only.
+3. If PDF has many pages, cover main topics.
+4. Generate technical + HR questions.
+5. Every question MUST have exactly 4 options.
+6. Every option MUST have explanation.
+7. correctAnswer MUST exactly match one option text.
+8. Return ONLY JSON array.
+9. No markdown.
+10. No extra text.
+
+JSON FORMAT:
+
 [
- { "question": "Explain your project?", "type": "technical" },
- { "question": "Tell me about yourself?", "type": "hr" }
+{
+"question":"Question here",
+
+"type":"technical",
+
+"topic":"Topic name",
+
+"page":1,
+
+"options":[
+
+{
+"text":"Option 1",
+"explanation":"Explanation of option 1"
+},
+
+{
+"text":"Option 2",
+"explanation":"Explanation of option 2"
+},
+
+{
+"text":"Option 3",
+"explanation":"Explanation of option 3"
+},
+
+{
+"text":"Option 4",
+"explanation":"Explanation of option 4"
+}
+
+],
+
+"correctAnswer":"Option 1",
+
+"difficulty":"Medium"
+}
 ]
+
 `;
 
-  const text = await callGemini(prompt);
-  const arr = parseJsonArray(text);
+const text = await callGemini(prompt);
 
-  if (!Array.isArray(arr)) {
-    console.error("❌ INVALID QUESTIONS FROM GEMINI");
-    return [];
-  }
+const arr = parseJsonArray(text);
 
-  return arr.map((q) => ({
-    question: typeof q === "string" ? q : q.question || "Question?",
-    type: q.type || "technical"
-  }));
+
+if(!Array.isArray(arr)){
+
+console.log("❌ Gemini invalid resume questions");
+
+return [];
+
+}
+
+
+return arr.map(q => ({
+
+question: q.question || "Question",
+
+type: q.type || "technical",
+
+topic: q.topic || "",
+
+page: q.page || 1,
+
+difficulty: q.difficulty || "Medium",
+
+options: Array.isArray(q.options)
+?
+q.options.map(o=>({
+
+text:o.text || "",
+
+explanation:o.explanation || ""
+
+}))
+:
+[],
+
+correctAnswer:q.correctAnswer || ""
+
+}));
+
 }
 
 module.exports = { generateQuestions, generateResumeQuestions };
