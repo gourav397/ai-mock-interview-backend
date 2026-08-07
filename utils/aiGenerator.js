@@ -206,6 +206,9 @@ JSON FORMAT:
 
 const text = await callGemini(prompt);
 
+console.log("🔥 GEMINI RAW RESPONSE:");
+console.log(text.substring(0,2000));
+
 const arr = parseJsonArray(text);
 
 
