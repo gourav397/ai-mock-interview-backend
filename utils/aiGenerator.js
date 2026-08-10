@@ -27,7 +27,7 @@ async function callGemini(prompt, timeoutMs = 120000) {
             contents: [{ parts: [{ text: prompt }] }],
             generationConfig: {
               temperature: 0.5,
-              maxOutputTokens: 8192,
+              maxOutputTokens: 32768,
               responseMimeType: "application/json" // ⬅️ YAHI KEY FIX
             }
           }),
@@ -98,6 +98,75 @@ function parseJsonArray(text) {
 
   console.error("❌ JSON PARSE FAIL — raw text:", text.slice(0, 300));
   return null;
+}
+
+// ============ ROBUST NORMALIZATION ============
+
+// options ko hamesha [{ text, explanation }] mein convert karo
+function normalizeOptions(rawOptions) {
+  if (!rawOptions) return [];
+
+  // Agar options object hai jaise { A: "text", B: "text" } ya { 1: "...", 2: "..." }
+  if (!Array.isArray(rawOptions)) {
+    rawOptions = Object.values(rawOptions);
+  }
+
+  return rawOptions
+    .map((o) => {
+      // Option seedha string hai → text bana do
+      if (typeof o === "string") {
+        return { text: o.trim(), explanation: "" };
+      }
+      // Option object hai → koi bhi common key pakdo
+      if (o && typeof o === "object") {
+        const text = o.text || o.option || o.value || o.label || o.answer || "";
+        const explanation = o.explanation || o.reason || o.description || o.why || "";
+        return {
+          text: String(text).trim(),
+          explanation: String(explanation).trim()
+        };
+      }
+      return { text: String(o).trim(), explanation: "" };
+    })
+    .filter((o) => o.text !== ""); // khali options hatao
+}
+
+// correctAnswer agar "A"/"B"/"0"/"1" jaisa aaya to usko option ke text se match karo
+function normalizeCorrectAnswer(ca, options) {
+  if (typeof ca === "number") ca = String(ca);
+  ca = (ca || "").trim();
+
+  const letterIdx = ["A", "B", "C", "D"].indexOf(ca.toUpperCase());
+  if (letterIdx !== -1 && options[letterIdx]) return options[letterIdx].text;
+
+  if (/^[0-3]$/.test(ca) && options[parseInt(ca, 10)]) {
+    return options[parseInt(ca, 10)].text;
+  }
+
+  return ca;
+}
+
+// Har question ko saaf shape mein normalize karo
+function normalizeQuestion(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  if (!raw.question && !raw.Question && !raw.q) return null;
+
+  const options = normalizeOptions(
+    raw.options || raw.choices || raw.answers || raw.answerOptions
+  );
+
+  return {
+    question: String(raw.question || raw.Question || raw.q || ""),
+    type: raw.type || "technical",
+    topic: raw.topic || "",
+    page: raw.page || 1,
+    difficulty: raw.difficulty || "Medium",
+    options,
+    correctAnswer: normalizeCorrectAnswer(
+      raw.correctAnswer || raw.answer,
+      options
+    )
+  };
 }
 
 async function generateQuestions(category, difficulty = "Medium", count = 10) {
@@ -211,43 +280,13 @@ console.log(text.substring(0,2000));
 
 const arr = parseJsonArray(text);
 
-
-if(!Array.isArray(arr)){
-
-console.log("❌ Gemini invalid resume questions");
-
-return [];
-
+if (!Array.isArray(arr)) {
+  console.log("❌ Gemini invalid resume questions");
+  return [];
 }
 
-
-return arr.map(q => ({
-
-question: q.question || "Question",
-
-type: q.type || "technical",
-
-topic: q.topic || "",
-
-page: q.page || 1,
-
-difficulty: q.difficulty || "Medium",
-
-options: Array.isArray(q.options)
-?
-q.options.map(o=>({
-
-text:o.text || "",
-
-explanation:o.explanation || ""
-
-}))
-:
-[],
-
-correctAnswer:q.correctAnswer || ""
-
-}));
+// ✅ Ab kisi bhi format ke options/answers normal ho jayenge
+return arr.map(normalizeQuestion).filter(Boolean);
 
 }
 
