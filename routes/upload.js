@@ -75,6 +75,11 @@ router.post("/resume", upload.single("resume"), async (req, res) => {
     
   : [];
 
+  // 🔍 DEBUG — dekhna ki API kya return kar rahi hai
+    console.log("✅ TOTAL QUESTIONS:", safeQuestions.length);
+    console.log("✅ FIRST Q OPTIONS COUNT:", safeQuestions[0]?.options?.length || 0);
+    console.log("✅ FIRST OPTION SAMPLE:", JSON.stringify(safeQuestions[0]?.options?.[0] || null));
+
     const resume = await Resume.create({
       filename: req.file.filename,
       text: extractedText,

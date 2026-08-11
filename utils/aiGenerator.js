@@ -1,5 +1,5 @@
 require("dotenv").config();
-
+const MODEL = "gemini-3.5-flash";
 const API_KEY = process.env.GEMINI_API_KEY;
 const MODEL = "gemini-flash-latest";
 
@@ -206,88 +206,59 @@ JSON FORMAT:
 }
 
 async function generateResumeQuestions(resumeText, count = 50) {
+  const BATCH_SIZE = 8; // 8-10 questions per call — chhota JSON = valid JSON
+  const all = [];
+  const batches = Math.ceil(count / BATCH_SIZE);
 
-const prompt = `
+  for (let b = 1; b <= batches; b++) {
+    const prompt = `
 You are an expert AI mock interviewer.
-
-Analyze this PDF/resume content:
-
+Analyze this resume content:
 ${resumeText}
 
-Generate maximum ${count} important interview questions.
-
+Generate up to ${BATCH_SIZE} important interview questions (technical + HR).
 Rules:
-
-1. Questions must be created ONLY from the given PDF content.
-2. Select important topics only.
-3. If PDF has many pages, cover main topics.
-4. Generate technical + HR questions.
-5. Every question MUST have exactly 4 options.
-6. Every option MUST have explanation.
-7. correctAnswer MUST exactly match one option text.
-8. Return ONLY JSON array.
-9. No markdown.
-10. No extra text.
+1. Every question MUST have exactly 4 options.
+2. Every option MUST have an explanation.
+3. correctAnswer must exactly match one option text.
+4. Return ONLY valid JSON array. No markdown. No extra text.
 
 JSON FORMAT:
-
 [
-{
-"question":"Question here",
-
-"type":"technical",
-
-"topic":"Topic name",
-
-"page":1,
-
-"options":[
-
-{
-"text":"Option 1",
-"explanation":"Explanation of option 1"
-},
-
-{
-"text":"Option 2",
-"explanation":"Explanation of option 2"
-},
-
-{
-"text":"Option 3",
-"explanation":"Explanation of option 3"
-},
-
-{
-"text":"Option 4",
-"explanation":"Explanation of option 4"
-}
-
-],
-
-"correctAnswer":"Option 1",
-
-"difficulty":"Medium"
-}
+ {
+  "question": "Question here",
+  "type": "technical",
+  "topic": "Topic name",
+  "page": 1,
+  "options": [
+    { "text": "Option 1", "explanation": "Why this is correct/incorrect" },
+    { "text": "Option 2", "explanation": "..." },
+    { "text": "Option 3", "explanation": "..." },
+    { "text": "Option 4", "explanation": "..." }
+  ],
+  "correctAnswer": "Option 1",
+  "difficulty": "Medium"
+ }
 ]
-
 `;
 
-const text = await callGemini(prompt);
+    const text = await callGemini(prompt);
+    console.log(`🔥 BATCH ${b}/${batches} RAW:`);
+    console.log(text.substring(0, 1500));
 
-console.log("🔥 GEMINI RAW RESPONSE:");
-console.log(text.substring(0,2000));
+    const arr = parseJsonArray(text);
+    if (Array.isArray(arr)) {
+      all.push(...arr.map(normalizeQuestion).filter(Boolean));
+      console.log(`✅ Batch ${b}: ${arr.length} questions`);
+    } else {
+      console.log(`❌ Batch ${b}: invalid JSON, skipping`);
+    }
 
-const arr = parseJsonArray(text);
+    if (all.length >= count) break;
+  }
 
-if (!Array.isArray(arr)) {
-  console.log("❌ Gemini invalid resume questions");
-  return [];
-}
-
-// ✅ Ab kisi bhi format ke options/answers normal ho jayenge
-return arr.map(normalizeQuestion).filter(Boolean);
-
+  console.log(`✅ TOTAL QUESTIONS GENERATED: ${all.length}`);
+  return all.slice(0, count);
 }
 
 module.exports = { generateQuestions, generateResumeQuestions };
