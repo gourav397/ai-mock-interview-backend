@@ -1,17 +1,55 @@
 require("dotenv").config();
 
-const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-3.5-flash";
+const fs = require("fs");
+const path = require("path");
 
-// jsonrepair optional hai — installed ho to use hoga, warna fallback parser chalega
-let jsonrepair = null;
-try {
-  ({ jsonrepair } = require("jsonrepair"));
-} catch (e) {
-  console.log("⚠️ jsonrepair installed nahi hai — fallback parser chalega");
+const API_KEY = process.env.GEMINI_API_KEY;
+// SPEED TIP: lite model isse kaafi fast hai. 3.5-flash thinking model hai isliye slow hai.
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
+
+// ---------- CACHE SETUP (24 ghante tak same questions serve honge) ----------
+const CACHE_DIR = path.join(__dirname, "..", "cache");
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+function cacheFile(category, difficulty) {
+  const safe = category.replace(/[^a-zA-Z0-9_-]/g, "_");
+  return path.join(CACHE_DIR, `${safe}-${difficulty}.json`);
 }
 
-async function callGemini(prompt, timeoutMs = 120000) {
+function getCached(category, difficulty) {
+  try {
+    const file = cacheFile(category, difficulty);
+    if (!fs.existsSync(file)) return null;
+    const data = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!Array.isArray(data.questions) || !data.questions.length) return null;
+    if (Date.now() - data.createdAt > CACHE_TTL_MS) return null; // expired
+    return data.questions;
+  } catch {
+    return null;
+  }
+}
+
+function saveCache(category, difficulty, questions) {
+  try {
+    if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(
+      cacheFile(category, difficulty),
+      JSON.stringify({ createdAt: Date.now(), questions })
+    );
+  } catch (e) {
+    console.log("Cache save fail:", e.message);
+  }
+}
+
+function clearCache(category, difficulty) {
+  try {
+    const file = cacheFile(category, difficulty);
+    if (fs.existsSync(file)) fs.unlinkSync(file);
+  } catch {}
+}
+
+// ---------- GEMINI CALL (backoff + jitter + Retry-After) ----------
+async function callGemini(prompt, timeoutMs = 60000) {
   if (!API_KEY) throw new Error("GEMINI_API_KEY missing in .env");
 
   if (prompt.length > 10000) {
@@ -20,11 +58,11 @@ async function callGemini(prompt, timeoutMs = 120000) {
 
   let lastError;
 
-  for (let attempt = 1; attempt <= 4; attempt++) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+    try {
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`,
         {
@@ -34,7 +72,7 @@ async function callGemini(prompt, timeoutMs = 120000) {
             contents: [{ parts: [{ text: prompt }] }],
             generationConfig: {
               temperature: 0.5,
-              maxOutputTokens: 32768,
+              maxOutputTokens: 8192, // pehle 32768 tha — isi se speed aayi
               responseMimeType: "application/json"
             }
           }),
@@ -44,9 +82,11 @@ async function callGemini(prompt, timeoutMs = 120000) {
 
       clearTimeout(timer);
 
-      if (res.status === 503 || res.status === 429) {
-        const wait = 5000 * attempt;
-        console.log(`⚠️ Gemini ${res.status} — retry ${attempt}/4 in ${wait / 1000}s`);
+      if (res.status === 429 || res.status === 503) {
+        // Retry-After header ho to use karo, warna exponential backoff + jitter
+        const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
+        const wait = (retryAfter || 2000 * attempt) + Math.floor(Math.random() * 1500);
+        console.log(`Gemini ${res.status} — retry ${attempt}/5 in ${Math.round(wait / 1000)}s`);
         await new Promise((r) => setTimeout(r, wait));
         lastError = new Error(`Gemini HTTP ${res.status} (after ${attempt} retries)`);
         continue;
@@ -68,18 +108,25 @@ async function callGemini(prompt, timeoutMs = 120000) {
       }
       return text;
     } catch (err) {
+      clearTimeout(timer);
       lastError = err;
       if (err.name === "AbortError") {
-        console.log(`⏰ Timeout — retry ${attempt}/4...`);
-        await new Promise((r) => setTimeout(r, 5000));
+        console.log(`Timeout — retry ${attempt}/5...`);
+        await new Promise((r) => setTimeout(r, 4000));
         continue;
       }
-      throw err;
+      throw err; // 400/401 jaise client errors pe retry nahi karte
     }
   }
 
   throw lastError;
 }
+
+// ---------- JSON PARSING (tumhara existing code — same rakha) ----------
+let jsonrepair = null;
+try {
+  ({ jsonrepair } = require("jsonrepair"));
+} catch (e) {}
 
 function parseJsonArray(text) {
   if (!text) return null;
@@ -89,17 +136,12 @@ function parseJsonArray(text) {
   if (start === -1 || end <= start) return null;
   text = text.slice(start, end + 1);
 
-  // 1) Seedha JSON
   try { return JSON.parse(text); } catch (e) {}
 
-  // 2) jsonrepair — agar installed ho (missing commas, single quotes, unquoted keys sab theek)
   if (jsonrepair) {
-    try {
-      return JSON.parse(jsonrepair(text));
-    } catch (e) {}
+    try { return JSON.parse(jsonrepair(text)); } catch (e) {}
   }
 
-  // 3) Last try — JS-style fixes
   try {
     const fixed = text
       .replace(/:\s*'([^']*)'/g, ': "$1"')
@@ -108,31 +150,21 @@ function parseJsonArray(text) {
     return JSON.parse(fixed);
   } catch (e) {}
 
-  console.error("❌ JSON PARSE FAIL — raw text:", text.slice(0, 300));
+  console.error("JSON PARSE FAIL:", text.slice(0, 300));
   return null;
 }
 
-// ============ ROBUST NORMALIZATION ============
-
 function normalizeOptions(rawOptions) {
   if (!rawOptions) return [];
-
-  if (!Array.isArray(rawOptions)) {
-    rawOptions = Object.values(rawOptions);
-  }
+  if (!Array.isArray(rawOptions)) rawOptions = Object.values(rawOptions);
 
   return rawOptions
     .map((o) => {
-      if (typeof o === "string") {
-        return { text: o.trim(), explanation: "" };
-      }
+      if (typeof o === "string") return { text: o.trim(), explanation: "" };
       if (o && typeof o === "object") {
         const text = o.text || o.option || o.value || o.label || o.answer || "";
         const explanation = o.explanation || o.reason || o.description || o.why || "";
-        return {
-          text: String(text).trim(),
-          explanation: String(explanation).trim()
-        };
+        return { text: String(text).trim(), explanation: String(explanation).trim() };
       }
       return { text: String(o).trim(), explanation: "" };
     })
@@ -157,9 +189,7 @@ function normalizeQuestion(raw) {
   if (!raw || typeof raw !== "object") return null;
   if (!raw.question && !raw.Question && !raw.q) return null;
 
-  const options = normalizeOptions(
-    raw.options || raw.choices || raw.answers || raw.answerOptions
-  );
+  const options = normalizeOptions(raw.options || raw.choices || raw.answers || raw.answerOptions);
 
   return {
     question: String(raw.question || raw.Question || raw.q || ""),
@@ -168,37 +198,45 @@ function normalizeQuestion(raw) {
     page: raw.page || 1,
     difficulty: raw.difficulty || "Medium",
     options,
-    correctAnswer: normalizeCorrectAnswer(
-      raw.correctAnswer || raw.answer,
-      options
-    )
+    correctAnswer: normalizeCorrectAnswer(raw.correctAnswer || raw.answer, options)
   };
 }
 
-async function generateQuestions(category, difficulty = "Medium", count = 10) {
+// ---------- MAIN GENERATOR (cache + fresh support) ----------
+async function generateQuestions(category, difficulty = "Medium", count = 5, fresh = false) {
+  // 1) Pehle cache check — cache hit hua to Gemini call hi nahi hoga (429 se bachao)
+  if (!fresh) {
+    const cached = getCached(category, difficulty);
+    if (cached && cached.length >= Math.min(count, 3)) {
+      console.log(`CACHE HIT: ${category} (${cached.length} questions)`);
+      return cached.slice(0, count);
+    }
+  }
+
+  if (fresh) clearCache(category, difficulty);
+
   const prompt = `
 Generate ${count} HIGH QUALITY multiple choice questions for category "${category}" (difficulty: ${difficulty}).
 
-These questions are for a REAL EXAM PRACTICE TEST. Every question MUST be an IMPORTANT question that has appeared in previous exams, previous year papers, or common interview/certification tests for this topic.
+These are for a REAL EXAM PRACTICE TEST. Every question MUST be an IMPORTANT question from previous exams / previous year papers / common interview tests.
 
 Rules:
 1. ONLY important, frequently-asked exam questions. No random/trivial questions.
 2. Every question MUST have exactly 4 options.
-3. Every option MUST have a detailed explanation (why it is correct/incorrect).
+3. Every option MUST have a SHORT explanation (maximum 15 words, one line only).
 4. correctAnswer must exactly match one option text.
 5. No duplicate questions.
-6. Every time generate a DIFFERENT set of questions — do not repeat the same set.
-7. Return ONLY valid JSON array. No markdown. No extra text.
+6. Return ONLY valid JSON array. No markdown. No extra text.
 
 JSON FORMAT:
 [
  {
   "question": "Question here",
   "options": [
-    { "text": "Option 1", "explanation": "Explanation of option 1" },
-    { "text": "Option 2", "explanation": "Explanation of option 2" },
-    { "text": "Option 3", "explanation": "Explanation of option 3" },
-    { "text": "Option 4", "explanation": "Explanation of option 4" }
+    { "text": "Option 1", "explanation": "short reason" },
+    { "text": "Option 2", "explanation": "short reason" },
+    { "text": "Option 3", "explanation": "short reason" },
+    { "text": "Option 4", "explanation": "short reason" }
   ],
   "correctAnswer": "Option 1",
   "difficulty": "${difficulty}"
@@ -212,21 +250,20 @@ JSON FORMAT:
     throw new Error("Gemini ne valid JSON array nahi diya");
   }
 
-  const normalized = arr
-    .map((q) => {
-      const n = normalizeQuestion(q);
-      if (!n) return null;
-      return { ...n, category, difficulty };
-    })
-    .filter(Boolean);
-
-  // Pehle exactly 4 options wale prefer karo; agar kam mile to bhi test chalega
+  const normalized = arr.map(normalizeQuestion).filter(Boolean);
   const withFour = normalized.filter((q) => q.options.length === 4);
-  const pool = withFour.length >= 3 ? withFour : normalized.filter((q) => q.options.length >= 2);
+  const pool = withFour.length >= 2 ? withFour : normalized.filter((q) => q.options.length >= 2);
 
-  return pool.slice(0, count);
+  if (!pool.length) {
+    throw new Error("AI se valid questions nahi mile (options missing)");
+  }
+
+  const result = pool.slice(0, count);
+  saveCache(category, difficulty, result);
+  return result;
 }
 
+// ---------- RESUME QUESTIONS (batch, upgraded callGemini use karega) ----------
 async function generateResumeQuestions(resumeText, count = 50) {
   const BATCH_SIZE = 8;
   const all = [];
@@ -241,7 +278,7 @@ ${resumeText}
 Generate up to ${BATCH_SIZE} important interview questions (technical + HR).
 Rules:
 1. Every question MUST have exactly 4 options.
-2. Every option MUST have an explanation.
+2. Every option MUST have a SHORT explanation (max 15 words).
 3. correctAnswer must exactly match one option text.
 4. Return ONLY valid JSON array. No markdown. No extra text.
 
@@ -253,7 +290,7 @@ JSON FORMAT:
   "topic": "Topic name",
   "page": 1,
   "options": [
-    { "text": "Option 1", "explanation": "Why this is correct/incorrect" },
+    { "text": "Option 1", "explanation": "short reason" },
     { "text": "Option 2", "explanation": "..." },
     { "text": "Option 3", "explanation": "..." },
     { "text": "Option 4", "explanation": "..." }
@@ -265,29 +302,19 @@ JSON FORMAT:
 `;
 
     const text = await callGemini(prompt);
-    console.log(`🔥 BATCH ${b}/${batches} RAW:`);
-    console.log(text.substring(0, 1500));
-
     const arr = parseJsonArray(text);
     if (Array.isArray(arr)) {
       all.push(...arr.map(normalizeQuestion).filter(Boolean));
-      console.log(`✅ Batch ${b}: ${arr.length} questions`);
+      console.log(`Batch ${b}: ${arr.length} questions`);
     } else {
-      console.log(`❌ Batch ${b}: invalid JSON, skipping`);
+      console.log(`Batch ${b}: invalid JSON, skipping`);
     }
 
     if (all.length >= count) break;
   }
 
-  console.log(`✅ TOTAL QUESTIONS GENERATED: ${all.length}`);
   return all.slice(0, count);
 }
-
-// ============ BACKWARD-COMPATIBLE EXPORTS ============
-// Chahe koi bhi file kisi bhi tarah require kare — sab chalega:
-//   const generateQuestions = require("../utils/aiGenerator");  ✅
-//   const { generateQuestions } = require("../utils/aiGenerator");  ✅
-//   const { generateResumeQuestions } = require("../utils/aiGenerator");  ✅
 
 module.exports = generateQuestions;
 module.exports.generateQuestions = generateQuestions;

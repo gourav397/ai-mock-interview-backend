@@ -3,20 +3,37 @@ const { generateQuestions } = require("../utils/aiGenerator");
 
 const router = express.Router();
 
-// GENERATE AI INTERVIEW QUESTIONS
-// GET /api/ai-interview/generate?category=Cyber Security&difficulty=Medium
+// Fresh regenerate ko rate-limit karo — taaki user baar-baar click karke 429 na utha le
+const lastFresh = new Map();
+
+// GET /api/ai-interview/generate?category=UPSC&difficulty=Medium&count=5&fresh=1
 router.get("/generate", async (req, res) => {
   try {
-    const { category, difficulty } = req.query;
+    const { category, difficulty, count, fresh } = req.query;
 
     if (!category) {
       return res.status(400).json({ message: "Category required" });
     }
 
+    const finalCount = Math.min(parseInt(count, 10) || 5, 10);
+
+    // "Naye Questions" per category sirf 60 sec me ek baar
+    if (fresh === "1") {
+      const now = Date.now();
+      const last = lastFresh.get(category) || 0;
+      if (now - last < 60000) {
+        return res.status(429).json({
+          message: "Naye questions 1 minute me ek baar hi generate hote hain. Thoda ruk kar try karo."
+        });
+      }
+      lastFresh.set(category, now);
+    }
+
     const questions = await generateQuestions(
       category,
       difficulty || "Medium",
-      10
+      finalCount,
+      fresh === "1"
     );
 
     if (!Array.isArray(questions) || questions.length === 0) {
