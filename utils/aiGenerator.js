@@ -1,9 +1,16 @@
 require("dotenv").config();
-const MODEL = "gemini-3.5-flash";
+
 const API_KEY = process.env.GEMINI_API_KEY;
+const MODEL = "gemini-3.5-flash";
 
+// jsonrepair optional hai — installed ho to use hoga, warna fallback parser chalega
+let jsonrepair = null;
+try {
+  ({ jsonrepair } = require("jsonrepair"));
+} catch (e) {
+  console.log("⚠️ jsonrepair installed nahi hai — fallback parser chalega");
+}
 
-// Gemini se STRICT JSON mangwayega (valid JSON ke alawa kuch nahi dega)
 async function callGemini(prompt, timeoutMs = 120000) {
   if (!API_KEY) throw new Error("GEMINI_API_KEY missing in .env");
 
@@ -28,7 +35,7 @@ async function callGemini(prompt, timeoutMs = 120000) {
             generationConfig: {
               temperature: 0.5,
               maxOutputTokens: 32768,
-              responseMimeType: "application/json" // ⬅️ YAHI KEY FIX
+              responseMimeType: "application/json"
             }
           }),
           signal: controller.signal
@@ -51,11 +58,10 @@ async function callGemini(prompt, timeoutMs = 120000) {
       }
 
       const data = await res.json();
-      const text =
-        data?.candidates?.[0]?.content?.parts
-          ?.map((p) => p.text || "")
-          .join("")
-          .trim();
+      const text = data?.candidates?.[0]?.content?.parts
+        ?.map((p) => p.text || "")
+        .join("")
+        .trim();
 
       if (!text) {
         throw new Error("Gemini empty response: " + (data?.candidates?.[0]?.finishReason || "?"));
@@ -75,7 +81,6 @@ async function callGemini(prompt, timeoutMs = 120000) {
   throw lastError;
 }
 
-// Robust parser — valid JSON + Gemini ka JS-style dono handle karega
 function parseJsonArray(text) {
   if (!text) return null;
 
@@ -84,10 +89,17 @@ function parseJsonArray(text) {
   if (start === -1 || end <= start) return null;
   text = text.slice(start, end + 1);
 
-  // 1) Pehle seedha JSON try karo
+  // 1) Seedha JSON
   try { return JSON.parse(text); } catch (e) {}
 
-  // 2) Agar fail ho — JS-style fix karke dobara try (single quotes -> double, keys quote)
+  // 2) jsonrepair — agar installed ho (missing commas, single quotes, unquoted keys sab theek)
+  if (jsonrepair) {
+    try {
+      return JSON.parse(jsonrepair(text));
+    } catch (e) {}
+  }
+
+  // 3) Last try — JS-style fixes
   try {
     const fixed = text
       .replace(/:\s*'([^']*)'/g, ': "$1"')
@@ -102,22 +114,18 @@ function parseJsonArray(text) {
 
 // ============ ROBUST NORMALIZATION ============
 
-// options ko hamesha [{ text, explanation }] mein convert karo
 function normalizeOptions(rawOptions) {
   if (!rawOptions) return [];
 
-  // Agar options object hai jaise { A: "text", B: "text" } ya { 1: "...", 2: "..." }
   if (!Array.isArray(rawOptions)) {
     rawOptions = Object.values(rawOptions);
   }
 
   return rawOptions
     .map((o) => {
-      // Option seedha string hai → text bana do
       if (typeof o === "string") {
         return { text: o.trim(), explanation: "" };
       }
-      // Option object hai → koi bhi common key pakdo
       if (o && typeof o === "object") {
         const text = o.text || o.option || o.value || o.label || o.answer || "";
         const explanation = o.explanation || o.reason || o.description || o.why || "";
@@ -128,10 +136,9 @@ function normalizeOptions(rawOptions) {
       }
       return { text: String(o).trim(), explanation: "" };
     })
-    .filter((o) => o.text !== ""); // khali options hatao
+    .filter((o) => o.text !== "");
 }
 
-// correctAnswer agar "A"/"B"/"0"/"1" jaisa aaya to usko option ke text se match karo
 function normalizeCorrectAnswer(ca, options) {
   if (typeof ca === "number") ca = String(ca);
   ca = (ca || "").trim();
@@ -146,7 +153,6 @@ function normalizeCorrectAnswer(ca, options) {
   return ca;
 }
 
-// Har question ko saaf shape mein normalize karo
 function normalizeQuestion(raw) {
   if (!raw || typeof raw !== "object") return null;
   if (!raw.question && !raw.Question && !raw.q) return null;
@@ -171,42 +177,58 @@ function normalizeQuestion(raw) {
 
 async function generateQuestions(category, difficulty = "Medium", count = 10) {
   const prompt = `
-Generate ${count} HIGH QUALITY multiple choice questions.
+Generate ${count} HIGH QUALITY multiple choice questions for category "${category}" (difficulty: ${difficulty}).
 
-Category: ${category}
-Difficulty: ${difficulty}
+These questions are for a REAL EXAM PRACTICE TEST. Every question MUST be an IMPORTANT question that has appeared in previous exams, previous year papers, or common interview/certification tests for this topic.
 
 Rules:
-1. Important exam level questions.
-2. Every question must have exactly 4 options.
-3. Every option needs a detailed explanation.
-4. Correct answer must exactly match one option text.
+1. ONLY important, frequently-asked exam questions. No random/trivial questions.
+2. Every question MUST have exactly 4 options.
+3. Every option MUST have a detailed explanation (why it is correct/incorrect).
+4. correctAnswer must exactly match one option text.
 5. No duplicate questions.
-6. Return ONLY valid JSON array. No markdown.
+6. Every time generate a DIFFERENT set of questions — do not repeat the same set.
+7. Return ONLY valid JSON array. No markdown. No extra text.
 
 JSON FORMAT:
 [
  {
-  "question": "",
+  "question": "Question here",
   "options": [
-    { "text": "", "explanation": "" },
-    { "text": "", "explanation": "" },
-    { "text": "", "explanation": "" },
-    { "text": "", "explanation": "" }
+    { "text": "Option 1", "explanation": "Explanation of option 1" },
+    { "text": "Option 2", "explanation": "Explanation of option 2" },
+    { "text": "Option 3", "explanation": "Explanation of option 3" },
+    { "text": "Option 4", "explanation": "Explanation of option 4" }
   ],
-  "correctAnswer": ""
+  "correctAnswer": "Option 1",
+  "difficulty": "${difficulty}"
  }
 ]
 `;
 
   const text = await callGemini(prompt);
   const arr = parseJsonArray(text);
-  if (!Array.isArray(arr)) throw new Error("Gemini ne valid JSON array nahi diya");
-  return arr.map((q) => ({ category, difficulty, ...q }));
+  if (!Array.isArray(arr)) {
+    throw new Error("Gemini ne valid JSON array nahi diya");
+  }
+
+  const normalized = arr
+    .map((q) => {
+      const n = normalizeQuestion(q);
+      if (!n) return null;
+      return { ...n, category, difficulty };
+    })
+    .filter(Boolean);
+
+  // Pehle exactly 4 options wale prefer karo; agar kam mile to bhi test chalega
+  const withFour = normalized.filter((q) => q.options.length === 4);
+  const pool = withFour.length >= 3 ? withFour : normalized.filter((q) => q.options.length >= 2);
+
+  return pool.slice(0, count);
 }
 
 async function generateResumeQuestions(resumeText, count = 50) {
-  const BATCH_SIZE = 8; // 8-10 questions per call — chhota JSON = valid JSON
+  const BATCH_SIZE = 8;
   const all = [];
   const batches = Math.ceil(count / BATCH_SIZE);
 
@@ -261,4 +283,12 @@ JSON FORMAT:
   return all.slice(0, count);
 }
 
-module.exports = { generateQuestions, generateResumeQuestions };
+// ============ BACKWARD-COMPATIBLE EXPORTS ============
+// Chahe koi bhi file kisi bhi tarah require kare — sab chalega:
+//   const generateQuestions = require("../utils/aiGenerator");  ✅
+//   const { generateQuestions } = require("../utils/aiGenerator");  ✅
+//   const { generateResumeQuestions } = require("../utils/aiGenerator");  ✅
+
+module.exports = generateQuestions;
+module.exports.generateQuestions = generateQuestions;
+module.exports.generateResumeQuestions = generateResumeQuestions;
