@@ -1,7 +1,7 @@
 require("dotenv").config();
 const MODEL = "gemini-3.5-flash";
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-flash-latest";
+
 
 // Gemini se STRICT JSON mangwayega (valid JSON ke alawa kuch nahi dega)
 async function callGemini(prompt, timeoutMs = 120000) {
