@@ -9,48 +9,26 @@ const lastFresh = new Map();
 // GET /api/ai-interview/generate?category=UPSC&difficulty=Medium&count=5&fresh=1
 router.get("/generate", async (req, res) => {
   try {
-    const { category, difficulty, count, fresh } = req.query;
+    const category = req.query.category || "General";
+    const difficulty = req.query.difficulty || "Medium";
+    // 🔥 total frontend se lo — max 56 (batch system ki limit)
+    const total = Math.min(parseInt(req.query.total) || 50, 56);
 
-    if (!category) {
-      return res.status(400).json({ message: "Category required" });
-    }
+    console.log(`🎯 Generating ${total} questions for ${category} (${difficulty})`);
 
-    const finalCount = Math.min(parseInt(count, 10) || 5, 10);
-
-    // "Naye Questions" per category sirf 60 sec me ek baar
-    if (fresh === "1") {
-      const now = Date.now();
-      const last = lastFresh.get(category) || 0;
-      if (now - last < 60000) {
-        return res.status(429).json({
-          message: "Naye questions 1 minute me ek baar hi generate hote hain. Thoda ruk kar try karo."
-        });
-      }
-      lastFresh.set(category, now);
-    }
-
-    const questions = await generateQuestions(
-      category,
-      difficulty || "Medium",
-      finalCount,
-      fresh === "1"
-    );
-
-    if (!Array.isArray(questions) || questions.length === 0) {
-      return res.status(502).json({
-        message: "AI questions generate nahi kar paya, dobara try karein"
-      });
-    }
+    // 🔥 IMPORTANT: DB/cache se questions check mat karo —
+    // hamesha Gemini se FRESH generate karo taaki har baar naye aayein
+    const questions = await generateQuestions(category, difficulty, total);
 
     res.json({
       category,
-      difficulty: difficulty || "Medium",
+      difficulty,
       total: questions.length,
-      questions
+      questions,
     });
-  } catch (error) {
-    console.log("AI GENERATE ERROR:", error.message);
-    res.status(500).json({ message: error.message });
+  } catch (err) {
+    console.error("Generate error:", err.message);
+    res.status(500).json({ message: err.message || "Questions generate nahi ho paye" });
   }
 });
 

@@ -64,21 +64,24 @@ async function callGemini(prompt, timeoutMs = 60000) {
 
     try {
       const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: {
-              temperature: 0.5,
-              maxOutputTokens: 8192, // pehle 32768 tha — isi se speed aayi
-              responseMimeType: "application/json"
-            }
-          }),
-          signal: controller.signal
-        }
-      );
+  `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
+  {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": API_KEY   // AQ. auth key header me jati hai, URL me nahi
+    },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.5,
+        maxOutputTokens: 8192,
+        responseMimeType: "application/json"
+      }
+    }),
+    signal: controller.signal
+  }
+);
 
       clearTimeout(timer);
 
