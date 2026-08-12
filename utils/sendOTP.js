@@ -5,7 +5,10 @@ const transporter = nodemailer.createTransport({
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
-  }
+  },
+  connectionTimeout: 10000,
+  greetingTimeout: 10000,
+  socketTimeout: 10000
 });
 
 const sendOTP = async (email, otp) => {
@@ -25,6 +28,8 @@ const sendOTP = async (email, otp) => {
       `
     };
 
+    console.log("📤 Calling Gmail sendMail...");
+
     const result = await transporter.sendMail(mailOptions);
 
     console.log("✅ EMAIL SENT via Gmail:", result.messageId);
@@ -33,7 +38,8 @@ const sendOTP = async (email, otp) => {
 
   } catch (error) {
     console.log("❌ GMAIL EMAIL FAILED");
-    console.log(error.message);
+    console.log("ERROR:", error.message);
+    console.log("CODE:", error.code);
     throw error;
   }
 };
