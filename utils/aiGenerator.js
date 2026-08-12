@@ -7,7 +7,7 @@ const API_KEY = process.env.GEMINI_API_KEY;
 // SPEED TIP: lite model isse kaafi fast hai
 const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 
-// ---------- CACHE SETUP (optional — sirf tab use hoga jab explicitly kaha jaye) ----------
+// ---------- CACHE SETUP ----------
 const CACHE_DIR = path.join(__dirname, "..", "cache");
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -48,8 +48,8 @@ function clearCache(category, difficulty) {
   } catch {}
 }
 
-// ---------- GEMINI CALL (backoff + jitter + Retry-After) ----------
-async function callGemini(prompt, timeoutMs = 90000) {
+// ---------- GEMINI CALL (60s timeout + backoff + jitter) ----------
+async function callGemini(prompt, timeoutMs = 60000) {
   if (!API_KEY) throw new Error("GEMINI_API_KEY missing in .env");
 
   if (prompt.length > 10000) {
@@ -74,7 +74,7 @@ async function callGemini(prompt, timeoutMs = 90000) {
           body: JSON.stringify({
             contents: [{ parts: [{ text: prompt }] }],
             generationConfig: {
-              temperature: 0.9,   // 🔥 variation ke liye
+              temperature: 0.9,   // 🔥 har baar naye questions
               topP: 0.95,
               maxOutputTokens: 8192,
               responseMimeType: "application/json"
@@ -240,9 +240,9 @@ JSON FORMAT:
 `;
 }
 
-// ---------- MAIN GENERATOR (BATCH-BASED — 8 per call, fresh by default) ----------
+// ---------- MAIN GENERATOR (PARALLEL BATCHES — fast + fresh) ----------
 async function generateQuestions(category, difficulty = "Medium", count = 5, useCache = false) {
-  // Cache SIRF tab use karo jab explicitly kaha jaye (useCache = true)
+  // Cache sirf tab jab explicitly kaha jaye
   if (useCache) {
     const cached = getCached(category, difficulty);
     if (cached && cached.length >= Math.min(count, 3)) {
@@ -254,35 +254,52 @@ async function generateQuestions(category, difficulty = "Medium", count = 5, use
   // 🔥 Fresh generation — purana cache hatao
   clearCache(category, difficulty);
 
-  const BATCH_SIZE = 8; // har call mein 8 questions — Gemini truncation se bachao
+  const BATCH_SIZE = 8;
+  const CONCURRENCY = 4; // ⚡ ek saath max 4 Gemini calls — total time 60-90 sec
+
+  // Batch sizes pehle se fix karo (50 → 8,8,8,8,8,8,2)
+  const batchCounts = [];
+  let remainingCount = count;
+  while (remainingCount > 0) {
+    batchCounts.push(Math.min(BATCH_SIZE, remainingCount));
+    remainingCount -= BATCH_SIZE;
+  }
+  const totalBatches = batchCounts.length;
+  console.log(`🔨 ${totalBatches} batches (${CONCURRENCY} parallel) for ${category}`);
+
   const all = [];
-  const batches = Math.ceil(count / BATCH_SIZE);
 
-  for (let b = 1; b <= batches; b++) {
-    const remaining = count - all.length;
-    if (remaining <= 0) break;
-    const batchCount = Math.min(BATCH_SIZE, remaining);
-
-    console.log(`🔨 Batch ${b}/${batches}: ${batchCount} questions (${category})`);
-
-    const prompt = buildPrompt(category, difficulty, batchCount, b, batches);
-    const text = await callGemini(prompt, 90000);
+  async function runBatch(batchNo, batchCount) {
+    const prompt = buildPrompt(category, difficulty, batchCount, batchNo, totalBatches);
+    const text = await callGemini(prompt, 60000);
     const arr = parseJsonArray(text);
-
-    if (Array.isArray(arr)) {
-      const normalized = arr.map(normalizeQuestion).filter(Boolean);
-      const withFour = normalized.filter((q) => q.options.length === 4);
-      const pool = withFour.length >= 2 ? withFour : normalized.filter((q) => q.options.length >= 2);
-      all.push(...pool.slice(0, batchCount));
-      console.log(`✅ Batch ${b}: ${pool.length} questions`);
-    } else {
-      console.log(`❌ Batch ${b}: invalid JSON, skipping`);
+    if (!Array.isArray(arr)) {
+      console.log(`❌ Batch ${batchNo}: invalid JSON`);
+      return [];
     }
+    const normalized = arr.map(normalizeQuestion).filter(Boolean);
+    const withFour = normalized.filter((q) => q.options.length === 4);
+    const pool = withFour.length >= 2 ? withFour : normalized.filter((q) => q.options.length >= 2);
+    console.log(`✅ Batch ${batchNo}: ${pool.length} questions`);
+    return pool.slice(0, batchCount);
+  }
 
-    // Rate limit se bachne ke liye chhota delay
-    if (b < batches) {
-      await new Promise((r) => setTimeout(r, 1500));
-    }
+  // Concurrency-limited loop — 4-4 karke, rounds ke beech chhota gap
+  let index = 0;
+  while (index < totalBatches) {
+    const slice = batchCounts.slice(index, index + CONCURRENCY);
+    const settled = await Promise.allSettled(
+      slice.map((c, i) => runBatch(index + i + 1, c))
+    );
+    settled.forEach((s, i) => {
+      if (s.status === "fulfilled") {
+        all.push(...s.value);
+      } else {
+        console.log(`❌ Batch ${index + i + 1} fail: ${s.reason?.message || s.reason}`);
+      }
+    });
+    index += CONCURRENCY;
+    if (index < totalBatches) await new Promise((r) => setTimeout(r, 1200));
   }
 
   const result = all.slice(0, count);
@@ -291,10 +308,11 @@ async function generateQuestions(category, difficulty = "Medium", count = 5, use
   }
 
   saveCache(category, difficulty, result);
+  console.log(`🎉 TOTAL: ${result.length} questions generated`);
   return result;
 }
 
-// ---------- RESUME QUESTIONS (batch — same upgraded callGemini use karta hai) ----------
+// ---------- RESUME QUESTIONS (batch, sequential — resume flow ke liye theek hai) ----------
 async function generateResumeQuestions(resumeText, count = 50) {
   const BATCH_SIZE = 8;
   const all = [];
@@ -349,7 +367,7 @@ JSON FORMAT:
   return all.slice(0, count);
 }
 
-// ✅ Clean export — route mein destructure isi se kaam karega
+// ✅ Clean export
 module.exports = {
   generateQuestions,
   generateResumeQuestions
