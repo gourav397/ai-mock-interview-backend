@@ -4,10 +4,10 @@ const fs = require("fs");
 const path = require("path");
 
 const API_KEY = process.env.GEMINI_API_KEY;
-// SPEED TIP: lite model isse kaafi fast hai. 3.5-flash thinking model hai isliye slow hai.
+// SPEED TIP: lite model isse kaafi fast hai
 const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 
-// ---------- CACHE SETUP (24 ghante tak same questions serve honge) ----------
+// ---------- CACHE SETUP (optional — sirf tab use hoga jab explicitly kaha jaye) ----------
 const CACHE_DIR = path.join(__dirname, "..", "cache");
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -22,7 +22,7 @@ function getCached(category, difficulty) {
     if (!fs.existsSync(file)) return null;
     const data = JSON.parse(fs.readFileSync(file, "utf8"));
     if (!Array.isArray(data.questions) || !data.questions.length) return null;
-    if (Date.now() - data.createdAt > CACHE_TTL_MS) return null; // expired
+    if (Date.now() - data.createdAt > CACHE_TTL_MS) return null;
     return data.questions;
   } catch {
     return null;
@@ -49,7 +49,7 @@ function clearCache(category, difficulty) {
 }
 
 // ---------- GEMINI CALL (backoff + jitter + Retry-After) ----------
-async function callGemini(prompt, timeoutMs = 60000) {
+async function callGemini(prompt, timeoutMs = 90000) {
   if (!API_KEY) throw new Error("GEMINI_API_KEY missing in .env");
 
   if (prompt.length > 10000) {
@@ -64,29 +64,29 @@ async function callGemini(prompt, timeoutMs = 60000) {
 
     try {
       const res = await fetch(
-  `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
-  {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": API_KEY   // AQ. auth key header me jati hai, URL me nahi
-    },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.5,
-        maxOutputTokens: 8192,
-        responseMimeType: "application/json"
-      }
-    }),
-    signal: controller.signal
-  }
-);
+        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": API_KEY
+          },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              temperature: 0.9,   // 🔥 variation ke liye
+              topP: 0.95,
+              maxOutputTokens: 8192,
+              responseMimeType: "application/json"
+            }
+          }),
+          signal: controller.signal
+        }
+      );
 
       clearTimeout(timer);
 
       if (res.status === 429 || res.status === 503) {
-        // Retry-After header ho to use karo, warna exponential backoff + jitter
         const retryAfter = parseInt(res.headers.get("retry-after") || "0", 10);
         const wait = (retryAfter || 2000 * attempt) + Math.floor(Math.random() * 1500);
         console.log(`Gemini ${res.status} — retry ${attempt}/5 in ${Math.round(wait / 1000)}s`);
@@ -118,14 +118,14 @@ async function callGemini(prompt, timeoutMs = 60000) {
         await new Promise((r) => setTimeout(r, 4000));
         continue;
       }
-      throw err; // 400/401 jaise client errors pe retry nahi karte
+      throw err;
     }
   }
 
   throw lastError;
 }
 
-// ---------- JSON PARSING (tumhara existing code — same rakha) ----------
+// ---------- JSON PARSING ----------
 let jsonrepair = null;
 try {
   ({ jsonrepair } = require("jsonrepair"));
@@ -205,30 +205,22 @@ function normalizeQuestion(raw) {
   };
 }
 
-// ---------- MAIN GENERATOR (cache + fresh support) ----------
-async function generateQuestions(category, difficulty = "Medium", count = 5, fresh = false) {
-  // 1) Pehle cache check — cache hit hua to Gemini call hi nahi hoga (429 se bachao)
-  if (!fresh) {
-    const cached = getCached(category, difficulty);
-    if (cached && cached.length >= Math.min(count, 3)) {
-      console.log(`CACHE HIT: ${category} (${cached.length} questions)`);
-      return cached.slice(0, count);
-    }
-  }
+// ---------- BATCH PROMPT BUILDER ----------
+function buildPrompt(category, difficulty, batchCount, batchNo, totalBatches) {
+  return `
+You are an expert exam question generator.
+Generate ${batchCount} HIGH QUALITY multiple choice questions for category "${category}" (difficulty: ${difficulty}).
 
-  if (fresh) clearCache(category, difficulty);
+These are for a REAL EXAM PRACTICE TEST. Every question MUST be an IMPORTANT question that has appeared in previous exams / previous year papers / common interview tests.
 
-  const prompt = `
-Generate ${count} HIGH QUALITY multiple choice questions for category "${category}" (difficulty: ${difficulty}).
-
-These are for a REAL EXAM PRACTICE TEST. Every question MUST be an IMPORTANT question from previous exams / previous year papers / common interview tests.
+This is batch ${batchNo} of ${totalBatches} — questions MUST be DIFFERENT from other batches (different subtopics, different concepts).
 
 Rules:
 1. ONLY important, frequently-asked exam questions. No random/trivial questions.
 2. Every question MUST have exactly 4 options.
 3. Every option MUST have a SHORT explanation (maximum 15 words, one line only).
 4. correctAnswer must exactly match one option text.
-5. No duplicate questions.
+5. No duplicate questions within this batch.
 6. Return ONLY valid JSON array. No markdown. No extra text.
 
 JSON FORMAT:
@@ -246,27 +238,63 @@ JSON FORMAT:
  }
 ]
 `;
+}
 
-  const text = await callGemini(prompt);
-  const arr = parseJsonArray(text);
-  if (!Array.isArray(arr)) {
-    throw new Error("Gemini ne valid JSON array nahi diya");
+// ---------- MAIN GENERATOR (BATCH-BASED — 8 per call, fresh by default) ----------
+async function generateQuestions(category, difficulty = "Medium", count = 5, useCache = false) {
+  // Cache SIRF tab use karo jab explicitly kaha jaye (useCache = true)
+  if (useCache) {
+    const cached = getCached(category, difficulty);
+    if (cached && cached.length >= Math.min(count, 3)) {
+      console.log(`CACHE HIT: ${category} (${cached.length} questions)`);
+      return cached.slice(0, count);
+    }
   }
 
-  const normalized = arr.map(normalizeQuestion).filter(Boolean);
-  const withFour = normalized.filter((q) => q.options.length === 4);
-  const pool = withFour.length >= 2 ? withFour : normalized.filter((q) => q.options.length >= 2);
+  // 🔥 Fresh generation — purana cache hatao
+  clearCache(category, difficulty);
 
-  if (!pool.length) {
-    throw new Error("AI se valid questions nahi mile (options missing)");
+  const BATCH_SIZE = 8; // har call mein 8 questions — Gemini truncation se bachao
+  const all = [];
+  const batches = Math.ceil(count / BATCH_SIZE);
+
+  for (let b = 1; b <= batches; b++) {
+    const remaining = count - all.length;
+    if (remaining <= 0) break;
+    const batchCount = Math.min(BATCH_SIZE, remaining);
+
+    console.log(`🔨 Batch ${b}/${batches}: ${batchCount} questions (${category})`);
+
+    const prompt = buildPrompt(category, difficulty, batchCount, b, batches);
+    const text = await callGemini(prompt, 90000);
+    const arr = parseJsonArray(text);
+
+    if (Array.isArray(arr)) {
+      const normalized = arr.map(normalizeQuestion).filter(Boolean);
+      const withFour = normalized.filter((q) => q.options.length === 4);
+      const pool = withFour.length >= 2 ? withFour : normalized.filter((q) => q.options.length >= 2);
+      all.push(...pool.slice(0, batchCount));
+      console.log(`✅ Batch ${b}: ${pool.length} questions`);
+    } else {
+      console.log(`❌ Batch ${b}: invalid JSON, skipping`);
+    }
+
+    // Rate limit se bachne ke liye chhota delay
+    if (b < batches) {
+      await new Promise((r) => setTimeout(r, 1500));
+    }
   }
 
-  const result = pool.slice(0, count);
+  const result = all.slice(0, count);
+  if (!result.length) {
+    throw new Error("AI se valid questions nahi mile");
+  }
+
   saveCache(category, difficulty, result);
   return result;
 }
 
-// ---------- RESUME QUESTIONS (batch, upgraded callGemini use karega) ----------
+// ---------- RESUME QUESTIONS (batch — same upgraded callGemini use karta hai) ----------
 async function generateResumeQuestions(resumeText, count = 50) {
   const BATCH_SIZE = 8;
   const all = [];
@@ -279,6 +307,7 @@ Analyze this resume content:
 ${resumeText}
 
 Generate up to ${BATCH_SIZE} important interview questions (technical + HR).
+This is batch ${b} of ${batches} — questions MUST be DIFFERENT from other batches.
 Rules:
 1. Every question MUST have exactly 4 options.
 2. Every option MUST have a SHORT explanation (max 15 words).
@@ -314,11 +343,14 @@ JSON FORMAT:
     }
 
     if (all.length >= count) break;
+    if (b < batches) await new Promise((r) => setTimeout(r, 1500));
   }
 
   return all.slice(0, count);
 }
 
-module.exports = generateQuestions;
-module.exports.generateQuestions = generateQuestions;
-module.exports.generateResumeQuestions = generateResumeQuestions;
+// ✅ Clean export — route mein destructure isi se kaam karega
+module.exports = {
+  generateQuestions,
+  generateResumeQuestions
+};
