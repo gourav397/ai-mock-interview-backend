@@ -1,45 +1,33 @@
-const nodemailer = require("nodemailer");
-const dns = require("dns");
+const { Resend } = require("resend");
 
-// ⭐ YEH FIX HAI: Node ko bolo IPv4 hi use kare (Railway pe IPv6 nahi chalta)
-dns.setDefaultResultOrder("ipv4first");
-
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false,
-  requireTLS: true,
-  family: 4,                        // extra safety
-  connectionTimeout: 15000,         // 15 sec me fail ho jaye, hang na ho
-  greetingTimeout: 15000,
-  socketTimeout: 15000,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  }
-});
+// RESEND_API_KEY .env se aayega (Railway Variables me bhi daalna — neeche dekho)
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 const sendOTP = async (email, otp) => {
   try {
-    console.log("📨 Sending OTP...");
+    console.log("📨 Sending OTP via Resend...");
     console.log("Receiver:", email);
     console.log("OTP:", otp);
 
-    const info = await transporter.sendMail({
-      from: `"AI Mock Interview" <${process.env.EMAIL_USER}>`,
-      to: email,
+    const { data, error } = await resend.emails.send({
+      from: "AI Mock Interview <onboarding@resend.dev>",
+      to: [email],
       subject: "AI Mock Interview OTP",
       html: `
         <h2>Your OTP is:</h2>
-        <h1>${otp}</h1>
+        <h1 style="font-size:32px;letter-spacing:4px;">${otp}</h1>
         <p>This OTP is valid for 5 minutes.</p>
-      `
+      `,
     });
 
-    console.log("✅ EMAIL SENT:", info.messageId);
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    console.log("✅ EMAIL SENT via Resend — Message ID:", data?.id);
   } catch (error) {
-    console.log("❌ EMAIL FAILED");
-    console.log(error);
+    console.log("❌ EMAIL FAILED:");
+    console.log(error.message || error);
     throw error;
   }
 };
