@@ -29,6 +29,8 @@ const sendOTP = async (email, otp) => {
 
     console.log("✅ EMAIL SENT via Gmail:", result.messageId);
 
+    return result;
+
   } catch (error) {
     console.log("❌ GMAIL EMAIL FAILED");
     console.log(error.message);
