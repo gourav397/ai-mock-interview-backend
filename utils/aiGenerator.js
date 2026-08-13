@@ -291,7 +291,8 @@ JSON FORMAT:
 }
 
 // ---------- MAIN GENERATOR ----------
-async function generateQuestions(category, difficulty = "Medium", count = 5, useCache = true) {
+async function generateQuestions(category, difficulty = "Medium", count = 50, useCache = false) {
+  // fresh mode me cache use hi nahi karte — har baar naye questions
   if (useCache) {
     const cached = getCached(category, difficulty);
     if (cached && cached.length >= Math.min(count, 3)) {
@@ -364,7 +365,48 @@ async function generateQuestions(category, difficulty = "Medium", count = 5, use
     if (index < totalBatches) await new Promise((r) => setTimeout(r, 1200));
   }
 
-  const result = all.slice(0, count);
+  // ---- 🔁 DEDUPE: repeat questions hatao (batches overlap ho sakti hain) ----
+  const seen = new Set();
+  const deduped = all.filter((q) => {
+    const key = q.question.split(" / ")[0].trim().toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  let result = deduped.slice(0, count);
+
+  // ---- 🔁 TOP-UP: count kam aaya to missing questions dobara maango (max 2 rounds) ----
+  let topUpRounds = 0;
+  while (result.length < count && topUpRounds < 2) {
+    topUpRounds++;
+    const missing = count - result.length;
+    console.log(`🔁 Top-up round ${topUpRounds}: ${missing} aur questions maang rahe hain...`);
+
+    const hint = "⚠️ These questions MUST be NEW — do NOT repeat any question from earlier batches. Proper Devanagari Hindi in EVERY question_hi and text_hi field.";
+    const prompt = buildPrompt(category, difficulty, missing, 1, 1, hint);
+    const text = await callGemini(prompt, 60000);
+    const arr = parseJsonArray(text);
+
+    if (Array.isArray(arr)) {
+      const normalized = arr.map(normalizeQuestion).filter(Boolean);
+      const pool = normalized.filter((q) => q.options.length === 4);
+      const bilingual = pool.filter(isBilingualQuestion);
+
+      // existing questions se match hone wale hatao
+      const existing = new Set(result.map((q) => q.question.split(" / ")[0].trim().toLowerCase()));
+      const freshOnes = bilingual.filter(
+        (q) => !existing.has(q.question.split(" / ")[0].trim().toLowerCase())
+      );
+      result.push(...freshOnes.slice(0, missing));
+      console.log(`✅ Top-up: ${freshOnes.length} naye mile, total ab ${result.length}`);
+    } else {
+      console.log(`❌ Top-up: invalid JSON`);
+    }
+
+    if (topUpRounds < 2) await new Promise((r) => setTimeout(r, 1500));
+  }
+
   if (!result.length) {
     throw new Error("AI ne bilingual (English+Hindi) questions nahi diye — dobara try karein");
   }

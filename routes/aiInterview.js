@@ -3,7 +3,7 @@ const { generateQuestions } = require("../utils/aiGenerator");
 
 const router = express.Router();
 
-// GET /api/ai-interview/generate?category=UPSC&difficulty=Medium&count=5&fresh=1
+// GET /api/ai-interview/generate?category=UPSC&difficulty=Medium&count=50&fresh=1
 router.get("/generate", async (req, res) => {
   try {
     const { category, difficulty, count, fresh } = req.query;
@@ -12,10 +12,10 @@ router.get("/generate", async (req, res) => {
       return res.status(400).json({ message: "Category required" });
     }
 
-    const finalCount = Math.min(parseInt(count, 10) || 5, 10);
+    // ✅ count = 50 tak allow (pehle max 10 tha — isliye 4-5 hi aate the)
+    const finalCount = Math.min(Math.max(parseInt(count, 10) || 50, 1), 50);
 
-    // ✅ fresh=1 → naye questions (cache skip + clear)
-    // ✅ normal load → cache use karo (fast)
+    // ✅ fresh=1 → cache skip + clear → HAR BAAR naye alag questions
     const useCache = fresh !== "1";
 
     const questions = await generateQuestions(
