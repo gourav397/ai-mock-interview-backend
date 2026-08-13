@@ -3,28 +3,43 @@ const { generateQuestions } = require("../utils/aiGenerator");
 
 const router = express.Router();
 
-// GET /api/ai-interview/generate?category=Cyber%20Security&difficulty=Medium&total=50
+// GET /api/ai-interview/generate?category=UPSC&difficulty=Medium&count=5&fresh=1
 router.get("/generate", async (req, res) => {
   try {
-    const category = req.query.category || "General";
-    const difficulty = req.query.difficulty || "Medium";
-    const total = Math.min(parseInt(req.query.total) || 50, 56);
+    const { category, difficulty, count, fresh } = req.query;
 
-    console.log(`🎯 Generating ${total} FRESH questions for ${category} (${difficulty})`);
+    if (!category) {
+      return res.status(400).json({ message: "Category required" });
+    }
 
-    // 🔥 useCache = false → hamesha Gemini se naye questions
-    // (batch system andar 8-8 karke generate karega)
-    const questions = await generateQuestions(category, difficulty, total, false);
+    const finalCount = Math.min(parseInt(count, 10) || 5, 10);
+
+    // ✅ fresh=1 → naye questions (cache skip + clear)
+    // ✅ normal load → cache use karo (fast)
+    const useCache = fresh !== "1";
+
+    const questions = await generateQuestions(
+      category,
+      difficulty || "Medium",
+      finalCount,
+      useCache
+    );
+
+    if (!Array.isArray(questions) || questions.length === 0) {
+      return res.status(502).json({
+        message: "AI questions generate nahi kar paya, dobara try karein"
+      });
+    }
 
     res.json({
       category,
-      difficulty,
+      difficulty: difficulty || "Medium",
       total: questions.length,
-      questions,
+      questions
     });
-  } catch (err) {
-    console.error("Generate error:", err.message);
-    res.status(500).json({ message: err.message || "Questions generate nahi ho paye" });
+  } catch (error) {
+    console.log("AI GENERATE ERROR:", error.message);
+    res.status(500).json({ message: error.message });
   }
 });
 
