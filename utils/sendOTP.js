@@ -1,22 +1,30 @@
 require("dotenv").config();
 const nodemailer = require("nodemailer");
 
-// Gmail SMTP transporter — Resend ki testing limit khatam!
+// SMTP config — env se aata hai (Brevo/Gmail dono support)
+const SMTP_HOST = process.env.SMTP_HOST || "smtp.gmail.com";
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || "587", 10);
+
 const transporter = nodemailer.createTransport({
-  service: "gmail",
+  host: SMTP_HOST,
+  port: SMTP_PORT,
+  secure: SMTP_PORT === 465, // 465 = SSL, 587 = STARTTLS
   auth: {
-    user: process.env.EMAIL_USER,   // gouravjangra782@gmail.com
-    pass: process.env.EMAIL_PASS,   // Gmail APP PASSWORD (16 digit)
+    user: process.env.SMTP_USER || process.env.EMAIL_USER,
+    pass: process.env.SMTP_PASS || process.env.EMAIL_PASS,
   },
+  connectionTimeout: 20000,
+  greetingTimeout: 20000,
+  socketTimeout: 40000,
 });
 
 async function sendOTP(to, otp) {
-  console.log(`📨 Sending OTP via Gmail SMTP...`);
+  console.log(`📨 Sending OTP via ${SMTP_HOST}...`);
   console.log(`Receiver: ${to}`);
   console.log(`OTP: ${otp}`);
 
   const mailOptions = {
-    from: process.env.EMAIL_USER,
+    from: `"AI Mock Interview" <${process.env.SMTP_FROM || process.env.EMAIL_USER}>`,
     to: to,
     subject: "Your OTP Code - AI Mock Interview",
     html: `
