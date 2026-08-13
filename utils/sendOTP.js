@@ -1,65 +1,38 @@
-const https = require("https");
+require("dotenv").config();
+const nodemailer = require("nodemailer");
 
-const sendOTP = async (email, otp) => {
-  try {
-    console.log("📨 Sending OTP via Resend...");
-    console.log("Receiver:", email);
-    console.log("OTP:", otp);
+// Gmail SMTP transporter — Resend ki testing limit khatam!
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,   // gouravjangra782@gmail.com
+    pass: process.env.EMAIL_PASS,   // Gmail APP PASSWORD (16 digit)
+  },
+});
 
-    const data = JSON.stringify({
-      from: "AI Mock Interview <onboarding@resend.dev>",
-      to: [email],
-      subject: "AI Mock Interview OTP",
-      html: `
-        <h2>Your OTP is:</h2>
-        <h1 style="font-size:32px;letter-spacing:4px;">${otp}</h1>
+async function sendOTP(to, otp) {
+  console.log(`📨 Sending OTP via Gmail SMTP...`);
+  console.log(`Receiver: ${to}`);
+  console.log(`OTP: ${otp}`);
+
+  const mailOptions = {
+    from: process.env.EMAIL_USER,
+    to: to,
+    subject: "Your OTP Code - AI Mock Interview",
+    html: `
+      <div style="font-family: Arial, sans-serif; padding: 20px;">
+        <h2>Your OTP Code</h2>
+        <p>Use this OTP to verify your email:</p>
+        <h1 style="letter-spacing: 8px; background: #f0f0f0; padding: 12px; display: inline-block;">
+          ${otp}
+        </h1>
         <p>This OTP is valid for 5 minutes.</p>
-      `
-    });
+      </div>
+    `,
+  };
 
-    const result = await new Promise((resolve, reject) => {
-      const req = https.request(
-        {
-          hostname: "api.resend.com",
-          path: "/emails",
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
-            "Content-Type": "application/json",
-            "Content-Length": Buffer.byteLength(data)
-          }
-        },
-        (res) => {
-          let body = "";
-
-          res.on("data", (chunk) => {
-            body += chunk;
-          });
-
-          res.on("end", () => {
-            if (res.statusCode >= 200 && res.statusCode < 300) {
-              resolve(JSON.parse(body));
-            } else {
-              reject(new Error(body));
-            }
-          });
-        }
-      );
-
-      req.on("error", reject);
-      req.write(data);
-      req.end();
-    });
-
-    console.log("✅ EMAIL SENT:", result.id);
-
-    return result;
-
-  } catch (error) {
-    console.log("❌ RESEND EMAIL FAILED");
-    console.log(error.message);
-    throw error;
-  }
-};
+  await transporter.sendMail(mailOptions);
+  console.log(`✅ OTP EMAIL SENT to ${to}`);
+}
 
 module.exports = sendOTP;
