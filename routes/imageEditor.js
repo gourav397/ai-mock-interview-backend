@@ -1,19 +1,20 @@
 // ============================================================
-// AI IMAGE EDITOR — Routes
+// AI IMAGE EDITOR — Routes (PRODUCTION v3.0)
 // Mounted at /api/image-editor/*
+// Stateless: client sends `imagePath` (server filename) for chained edits.
+// Safe against path traversal — only basenames inside TEMP_DIR resolve.
 // ============================================================
 
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
-const crypto = require("crypto");
 const { ImageProcessor, TEMP_DIR } = require("../utils/imageProcessor");
 
 const router = express.Router();
 
 // ============================================
-// MULTER — memory storage for validation first
+// MULTER — memory storage, validation happens after
 // ============================================
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -23,20 +24,62 @@ const upload = multer({
     if (allowed.includes(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error(`Unsupported file type: ${file.mimetype}`), false);
+      cb(new Error(`Unsupported file type: ${file.mimetype}. Allowed: JPG, PNG, WebP.`), false);
     }
   },
 });
 
 // ============================================
-// Middleware: validate image exists
+// PATH SAFETY — resolve a filename strictly inside TEMP_DIR
+// ============================================
+
+const FILENAME_RE = /^[a-zA-Z0-9._-]+$/;
+
+function resolveTempPath(imagePath) {
+  if (!imagePath || typeof imagePath !== "string") return null;
+  const safeName = path.basename(imagePath.trim());
+  if (!safeName || !FILENAME_RE.test(safeName)) return null;
+  const full = path.join(TEMP_DIR, safeName);
+  if (!full.startsWith(TEMP_DIR + path.sep) && full !== TEMP_DIR) return null;
+  return full;
+}
+
+// Load working buffer: uploaded file first, otherwise imagePath from body
+async function loadImageBuffer(req) {
+  if (req.file && req.file.buffer) {
+    return req.file.buffer;
+  }
+  const resolved = resolveTempPath(req.body?.imagePath);
+  if (resolved && fs.existsSync(resolved)) {
+    return fs.promises.readFile(resolved);
+  }
+  return null;
+}
+
+// ============================================
+// Middleware: validate image source exists
 // ============================================
 const validateImage = (req, res, next) => {
-  if (!req.file && !req.body.imagePath && !req.session?.lastImage) {
-    return res.status(400).json({ success: false, message: "No image provided. Upload an image first." });
+  if (!req.file && !req.body?.imagePath && !req.session?.lastImage) {
+    return res.status(400).json({
+      success: false,
+      message: "No image provided. Upload an image first or send imagePath.",
+    });
   }
   next();
 };
+
+// Shared response builder — returns filename (basename) + URLs
+function buildImageData(filename, extra = {}) {
+  return {
+    path: filename,
+    filename,
+    preview: `/api/image-editor/preview/${filename}`,
+    resultUrl: `/api/image-editor/preview/${filename}`,
+    downloadUrl: `/api/image-editor/download/${filename}`,
+    ...extra,
+  };
+}
 
 // ============================================
 // GET /api/image-editor/status
@@ -45,37 +88,15 @@ router.get("/status", (req, res) => {
   res.json({
     success: true,
     data: {
-      version: "1.0.0",
+      version: "3.0.0",
       supportedFormats: ["image/jpeg", "image/png", "image/webp"],
       maxFileSize: "20MB",
-      maxDimensions: "4096px",
-      filters: [
-        { id: "natural", name: "Natural Enhancement", free: true },
-        { id: "brightness", name: "Brighten", free: true },
-        { id: "brightness-low", name: "Darken", free: true },
-        { id: "contrast", name: "Contrast", free: true },
-        { id: "saturation", name: "Saturate", free: true },
-        { id: "desaturate", name: "Desaturate", free: true },
-        { id: "warm", name: "Warm Tone", free: true },
-        { id: "cool", name: "Cool Tone", free: true },
-        { id: "vintage", name: "Vintage", free: true },
-        { id: "black-white", name: "Black & White", free: true },
-        { id: "cinematic", name: "Cinematic", free: true },
-        { id: "portrait", name: "Portrait Enhance", free: true },
-        { id: "soft", name: "Soft", free: true },
-        { id: "vivid", name: "Vivid", free: true },
-        { id: "dramatic", name: "Dramatic", free: true },
-      ],
+      maxDimensions: "8192px",
+      filters: Object.keys(ImageProcessor.FILTER_PRESETS).map((id) => ({ id, free: true })),
       editingCapabilities: [
-        "enhance", "upscale", "filters", "adjust",
-        "resize", "crop", "rotate", "remove-background",
-        "replace-background", "portrait-enhance",
+        "enhance", "upscale", "filters", "adjust", "resize", "crop", "rotate",
+        "remove-background", "replace-background", "ai-edit", "compare", "download",
       ],
-      aiProviders: {
-        upscale: process.env.UPSCALE_PROVIDER || "local_sharp",
-        bgRemoval: process.env.BG_REMOVER_PROVIDER || "local_fallback",
-        aiEdit: process.env.AI_EDIT_PROVIDER || "none_configured",
-      },
       freeUserLimits: {
         maxFileSize: "10MB (free), 20MB (premium)",
         dailyEdits: 50,
@@ -85,50 +106,45 @@ router.get("/status", (req, res) => {
 });
 
 // ============================================
-// POST /api/image-editor/upload
+// POST /api/image-editor/upload  (multipart field: "image")
 // ============================================
 router.post("/upload", upload.single("image"), async (req, res) => {
   try {
     const file = req.file;
     if (!file) {
-      return res.status(400).json({ success: false, message: "No image uploaded." });
+      return res.status(400).json({ success: false, message: "No image uploaded. Field name must be 'image'." });
     }
 
-    // Server-side validation
     const validation = ImageProcessor.validateImage(file);
     if (!validation.valid) {
       return res.status(400).json({ success: false, message: validation.error });
     }
 
-    // Get metadata
     const metadata = await ImageProcessor.getMetadata(file.buffer);
     if (!metadata) {
       return res.status(400).json({ success: false, message: "Could not read image. File may be corrupted." });
     }
 
-    // Save temp
-    const userId = req.user?._id?.toString() || req.ip || "anon";
-    const savedPath = await ImageProcessor.saveTemp(file.buffer, userId);
+    const userId = req.user?._id?.toString() || "anon";
+    const savedName = await ImageProcessor.saveTemp(file.buffer, userId);
 
-    // Store for session
-    if (!req.session) req.session = {};
-    req.session.lastImage = savedPath;
-    req.session.lastBuffer = file.buffer.toString("base64");
+    // Optional session support (express-session may not be installed — guard safely)
+    if (req.session) {
+      req.session.lastImage = savedName;
+    }
 
-    res.json({
+    return res.json({
       success: true,
       message: "Image uploaded successfully.",
-      data: {
-        path: savedPath,
-        filename: file.originalname,
+      data: buildImageData(savedName, {
+        originalname: file.originalname,
         size: file.buffer.length,
         ...metadata,
-        preview: `/api/image-editor/preview/${path.basename(savedPath)}`,
-      },
+      }),
     });
   } catch (err) {
     console.error("Upload error:", err.message);
-    res.status(500).json({ success: false, message: `Upload failed: ${err.message}` });
+    return res.status(500).json({ success: false, message: `Upload failed: ${err.message}` });
   }
 });
 
@@ -136,13 +152,11 @@ router.post("/upload", upload.single("image"), async (req, res) => {
 // GET /api/image-editor/preview/:filename
 // ============================================
 router.get("/preview/:filename", (req, res) => {
-  const safeName = path.basename(req.params.filename).replace(/[^a-zA-Z0-9._-]/g, "");
-  const filePath = path.join(TEMP_DIR, safeName);
-
-  if (!fs.existsSync(filePath)) {
+  const filePath = resolveTempPath(req.params.filename);
+  if (!filePath || !fs.existsSync(filePath)) {
     return res.status(404).json({ success: false, message: "Image not found or expired." });
   }
-
+  res.setHeader("Cache-Control", "private, max-age=300");
   res.sendFile(filePath);
 });
 
@@ -151,29 +165,60 @@ router.get("/preview/:filename", (req, res) => {
 // ============================================
 router.post("/enhance", validateImage, async (req, res) => {
   try {
-    const { scale = 2, sharpness = 1.0 } = req.body;
-    const buffer = req.file?.buffer || Buffer.from(req.session.lastBuffer, "base64");
+    const buffer = await loadImageBuffer(req);
+    if (!buffer) {
+      return res.status(404).json({ success: false, message: "Image not found or expired. Upload again." });
+    }
 
-    const result = await ImageProcessor.enhance(buffer, { scale: Math.min(Math.max(scale, 1), 4), sharpness });
+    const scale = Number(req.body?.scale) || 1;
+    const sharpness = Number(req.body?.sharpness) || 1.0;
 
-    const userId = req.user?._id || "anon";
-    const savedPath = await ImageProcessor.saveTemp(result.buffer, `${userId}_enhanced`);
+    const result = await ImageProcessor.enhance(buffer, { scale, sharpness });
+    const savedName = await ImageProcessor.saveTemp(result.buffer, "enhanced");
 
-    res.json({
+    return res.json({
       success: true,
-      message: `Image enhanced at ${scale}x with sharpness ${sharpness}.`,
-      data: {
-        path: savedPath,
+      message: `Image enhanced at ${result.scale}x with sharpness ${sharpness}.`,
+      data: buildImageData(savedName, {
         width: result.width,
         height: result.height,
         originalWidth: result.originalWidth,
         originalHeight: result.originalHeight,
         scale: result.scale,
-        preview: `/api/image-editor/preview/${path.basename(savedPath)}`,
-      },
+      }),
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: `Enhancement failed: ${err.message}` });
+    return res.status(500).json({ success: false, message: `Enhancement failed: ${err.message}` });
+  }
+});
+
+// ============================================
+// POST /api/image-editor/upscale
+// ============================================
+router.post("/upscale", validateImage, async (req, res) => {
+  try {
+    const buffer = await loadImageBuffer(req);
+    if (!buffer) {
+      return res.status(404).json({ success: false, message: "Image not found or expired. Upload again." });
+    }
+
+    const scale = Math.min(Math.max(Number(req.body?.scale) || 2, 1), 4);
+    const result = await ImageProcessor.enhance(buffer, { scale, sharpness: 0.8 });
+    const savedName = await ImageProcessor.saveTemp(result.buffer, "upscaled");
+
+    return res.json({
+      success: true,
+      message: `Image upscaled ${result.scale}x.`,
+      data: buildImageData(savedName, {
+        width: result.width,
+        height: result.height,
+        originalWidth: result.originalWidth,
+        originalHeight: result.originalHeight,
+        scale: result.scale,
+      }),
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: `Upscale failed: ${err.message}` });
   }
 });
 
@@ -182,28 +227,27 @@ router.post("/enhance", validateImage, async (req, res) => {
 // ============================================
 router.post("/filter", validateImage, async (req, res) => {
   try {
-    const { filter } = req.body;
-    if (!filter) {
+    const { filter } = req.body || {};
+    if (!filter || typeof filter !== "string") {
       return res.status(400).json({ success: false, message: "Filter name is required." });
     }
 
-    const buffer = req.file?.buffer || Buffer.from(req.session.lastBuffer, "base64");
+    const buffer = await loadImageBuffer(req);
+    if (!buffer) {
+      return res.status(404).json({ success: false, message: "Image not found or expired. Upload again." });
+    }
+
     const result = await ImageProcessor.applyFilter(buffer, filter);
+    const savedName = await ImageProcessor.saveTemp(result, `f_${filter}`);
 
-    const userId = req.user?._id || "anon";
-    const savedPath = await ImageProcessor.saveTemp(result, `${userId}_${filter}`);
-
-    res.json({
+    return res.json({
       success: true,
       message: `Filter "${filter}" applied.`,
-      data: {
-        path: savedPath,
-        filter,
-        preview: `/api/image-editor/preview/${path.basename(savedPath)}`,
-      },
+      data: buildImageData(savedName, { filter }),
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: `Filter failed: ${err.message}` });
+    const status = String(err.message || "").startsWith("Unknown filter") ? 400 : 500;
+    return res.status(status).json({ success: false, message: `Filter failed: ${err.message}` });
   }
 });
 
@@ -212,25 +256,23 @@ router.post("/filter", validateImage, async (req, res) => {
 // ============================================
 router.post("/adjust", validateImage, async (req, res) => {
   try {
-    const adjustments = req.body;
-    const buffer = req.file?.buffer || Buffer.from(req.session.lastBuffer, "base64");
+    // Accept { imagePath, adjustments: {...} } or flat { brightness, contrast, ... }
+    const adjustments = req.body?.adjustments || req.body || {};
+    const buffer = await loadImageBuffer(req);
+    if (!buffer) {
+      return res.status(404).json({ success: false, message: "Image not found or expired. Upload again." });
+    }
 
     const result = await ImageProcessor.adjust(buffer, adjustments);
+    const savedName = await ImageProcessor.saveTemp(result, "adjusted");
 
-    const userId = req.user?._id || "anon";
-    const savedPath = await ImageProcessor.saveTemp(result, `${userId}_adjusted`);
-
-    res.json({
+    return res.json({
       success: true,
       message: "Adjustments applied.",
-      data: {
-        path: savedPath,
-        adjustments,
-        preview: `/api/image-editor/preview/${path.basename(savedPath)}`,
-      },
+      data: buildImageData(savedName, { adjustments }),
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: `Adjust failed: ${err.message}` });
+    return res.status(500).json({ success: false, message: `Adjust failed: ${err.message}` });
   }
 });
 
@@ -239,24 +281,26 @@ router.post("/adjust", validateImage, async (req, res) => {
 // ============================================
 router.post("/resize", validateImage, async (req, res) => {
   try {
-    const { width, height, fit = "cover" } = req.body;
+    const { width, height, fit = "cover" } = req.body || {};
     if (!width || !height) {
       return res.status(400).json({ success: false, message: "width and height are required." });
     }
 
-    const buffer = req.file?.buffer || Buffer.from(req.session.lastBuffer, "base64");
+    const buffer = await loadImageBuffer(req);
+    if (!buffer) {
+      return res.status(404).json({ success: false, message: "Image not found or expired. Upload again." });
+    }
+
     const result = await ImageProcessor.resize(buffer, width, height, fit);
+    const savedName = await ImageProcessor.saveTemp(result, "resized");
 
-    const userId = req.user?._id || "anon";
-    const savedPath = await ImageProcessor.saveTemp(result, `${userId}_resized`);
-
-    res.json({
+    return res.json({
       success: true,
-      message: `Image resized to ${width}x${height}.`,
-      data: { path: savedPath, width, height, fit, preview: `/api/image-editor/preview/${path.basename(savedPath)}` },
+      message: `Image resized to ${Math.round(width)}x${Math.round(height)}.`,
+      data: buildImageData(savedName, { width: Math.round(width), height: Math.round(height), fit }),
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: `Resize failed: ${err.message}` });
+    return res.status(500).json({ success: false, message: `Resize failed: ${err.message}` });
   }
 });
 
@@ -265,24 +309,27 @@ router.post("/resize", validateImage, async (req, res) => {
 // ============================================
 router.post("/crop", validateImage, async (req, res) => {
   try {
-    const { left, top, width, height } = req.body;
+    const { left, top, width, height } = req.body || {};
     if (left === undefined || top === undefined || !width || !height) {
       return res.status(400).json({ success: false, message: "left, top, width, height are required." });
     }
 
-    const buffer = req.file?.buffer || Buffer.from(req.session.lastBuffer, "base64");
+    const buffer = await loadImageBuffer(req);
+    if (!buffer) {
+      return res.status(404).json({ success: false, message: "Image not found or expired. Upload again." });
+    }
+
     const result = await ImageProcessor.crop(buffer, left, top, width, height);
+    const savedName = await ImageProcessor.saveTemp(result, "cropped");
 
-    const userId = req.user?._id || "anon";
-    const savedPath = await ImageProcessor.saveTemp(result, `${userId}_cropped`);
-
-    res.json({
+    return res.json({
       success: true,
-      message: `Image cropped to ${width}x${height}.`,
-      data: { path: savedPath, width, height, preview: `/api/image-editor/preview/${path.basename(savedPath)}` },
+      message: `Image cropped to ${Math.round(width)}x${Math.round(height)}.`,
+      data: buildImageData(savedName, { width: Math.round(width), height: Math.round(height) }),
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: `Crop failed: ${err.message}` });
+    const status = String(err.message || "").includes("bounds") ? 400 : 500;
+    return res.status(status).json({ success: false, message: `Crop failed: ${err.message}` });
   }
 });
 
@@ -291,63 +338,72 @@ router.post("/crop", validateImage, async (req, res) => {
 // ============================================
 router.post("/rotate", validateImage, async (req, res) => {
   try {
-    const { degrees = 90 } = req.body;
-    const buffer = req.file?.buffer || Buffer.from(req.session.lastBuffer, "base64");
+    const degrees = Number(req.body?.degrees) || 90;
+
+    const buffer = await loadImageBuffer(req);
+    if (!buffer) {
+      return res.status(404).json({ success: false, message: "Image not found or expired. Upload again." });
+    }
+
     const result = await ImageProcessor.rotate(buffer, degrees);
+    const savedName = await ImageProcessor.saveTemp(result, "rotated");
 
-    const userId = req.user?._id || "anon";
-    const savedPath = await ImageProcessor.saveTemp(result, `${userId}_rotated`);
-
-    res.json({
+    return res.json({
       success: true,
       message: `Image rotated ${degrees}°.`,
-      data: { path: savedPath, degrees, preview: `/api/image-editor/preview/${path.basename(savedPath)}` },
+      data: buildImageData(savedName, { degrees }),
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: `Rotation failed: ${err.message}` });
+    return res.status(500).json({ success: false, message: `Rotation failed: ${err.message}` });
   }
 });
 
 // ============================================
-// POST /api/image-editor/remove-background
+// POST /api/image-editor/remove-background  (+ /remove-bg alias)
 // ============================================
-router.post("/remove-background", validateImage, async (req, res) => {
+const removeBackgroundHandler = async (req, res) => {
   try {
-    const buffer = req.file?.buffer || Buffer.from(req.session.lastBuffer, "base64");
+    const buffer = await loadImageBuffer(req);
+    if (!buffer) {
+      return res.status(404).json({ success: false, message: "Image not found or expired. Upload again." });
+    }
+
     const result = await ImageProcessor.removeBackground(buffer);
+    const savedName = await ImageProcessor.saveTemp(result, "nobg");
 
-    const userId = req.user?._id || "anon";
-    const savedPath = await ImageProcessor.saveTemp(result, `${userId}_nobg`);
-
-    res.json({
+    return res.json({
       success: true,
-      message: "Background removed.",
-      data: { path: savedPath, preview: `/api/image-editor/preview/${path.basename(savedPath)}` },
+      message: "Background removal (fallback) applied. Output is PNG.",
+      data: buildImageData(savedName),
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: `Background removal failed: ${err.message}` });
+    return res.status(500).json({ success: false, message: `Background removal failed: ${err.message}` });
   }
-});
+};
+router.post("/remove-background", validateImage, removeBackgroundHandler);
+router.post("/remove-bg", validateImage, removeBackgroundHandler); // alias for older clients
 
 // ============================================
 // POST /api/image-editor/replace-background
 // ============================================
 router.post("/replace-background", validateImage, async (req, res) => {
   try {
-    const { color = "#ffffff" } = req.body;
-    const buffer = req.file?.buffer || Buffer.from(req.session.lastBuffer, "base64");
+    const color = req.body?.color || "#ffffff";
+    const buffer = await loadImageBuffer(req);
+    if (!buffer) {
+      return res.status(404).json({ success: false, message: "Image not found or expired. Upload again." });
+    }
+
     const result = await ImageProcessor.replaceBackground(buffer, { color });
+    const savedName = await ImageProcessor.saveTemp(result, "bg_replaced");
 
-    const userId = req.user?._id || "anon";
-    const savedPath = await ImageProcessor.saveTemp(result, `${userId}_bg_replaced`);
-
-    res.json({
+    return res.json({
       success: true,
       message: `Background replaced with ${color}.`,
-      data: { path: savedPath, color, preview: `/api/image-editor/preview/${path.basename(savedPath)}` },
+      data: buildImageData(savedName, { color }),
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: `Background replacement failed: ${err.message}` });
+    return res.status(500).json({ success: false, message: `Background replacement failed: ${err.message}` });
   }
 });
 
@@ -356,60 +412,95 @@ router.post("/replace-background", validateImage, async (req, res) => {
 // ============================================
 router.post("/ai-edit", validateImage, async (req, res) => {
   try {
-    const { instruction } = req.body;
+    const { instruction } = req.body || {};
     if (!instruction || typeof instruction !== "string") {
       return res.status(400).json({ success: false, message: "Instruction text is required." });
     }
 
-    const buffer = req.file?.buffer || Buffer.from(req.session.lastBuffer, "base64");
-    const lower = instruction.toLowerCase().trim();
-
-    // Natural language → action mapping
-    if (/remove\s+(the\s+)?background/i.test(lower) || /delete\s+background/i.test(lower)) {
-      const result = await ImageProcessor.removeBackground(buffer);
-      const savedPath = await ImageProcessor.saveTemp(result, `${req.user?._id || "anon"}_ai_bg`);
-      return res.json({ success: true, message: "Background removed.", data: { instruction, action: "remove_background", path: savedPath, preview: `/api/image-editor/preview/${path.basename(savedPath)}` } });
+    const buffer = await loadImageBuffer(req);
+    if (!buffer) {
+      return res.status(404).json({ success: false, message: "Image not found or expired. Upload again." });
     }
 
+    const lower = instruction.toLowerCase().trim();
+
+    // remove background
+    if (/remove\s+(the\s+)?background/i.test(lower) || /delete\s+background/i.test(lower)) {
+      const result = await ImageProcessor.removeBackground(buffer);
+      const savedName = await ImageProcessor.saveTemp(result, "ai_bg");
+      return res.json({
+        success: true,
+        message: "Background removed.",
+        data: { instruction, action: "remove_background", ...buildImageData(savedName) },
+      });
+    }
+
+    // replace background
     if (/replace\s+(the\s+)?background/i.test(lower)) {
-      // Extract color from instruction
-      const colors = { white: "#ffffff", black: "#000000", blue: "#0000ff", red: "#ff0000", green: "#00ff00", gray: "#808080", grey: "#808080" };
+      const colors = {
+        white: "#ffffff", black: "#000000", blue: "#0000ff", red: "#ff0000",
+        green: "#00ff00", gray: "#808080", grey: "#808080",
+      };
       let color = "#ffffff";
       for (const [name, hex] of Object.entries(colors)) {
         if (lower.includes(name)) { color = hex; break; }
       }
       const result = await ImageProcessor.replaceBackground(buffer, { color });
-      const savedPath = await ImageProcessor.saveTemp(result, `${req.user?._id || "anon"}_ai_bgrep`);
-      return res.json({ success: true, message: `Background replaced with ${color}.`, data: { instruction, action: "replace_background", color, path: savedPath, preview: `/api/image-editor/preview/${path.basename(savedPath)}` } });
+      const savedName = await ImageProcessor.saveTemp(result, "ai_bgrep");
+      return res.json({
+        success: true,
+        message: `Background replaced with ${color}.`,
+        data: { instruction, action: "replace_background", color, ...buildImageData(savedName) },
+      });
     }
 
+    // enhance / upscale
     if (/(improve|enhance|make\s+better|upscale|hd|high\s+quality)/i.test(lower)) {
       const scale = /2x|4x|high|ultra|hd/i.test(lower) ? 2 : 1.5;
       const result = await ImageProcessor.enhance(buffer, { scale });
-      const savedPath = await ImageProcessor.saveTemp(result.buffer, `${req.user?._id || "anon"}_ai_enhanced`);
-      return res.json({ success: true, message: "Image enhanced.", data: { instruction, action: "enhance", scale, path: savedPath, preview: `/api/image-editor/preview/${path.basename(savedPath)}` } });
+      const savedName = await ImageProcessor.saveTemp(result.buffer, "ai_enhanced");
+      return res.json({
+        success: true,
+        message: "Image enhanced.",
+        data: { instruction, action: "enhance", scale, ...buildImageData(savedName) },
+      });
     }
 
+    // brightness
     if (/(bright|darker|lighten)/i.test(lower)) {
       const isBright = /bright|lighten/i.test(lower);
       const result = await ImageProcessor.adjust(buffer, { brightness: isBright ? 1.3 : 0.7 });
-      const savedPath = await ImageProcessor.saveTemp(result, `${req.user?._id || "anon"}_ai_bright`);
-      return res.json({ success: true, message: isBright ? "Image brightened." : "Image darkened.", data: { instruction, action: "adjust_brightness", path: savedPath, preview: `/api/image-editor/preview/${path.basename(savedPath)}` } });
+      const savedName = await ImageProcessor.saveTemp(result, "ai_bright");
+      return res.json({
+        success: true,
+        message: isBright ? "Image brightened." : "Image darkened.",
+        data: { instruction, action: "adjust_brightness", ...buildImageData(savedName) },
+      });
     }
 
+    // black & white
     if (/(black\s*(and|&)\s*white|grayscale|monochrome|b&w)/i.test(lower)) {
       const result = await ImageProcessor.applyFilter(buffer, "black-white");
-      const savedPath = await ImageProcessor.saveTemp(result, `${req.user?._id || "anon"}_ai_bw`);
-      return res.json({ success: true, message: "Converted to black & white.", data: { instruction, action: "black_white", path: savedPath, preview: `/api/image-editor/preview/${path.basename(savedPath)}` } });
+      const savedName = await ImageProcessor.saveTemp(result, "ai_bw");
+      return res.json({
+        success: true,
+        message: "Converted to black & white.",
+        data: { instruction, action: "black_white", ...buildImageData(savedName) },
+      });
     }
 
-    if (/(crop|trim|cut)/i.test(lower) && /(\d+)\s*x\s*(\d+)/.test(lower)) {
-      const match = lower.match(/(\d+)\s*x\s*(\d+)/);
-      const meta = await ImageProcessor.getMetadata(buffer);
-      const w = parseInt(match[1]), h = parseInt(match[2]);
+    // crop/resize to WxH
+    if (/(crop|trim|cut|resize)/i.test(lower) && /(\d+)\s*[xX]\s*(\d+)/.test(lower)) {
+      const match = lower.match(/(\d+)\s*[xX]\s*(\d+)/);
+      const w = parseInt(match[1], 10);
+      const h = parseInt(match[2], 10);
       const result = await ImageProcessor.resize(buffer, w, h);
-      const savedPath = await ImageProcessor.saveTemp(result, `${req.user?._id || "anon"}_ai_resize`);
-      return res.json({ success: true, message: `Image resized to ${w}x${h}.`, data: { instruction, action: "resize", width: w, height: h, path: savedPath, preview: `/api/image-editor/preview/${path.basename(savedPath)}` } });
+      const savedName = await ImageProcessor.saveTemp(result, "ai_resize");
+      return res.json({
+        success: true,
+        message: `Image resized to ${w}x${h}.`,
+        data: { instruction, action: "resize", width: w, height: h, ...buildImageData(savedName) },
+      });
     }
 
     // Unknown instruction
@@ -422,12 +513,32 @@ router.post("/ai-edit", validateImage, async (req, res) => {
         "Enhance / improve image quality",
         "Make it brighter / darker",
         "Convert to black and white",
-        "Crop to WxH dimensions",
-        "Apply filter: [natural/brightness/contrast/saturation/vintage/cinematic/portrait]",
+        "Resize to WxH dimensions",
       ],
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: `AI edit failed: ${err.message}` });
+    return res.status(500).json({ success: false, message: `AI edit failed: ${err.message}` });
+  }
+});
+
+// ============================================
+// POST /api/image-editor/reset — returns the given image as current
+// ============================================
+router.post("/reset", validateImage, async (req, res) => {
+  try {
+    const buffer = await loadImageBuffer(req);
+    if (!buffer) {
+      return res.status(404).json({ success: false, message: "Image not found or expired. Upload again." });
+    }
+    const resolved = resolveTempPath(req.body.imagePath);
+    const filename = path.basename(resolved);
+    return res.json({
+      success: true,
+      message: "Reset to image.",
+      data: buildImageData(filename),
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: `Reset failed: ${err.message}` });
   }
 });
 
@@ -435,54 +546,81 @@ router.post("/ai-edit", validateImage, async (req, res) => {
 // GET /api/image-editor/download/:filename
 // ============================================
 router.get("/download/:filename", (req, res) => {
-  const safeName = path.basename(req.params.filename).replace(/[^a-zA-Z0-9._-]/g, "");
-  const filePath = path.join(TEMP_DIR, safeName);
-
-  if (!fs.existsSync(filePath)) {
+  const filePath = resolveTempPath(req.params.filename);
+  if (!filePath || !fs.existsSync(filePath)) {
     return res.status(404).json({ success: false, message: "File not found or expired." });
   }
-
-  res.download(filePath, `edited-${safeName}`);
+  res.download(filePath, `edited-${path.basename(filePath)}`);
 });
 
 // ============================================
-// POST /api/image-editor/compare — before/after
+// POST /api/image-editor/compare — before/after (size-safe base64)
 // ============================================
+async function toCompareDataUrl(buffer) {
+  const meta = await ImageProcessor.getMetadata(buffer);
+  let w = meta?.width || 800;
+  let h = meta?.height || 600;
+  const max = 1200;
+  if (w > max || h > max) {
+    const r = max / Math.max(w, h);
+    w = Math.max(1, Math.round(w * r));
+    h = Math.max(1, Math.round(h * r));
+  }
+  const resized = await ImageProcessor.resize(buffer, w, h, "inside");
+  return `data:image/jpeg;base64,${resized.toString("base64")}`;
+}
+
 router.post("/compare", validateImage, async (req, res) => {
   try {
-    const buffer = req.file?.buffer || Buffer.from(req.session.lastBuffer, "base64");
-    const editType = req.body.editType || "enhance";
+    const buffer = await loadImageBuffer(req);
+    if (!buffer) {
+      return res.status(404).json({ success: false, message: "Image not found or expired. Upload again." });
+    }
 
+    const editType = req.body?.editType || "enhance";
     let resultBuffer;
+
     switch (editType) {
       case "enhance":
         resultBuffer = (await ImageProcessor.enhance(buffer, { scale: 2 })).buffer;
         break;
       case "filter":
-        resultBuffer = await ImageProcessor.applyFilter(buffer, req.body.filter || "natural");
+        resultBuffer = await ImageProcessor.applyFilter(buffer, req.body?.filter || "natural");
         break;
       case "brightness":
-        resultBuffer = await ImageProcessor.adjust(buffer, { brightness: req.body.brightness || 1.3 });
+        resultBuffer = await ImageProcessor.adjust(buffer, { brightness: Number(req.body?.brightness) || 1.3 });
         break;
       default:
         resultBuffer = await ImageProcessor.enhance(buffer, { scale: 1.5 });
     }
 
-    // Return both as base64 for frontend comparison
-    const originalBase64 = buffer.toString("base64");
-    const editedBase64 = resultBuffer.toString("base64");
+    const original = await toCompareDataUrl(buffer);
+    const edited = await toCompareDataUrl(resultBuffer);
 
-    res.json({
+    return res.json({
       success: true,
-      data: {
-        original: `data:image/png;base64,${originalBase64}`,
-        edited: `data:image/png;base64,${editedBase64}`,
-        editType,
-      },
+      data: { original, edited, editType },
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: `Comparison failed: ${err.message}` });
+    return res.status(500).json({ success: false, message: `Comparison failed: ${err.message}` });
   }
+});
+
+// ============================================
+// ROUTER-LEVEL ERROR HANDLER — catches Multer errors with proper status
+// ============================================
+router.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    const message =
+      err.code === "LIMIT_FILE_SIZE"
+        ? "File too large. Maximum is 20MB."
+        : `Upload error: ${err.code}`;
+    return res.status(400).json({ success: false, message });
+  }
+  if (err) {
+    return res.status(400).json({ success: false, message: err.message || "Request failed." });
+  }
+  next();
 });
 
 module.exports = router;
