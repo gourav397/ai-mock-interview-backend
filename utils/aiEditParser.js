@@ -1,8 +1,12 @@
 // ============================================================
-// AI EDIT PARSER — Natural Language Intent Detection
+// AI EDIT PARSER — Natural Language Intent Detection (v4.1)
 // Supports: English, Hindi (Latin script), Hinglish
-// Produces an ordered execution PLAN of editing steps.
-// Multi-step support: split on "aur / and / then / phir / fir / , / +"
+// NEW: Hinglish spelling normalization (hta → hata, rhne → rehne, ...)
+// NEW: "details ko hta de pic me se only pic ko rhne de"
+//      → recognized as remove background / unwanted surroundings
+// NEW: "black white" (without "and"), "sirf subject rakho", "isolate",
+//      "transparent background"
+// Multi-step: split on "aur / and / then / phir / fir / , / + / or / ya"
 // No external AI API required — deterministic rule-based parser.
 // ============================================================
 
@@ -21,6 +25,45 @@ const COLOR_WORDS = {
   orange: "#ffa500", narangi: "#ffa500",
   purple: "#800080", baingani: "#800080",
 };
+
+// ------------------------------------------------------------
+// HINGLISH SPELLING NORMALIZATION
+// Maps common truncated/informal spellings to canonical forms
+// BEFORE intent matching. Order matters.
+// ------------------------------------------------------------
+const SPELLING_RULES = [
+  [/\bhataa\b/g, "hata"],
+  [/\bhatade\b/g, "hata de"],
+  [/\bhatao\b/g, "hata do"],
+  [/\bhta\b/g, "hata"],           // "hta" → "hata"
+  [/\bhtade\b/g, "hata de"],
+  [/\bnikaldo\b/g, "nikal do"],
+  [/\bhatado\b/g, "hata do"],
+  [/\bkrdo\b/g, "kar do"],
+  [/\bkardo\b/g, "kar do"],
+  [/\bkr\b/g, "kar"],             // "kr" → "kar"
+  [/\bkro\b/g, "karo"],
+  [/\bkrna\b/g, "karna"],
+  [/\bkarke\b/g, "kar ke"],
+  [/\brhne\b/g, "rehne"],         // "rhne" → "rehne"
+  [/\brehn\b/g, "rehne"],
+  [/\brhndo\b/g, "rehne do"],
+  [/\brakho\b/g, "rakho"],
+  [/\brakhna\b/g, "rakhna"],
+  [/\bchhodo\b/g, "chhod do"],
+  [/\bchodo\b/g, "chhod do"],
+  [/\bbanao\b/g, "bana do"],
+  [/\bbadhaao\b/g, "badha do"],
+  [/\bbdhao\b/g, "badha do"],
+  [/\bbada\b/g, "bada"],
+  [/\bpiche\b/g, "peeche"],
+  [/\bpeechhe\b/g, "peeche"],
+  [/\bpeechha\b/g, "peeche"],
+  [/\bsafed\b/g, "safed"],
+  [/\bko\s+htado\b/g, "ko hata do"],
+  [/\bhata\s+de\b/g, "hata de"],
+  [/\bde\s+do\b/g, "de do"],
+];
 
 // ------------------------------------------------------------
 // Step priority — background ops first, geometry last
@@ -44,16 +87,24 @@ const MAX_STEPS = 5;
 // ------------------------------------------------------------
 
 function normalize(text) {
-  return String(text || "").toLowerCase().replace(/\s+/g, " ").trim();
+  let s = String(text || "").toLowerCase().replace(/\s+/g, " ").trim();
+
+  // Apply Hinglish spelling normalization
+  for (const [pattern, replacement] of SPELLING_RULES) {
+    s = s.replace(pattern, replacement);
+  }
+
+  return s;
 }
 
-// Protect "black and white" / "black & white" from being split on "and"
+// Protect "black and white" style phrases from being split on "and"/"aur"
 function protectPhrases(text) {
   return text
-    .replace(/black\s*(?:and|&| Aur )\s*white/gi, "«BLACKWHITE»")
+    .replace(/black\s*(?:and|&|aur)\s*white/gi, "«BLACKWHITE»")
+    .replace(/black\s+white/gi, "«BLACKWHITE»") // "black white kar do"
     .replace(/b\s*&\s*w/gi, "«BW»")
-    .replace(/kala\s*(?:and|&| aur )\s*safed/gi, "«BLACKWHITE»")
-    .replace(/kaala\s*(?:and|&| aur )\s*safaid/gi, "«BLACKWHITE»");
+    .replace(/kala\s*(?:and|&|aur)?\s*safed/gi, "«BLACKWHITE»")
+    .replace(/kaala\s*(?:and|&|aur)?\s*safaid/gi, "«BLACKWHITE»");
 }
 
 function restorePhrases(text) {
@@ -75,7 +126,6 @@ function findColor(text) {
   for (const [name, hex] of Object.entries(COLOR_WORDS)) {
     if (new RegExp(`\\b${name}\\b`, "i").test(text)) return hex;
   }
-  // hex color literal: #fff / #ffffff
   const hexMatch = text.match(/#([0-9a-f]{3}|[0-9a-f]{6})\b/i);
   if (hexMatch) return hexMatch[0];
   return null;
@@ -84,7 +134,7 @@ function findColor(text) {
 // "kam / thoda / less" vs "zyada / badha / more" modifiers
 function intensity(text) {
   if (/\b(kam|thoda|thodi|less|decrease|halka|halki|reduce|down)\b/i.test(text)) return "reduce";
-  if (/\b(zyada|jyada|badha|badhao|badha\s*do|thoda\s*zyada|more|increase|high|up|boost)\b/i.test(text)) return "increase";
+  if (/\b(zyada|jyada|badha|more|increase|high|up|boost)\b/i.test(text)) return "increase";
   return "default";
 }
 
@@ -105,73 +155,81 @@ function dedupeAndSort(plan) {
 
 // ------------------------------------------------------------
 // SINGLE SEGMENT PARSER — detects one intent from one phrase
+// REMOVE BACKGROUND is checked FIRST (highest semantic priority)
 // ------------------------------------------------------------
 
 function parseSegment(segment) {
   const s = normalize(segment);
 
   // ---------- REMOVE BACKGROUND ----------
-  // "background hata do", "pic me se background hatao", "remove background"
+  // Matches (after normalization):
+  //   "background hata do" / "background remove kar do" / "bg nikal do"
+  //   "pic ka background hata de"
+  //   "details ko hata de pic me se only pic ko rehne de"   ← the failing case
+  //   "sirf main subject rakho" / "only photo rehne do"
+  //   "photo ko isolate kar do" / "background remove karke transparent kar do"
   if (
-    /((?:background|bg|back\s*ground)\s*(?:hata|hatao|hataana|hatana|remove|delete|erase|hataa\s*do|hata\s*do))/.test(s) ||
-    /(hata(?:o|ana|ana)?\s*(?:do|de)?\s*(?:the\s+)?(?:background|bg|peechhe|piche|peeche))/.test(s) ||
-    /(remove|delete|erase)\s+(?:the\s+)?(background|bg)/.test(s) ||
-    /(background|bg)\s+(?:nikal|remove|delete|hata)/.test(s) ||
-    /(peechhe|piche|peeche)\s*(?:ka|ki)?\s*(?:hata|cheez\s*hata)/.test(s)
+    // background + removal verb (any order)
+    /(background|bg|peeche\s+ka|peeche\s+ki)\s*(?:ko|to)?\s*(?:se\s*)?(hata|remove|nikal|delete|erase|clear|saaf)/.test(s) ||
+    /(hata|remove|nikal|delete|erase)\s*(?:do|de|dijiye|karo|kar)?\s*(?:the\s+)?(background|bg)/.test(s) ||
+    /(background|bg)\s+(?:nikal|hata|remove|delete)/.test(s) ||
+    // "details ko hata de ..." — remove unwanted surrounding details
+    /(details?|detail)\s*(?:ko|to)?\s*(?:se\s*)?(hata|remove|nikal|delete|erase)/.test(s) ||
+    // "only/sirf ... subject/photo/pic ... rakho/rehne do/keep"
+    /(only|sirf|sirph|just)\s+(?:main\s+|subject\s+|photo\s+|pic\s+|image\s+)*(subject|photo|pic|image|person|insaan|object|chehra|face)\s*(?:ko)?\s*(rakho|rakh|rehne|rehn|keep|chhod)/.test(s) ||
+    /(sirf|only)\s+(?:main\s+)?(photo|pic|image|subject)\s+(?:rehne|rakho|rakh)/.test(s) ||
+    // "photo ko isolate kar do" / "transparent background"
+    /(photo|pic|image|subject)\s*(?:ko)?\s*(isolate|transparent)\s*(?:kar|karo|karna)?/.test(s) ||
+    /(transparent\s+background)/.test(s) ||
+    /(unwanted)\s+(?:details?|surroundings?|background)/.test(s)
   ) {
     return { action: "remove_background" };
   }
 
   // ---------- REPLACE BACKGROUND ----------
-  // "background white kar do", "background ko blue kar do", "white background lagao"
   const color = findColor(s);
   if (
     color &&
-    /(background|bg|peechhe|piche|peeche)/.test(s) &&
+    /(background|bg|peeche|peeche\s+ka)/.test(s) &&
     /(kar|karo|karna|do|de|lagao|laga|change|replace|badal|set|bana|banana|make)/.test(s)
   ) {
     return { action: "replace_background", color };
   }
-  if (
-    /(replace|change|badal)\s+(?:the\s+)?(background|bg)/.test(s) &&
-    color
-  ) {
+  if (/(replace|change|badal)\s+(?:the\s+)?(background|bg)/.test(s) && color) {
     return { action: "replace_background", color };
   }
 
   // ---------- BLACK & WHITE ----------
   if (
-    /(black\s*(and|&)\s*white|grayscale|greyscale|monochrome|b\s*&\s*w|kala\s*(?:aur\s*)?safed|kaala\s*(?:aur\s*)?safaid)/.test(s)
+    /(black\s*(?:and|&)?\s*white|grayscale|greyscale|monochrome|b\s*&\s*w|kala\s*(?:aur\s*)?safed|kaala\s*(?:aur\s*)?safaid)/.test(s)
   ) {
     return { action: "filter", filter: "black-white" };
   }
 
   // ---------- UPSCALE ----------
-  // "2x upscale", "photo bada kar do", "4x kar do"
-  if (/(upscale|enlarge|bada\s*kar|badha\s*(?:do|de)\s*(?:size|resolution))/.test(s) || /\b([234])\s*x\b/.test(s)) {
+  // "2x bada kar do", "2x upscale", "photo bada kar do"
+  if (/(upscale|enlarge|bada\s*kar|badha\s*(?:do|de)?\s*(?:size|resolution))/.test(s) || /\b([234])\s*x\b/.test(s)) {
     const m = s.match(/\b([234])\s*x\b/);
     const factor = m ? parseInt(m[1], 10) : 2;
     return { action: "upscale", scale: factor };
   }
 
-  // ---------- ENHANCE / HD ----------
-  // "photo ko HD kar do", "face ko clear kar do", "quality improve karo"
+  // ---------- ENHANCE / HD / CLEAR ----------
   if (
-    /(hd|h\.d\.?|high\s*quality|enhance|improve|better|behtar|sudhar|sudhaar|sharpen|sharp\s*kar|clear\s*kar|clear\s*karo|saaf\s*kar|quality\s*(?:badha|improve|acchi|theek))/.test(s)
+    /(hd|h\.d\.?|high\s*quality|enhance|improve|better|behtar|sudhar|sudhaar|sharpen|sharp|clear|saaf\s*kar|quality|crisp)/.test(s)
   ) {
     return { action: "enhance", scale: 1, sharpness: 1.2 };
   }
 
   // ---------- BRIGHTNESS ----------
-  // "brightness thodi badha do", "ujala karo", "photo roshan kar do", "dark kar do"
-  if (/(bright|brightness|ujala|ujlaa|ujal|roshan|roshni|light\s*kar|lighten|chamak\s*(?:badha)?)/.test(s)) {
+  if (/(bright|brightness|ujala|ujlaa|ujal|roshan|roshni|light|lighten|chamak)/.test(s)) {
     const level = intensity(s);
-    if (/(dark|andhera|dheema|dim|kam)/.test(s) || level === "reduce") {
+    if (/(dark|andhera|dheema|dim)/.test(s) || level === "reduce") {
       return { action: "adjust", adjustments: { brightness: 0.72 } };
     }
     return { action: "adjust", adjustments: { brightness: 1.3 } };
   }
-  if (/(dark|andhera|andhere|dheema|dim\s*kar|darken)/.test(s)) {
+  if (/(dark|andhera|andhere|dheema|dim|darken)/.test(s)) {
     return { action: "adjust", adjustments: { brightness: 0.72 } };
   }
 
@@ -184,7 +242,7 @@ function parseSegment(segment) {
 
   // ---------- SATURATION ----------
   if (
-    /(saturat|vibrant|vivid|chamakdar|colors?\s*(?:badha|zyada|vibrant)|rang\s*(?:badha|zyada|gahra)|saturation)/.test(s)
+    /(saturat|vibrant|vivid|chamakdar|colors?\s*(?:badha|zyada|vibrant)|rang\s*(?:badha|zyada|gahra))/.test(s)
   ) {
     const level = intensity(s);
     if (level === "reduce" || /(kam|desaturate|halka)/.test(s)) {
@@ -192,7 +250,7 @@ function parseSegment(segment) {
     }
     return { action: "adjust", adjustments: { saturation: 1.5 } };
   }
-  if (/(desaturate|saturate\s*kam|saturation\s*kam|rang\s*(?:kam|halka|hate))/.test(s)) {
+  if (/(desaturate|saturation\s*kam|rang\s*(?:kam|halka|hate))/.test(s)) {
     return { action: "adjust", adjustments: { saturation: 0.6 } };
   }
 
@@ -203,7 +261,7 @@ function parseSegment(segment) {
   if (/(cool|thanda|thand|cool\s*tone)/.test(s)) {
     return { action: "filter", filter: "cool" };
   }
-  if (/(vintage|retro|purane\s*(?:zamaane\s*)?(?:look|style)|old\s*(?:look|style|photo))/ .test(s)) {
+  if (/(vintage|retro|purane\s*(?:zamaane\s*)?(?:look|style)|old\s*(?:look|style|photo))/.test(s)) {
     return { action: "filter", filter: "vintage" };
   }
   if (/(cinematic|film\s*look|movie\s*look|film\s*jaisa)/.test(s)) {
@@ -215,15 +273,11 @@ function parseSegment(segment) {
   if (/(dramatic|drama)/.test(s)) {
     return { action: "filter", filter: "dramatic" };
   }
-  if (/(natural\s*(?:look|enhance)?)/.test(s) && /(filter|look|kar|bana)/.test(s)) {
-    return { action: "filter", filter: "natural" };
-  }
   if (/(portrait|face\s*(?:clear|enhance|better|behtar|saaf)|chehra\s*(?:clear|saaf|behtar)|selfie)/.test(s)) {
     return { action: "filter", filter: "portrait" };
   }
 
   // ---------- RESIZE ----------
-  // "image ko 1920x1080 kar do", "resize to 800x600"
   const dims = s.match(/(\d{2,5})\s*[xX×]\s*(\d{2,5})/);
   if (dims) {
     const w = parseInt(dims[1], 10);
@@ -237,8 +291,7 @@ function parseSegment(segment) {
   }
 
   // ---------- CROP ----------
-  if (/(crop|kaat|kat\s*do|kaat\s*do|trim|cut\s*kar|center\s*crop)/.test(s)) {
-    // Optional explicit crop box: "crop 100,100 400x400"
+  if (/(crop|kaat|kaat\s*do|kat\s*do|trim|cut\s*kar|center\s*crop)/.test(s)) {
     const box = s.match(/(\d{1,5})\s*[, ]\s*(\d{1,5})\s*(?:\(|,| )?\s*(\d{2,5})\s*[xX×]\s*(\d{2,5})/);
     if (box) {
       return {
@@ -249,19 +302,17 @@ function parseSegment(segment) {
         height: parseInt(box[4], 10),
       };
     }
-    // Center crop to a percentage if given: "crop 50%" → 50% area
     const pct = s.match(/crop\s*(?:to\s*)?(\d{1,2})\s*%/);
     if (pct) {
       const p = Math.min(Math.max(parseInt(pct[1], 10), 10), 90) / 100;
       return { action: "crop_percent", percent: p };
     }
-    // Default: center crop to 80%
     return { action: "crop_percent", percent: 0.8 };
   }
 
   // ---------- ROTATE ----------
-  if (/(rotate|ghuma|ghumao|ghuma\s*do|turn)/.test(s)) {
-    const deg = s.match(/(\d{1,3})\s*(?:degree|deg|°|dharan)?/);
+  if (/(rotate|ghuma|ghumao|turn)/.test(s)) {
+    const deg = s.match(/(\d{1,3})\s*(?:degree|deg|°)?/);
     if (deg) {
       const d = parseInt(deg[1], 10);
       if (d > 0 && d <= 359) return { action: "rotate", degrees: d };
@@ -279,7 +330,7 @@ function parseSegment(segment) {
 
 // ------------------------------------------------------------
 // MAIN PARSER
-// Returns { ok: true, plan } or { ok: false, suggestions }
+// Returns { ok: true, plan } or { ok: false }
 // ------------------------------------------------------------
 
 function parseAiInstruction(instruction) {
@@ -291,7 +342,7 @@ function parseAiInstruction(instruction) {
     if (step) plan.push(step);
   }
 
-  // Whole-instruction fallbacks (multi-word patterns spanning segments)
+  // Whole-instruction fallbacks (patterns spanning segments)
   if (plan.length === 0) {
     const whole = normalize(instruction);
 
@@ -307,8 +358,6 @@ function parseAiInstruction(instruction) {
   }
 
   plan = dedupeAndSort(plan);
-
-  // Flag ambiguous resize (no dimensions) — executor applies 1024x1024
   return { ok: true, plan };
 }
 
