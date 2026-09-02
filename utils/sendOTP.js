@@ -21,11 +21,11 @@ async function sendOTP(to, otp) {
     },
     body: JSON.stringify({
       sender: {
-        name: "AI Mock Interview",
+        name: "AI Interview",
         email: BREVO_SENDER,
       },
       to: [{ email: to }],
-      subject: "Your OTP Code - AI Mock Interview",
+      subject: "Your OTP Code - AI Interview",
       htmlContent: `
         <div style="font-family: Arial, sans-serif; padding: 20px;">
           <h2>Your OTP Code</h2>

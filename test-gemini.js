@@ -1,6 +1,6 @@
 require("dotenv").config();
 
-const key = process.env.GEMINI_API_KEY;
+const key = process.env.GEMINI_API_KEYS;
 console.log("KEY:", key ? "✅ MILA -> " + key.slice(0, 8) + "..." : "❌ UNDEFINED");
 if (!key) process.exit(1);
 

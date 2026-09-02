@@ -47,6 +47,25 @@ message:error.message
 });
 
 
+router.get("/detail/:id", async (req, res) => {
+    try {
+        const result = await Result.findById(req.params.id);
+
+        if (!result) {
+            return res.status(404).json({
+                message: "Result not found"
+            });
+        }
+
+        res.json(result);
+
+    } catch (error) {
+        res.status(500).json({
+            message: error.message
+        });
+    }
+});
+
 
 router.get("/:userId", async(req,res)=>{
 

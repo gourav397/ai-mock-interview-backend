@@ -1,7 +1,7 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "description": "AI Mock Interview Backend",
+  "description": "AI Interview Backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -14,15 +14,19 @@
     "cors": "^2.8.6",
     "dotenv": "^16.4.5",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.6.2",
+    "helmet": "^8.3.0",
     "jsonrepair": "^3.15.0",
     "jsonwebtoken": "^9.0.3",
-    "mammoth": "^1.12.0",
+    "mammoth": "^1.12.1",
     "mongoose": "^9.7.4",
     "multer": "^2.2.0",
+    "node-cron": "^4.6.0",
     "nodemailer": "^9.0.5",
     "otp-generator": "^4.0.1",
-    "pdf-parse": "^1.1.1",
-    "resend": "^6.19.0"
+    "pdf-parse": "^1.1.4",
+    "resend": "^6.19.0",
+    "sharp": "^0.35.4"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"
