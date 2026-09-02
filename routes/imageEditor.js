@@ -1,8 +1,9 @@
 // ============================================================
-// AI IMAGE EDITOR — Routes (PRODUCTION v3.0)
+// AI IMAGE EDITOR — Routes (PRODUCTION v4.0)
 // Mounted at /api/image-editor/*
 // Stateless: client sends `imagePath` (server filename) for chained edits.
 // Safe against path traversal — only basenames inside TEMP_DIR resolve.
+// ai-edit uses utils/aiEditParser for Hindi/Hinglish/English + multi-step.
 // ============================================================
 
 const express = require("express");
@@ -10,6 +11,7 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const { ImageProcessor, TEMP_DIR } = require("../utils/imageProcessor");
+const { parseAiInstruction, describeStep } = require("../utils/aiEditParser");
 
 const router = express.Router();
 
@@ -82,13 +84,87 @@ function buildImageData(filename, extra = {}) {
 }
 
 // ============================================
+// AI EDIT — plan executor
+// Executes the parsed plan sequentially on the buffer.
+// Returns { buffer, executed, notices, failedAt }
+// ============================================
+
+async function executePlan(buffer, plan) {
+  let current = buffer;
+  const executed = [];
+  const notices = [];
+
+  for (const step of plan) {
+    try {
+      switch (step.action) {
+        case "remove_background": {
+          const result = await ImageProcessor.removeBackground(current);
+          current = result.buffer;
+          if (result.provider === "fallback") {
+            notices.push(
+              "Background removal used local fallback (PNG conversion only — no real segmentation). Set REMOVE_BG_API_KEY for real background removal."
+            );
+          } else {
+            notices.push("Background removed using remove.bg provider.");
+          }
+          break;
+        }
+        case "replace_background":
+          current = await ImageProcessor.replaceBackground(current, { color: step.color });
+          break;
+        case "filter":
+          current = await ImageProcessor.applyFilter(current, step.filter);
+          break;
+        case "adjust":
+          current = await ImageProcessor.adjust(current, step.adjustments);
+          break;
+        case "enhance":
+          current = (await ImageProcessor.enhance(current, { scale: step.scale || 1, sharpness: step.sharpness || 1.2 })).buffer;
+          break;
+        case "upscale":
+          current = (await ImageProcessor.enhance(current, { scale: step.scale, sharpness: 0.8 })).buffer;
+          break;
+        case "resize":
+          current = await ImageProcessor.resize(current, step.width, step.height);
+          break;
+        case "crop":
+          current = await ImageProcessor.crop(current, step.left, step.top, step.width, step.height);
+          break;
+        case "crop_percent": {
+          // Center crop to a percentage of current dimensions
+          const meta = await ImageProcessor.getMetadata(current);
+          const w = meta?.width || 0;
+          const h = meta?.height || 0;
+          const cw = Math.max(1, Math.round(w * step.percent));
+          const ch = Math.max(1, Math.round(h * step.percent));
+          const left = Math.round((w - cw) / 2);
+          const top = Math.round((h - ch) / 2);
+          current = await ImageProcessor.crop(current, left, top, cw, ch);
+          break;
+        }
+        case "rotate":
+          current = await ImageProcessor.rotate(current, step.degrees);
+          break;
+        default:
+          throw new Error(`Unknown plan action: ${step.action}`);
+      }
+      executed.push(step);
+    } catch (err) {
+      return { buffer: current, executed, notices, failedAt: step, error: err.message };
+    }
+  }
+
+  return { buffer: current, executed, notices, failedAt: null, error: null };
+}
+
+// ============================================
 // GET /api/image-editor/status
 // ============================================
 router.get("/status", (req, res) => {
   res.json({
     success: true,
     data: {
-      version: "3.0.0",
+      version: "4.0.0",
       supportedFormats: ["image/jpeg", "image/png", "image/webp"],
       maxFileSize: "20MB",
       maxDimensions: "8192px",
@@ -97,6 +173,11 @@ router.get("/status", (req, res) => {
         "enhance", "upscale", "filters", "adjust", "resize", "crop", "rotate",
         "remove-background", "replace-background", "ai-edit", "compare", "download",
       ],
+      aiEdit: {
+        languages: ["english", "hindi", "hinglish"],
+        multiStep: true,
+        backgroundRemovalProvider: process.env.REMOVE_BG_API_KEY ? "remove.bg" : "fallback",
+      },
       freeUserLimits: {
         maxFileSize: "10MB (free), 20MB (premium)",
         dailyEdits: 50,
@@ -128,7 +209,6 @@ router.post("/upload", upload.single("image"), async (req, res) => {
     const userId = req.user?._id?.toString() || "anon";
     const savedName = await ImageProcessor.saveTemp(file.buffer, userId);
 
-    // Optional session support (express-session may not be installed — guard safely)
     if (req.session) {
       req.session.lastImage = savedName;
     }
@@ -256,7 +336,6 @@ router.post("/filter", validateImage, async (req, res) => {
 // ============================================
 router.post("/adjust", validateImage, async (req, res) => {
   try {
-    // Accept { imagePath, adjustments: {...} } or flat { brightness, contrast, ... }
     const adjustments = req.body?.adjustments || req.body || {};
     const buffer = await loadImageBuffer(req);
     if (!buffer) {
@@ -369,12 +448,17 @@ const removeBackgroundHandler = async (req, res) => {
     }
 
     const result = await ImageProcessor.removeBackground(buffer);
-    const savedName = await ImageProcessor.saveTemp(result, "nobg");
+    const savedName = await ImageProcessor.saveTemp(result.buffer, "nobg");
+
+    const message =
+      result.provider === "remove.bg"
+        ? "Background removed using remove.bg."
+        : "Background removal fallback applied (PNG conversion only — no real segmentation). Set REMOVE_BG_API_KEY for real background removal.";
 
     return res.json({
       success: true,
-      message: "Background removal (fallback) applied. Output is PNG.",
-      data: buildImageData(savedName),
+      message,
+      data: buildImageData(savedName, { provider: result.provider }),
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: `Background removal failed: ${err.message}` });
@@ -409,11 +493,12 @@ router.post("/replace-background", validateImage, async (req, res) => {
 
 // ============================================
 // POST /api/image-editor/ai-edit — Natural Language Editing
+// Hindi / Hinglish / English + multi-step commands
 // ============================================
 router.post("/ai-edit", validateImage, async (req, res) => {
   try {
     const { instruction } = req.body || {};
-    if (!instruction || typeof instruction !== "string") {
+    if (!instruction || typeof instruction !== "string" || !instruction.trim()) {
       return res.status(400).json({ success: false, message: "Instruction text is required." });
     }
 
@@ -422,99 +507,55 @@ router.post("/ai-edit", validateImage, async (req, res) => {
       return res.status(404).json({ success: false, message: "Image not found or expired. Upload again." });
     }
 
-    const lower = instruction.toLowerCase().trim();
+    const parsed = parseAiInstruction(instruction);
 
-    // remove background
-    if (/remove\s+(the\s+)?background/i.test(lower) || /delete\s+background/i.test(lower)) {
-      const result = await ImageProcessor.removeBackground(buffer);
-      const savedName = await ImageProcessor.saveTemp(result, "ai_bg");
+    if (!parsed.ok) {
+      // Fallback: don't show a generic error — suggest what IS supported
       return res.json({
-        success: true,
-        message: "Background removed.",
-        data: { instruction, action: "remove_background", ...buildImageData(savedName) },
+        success: false,
+        message: `Instruction "${instruction.trim()}" samajh nahi aayi. Try: "background hata do", "photo HD kar do", "brightness badha do", "black and white kar do", "background white kar do", "vintage look do", "1920x1080 kar do", "rotate 90", "crop 50%", "contrast badha do" — ya multi-step: "background hata do aur HD kar do".`,
+        supportedInstructions: [
+          "Remove the background / background hata do",
+          "Replace background with color / background white kar do",
+          "Enhance / HD kar do / photo behtar kar do",
+          "Brightness badha do / kam kar do",
+          "Contrast / saturation badha do ya kam karo",
+          "Black and white / kala safed kar do",
+          "Warm / cool / vintage / cinematic / soft / dramatic look do",
+          "Resize to WxH / image ko 1920x1080 kar do",
+          "Crop / crop 50% / center crop karo",
+          "Rotate 90 / photo ghumao",
+          "Multi-step: 'background hata do aur HD kar do'",
+        ],
       });
     }
 
-    // replace background
-    if (/replace\s+(the\s+)?background/i.test(lower)) {
-      const colors = {
-        white: "#ffffff", black: "#000000", blue: "#0000ff", red: "#ff0000",
-        green: "#00ff00", gray: "#808080", grey: "#808080",
-      };
-      let color = "#ffffff";
-      for (const [name, hex] of Object.entries(colors)) {
-        if (lower.includes(name)) { color = hex; break; }
-      }
-      const result = await ImageProcessor.replaceBackground(buffer, { color });
-      const savedName = await ImageProcessor.saveTemp(result, "ai_bgrep");
-      return res.json({
-        success: true,
-        message: `Background replaced with ${color}.`,
-        data: { instruction, action: "replace_background", color, ...buildImageData(savedName) },
+    const { buffer: resultBuffer, executed, notices, failedAt, error } = await executePlan(buffer, parsed.plan);
+
+    if (executed.length === 0) {
+      return res.status(500).json({
+        success: false,
+        message: `AI edit failed at step "${failedAt ? describeStep(failedAt) : "unknown"}": ${error}`,
       });
     }
 
-    // enhance / upscale
-    if (/(improve|enhance|make\s+better|upscale|hd|high\s+quality)/i.test(lower)) {
-      const scale = /2x|4x|high|ultra|hd/i.test(lower) ? 2 : 1.5;
-      const result = await ImageProcessor.enhance(buffer, { scale });
-      const savedName = await ImageProcessor.saveTemp(result.buffer, "ai_enhanced");
-      return res.json({
-        success: true,
-        message: "Image enhanced.",
-        data: { instruction, action: "enhance", scale, ...buildImageData(savedName) },
-      });
-    }
+    const savedName = await ImageProcessor.saveTemp(resultBuffer, "ai_edit");
+    const stepNames = executed.map(describeStep);
 
-    // brightness
-    if (/(bright|darker|lighten)/i.test(lower)) {
-      const isBright = /bright|lighten/i.test(lower);
-      const result = await ImageProcessor.adjust(buffer, { brightness: isBright ? 1.3 : 0.7 });
-      const savedName = await ImageProcessor.saveTemp(result, "ai_bright");
-      return res.json({
-        success: true,
-        message: isBright ? "Image brightened." : "Image darkened.",
-        data: { instruction, action: "adjust_brightness", ...buildImageData(savedName) },
-      });
-    }
-
-    // black & white
-    if (/(black\s*(and|&)\s*white|grayscale|monochrome|b&w)/i.test(lower)) {
-      const result = await ImageProcessor.applyFilter(buffer, "black-white");
-      const savedName = await ImageProcessor.saveTemp(result, "ai_bw");
-      return res.json({
-        success: true,
-        message: "Converted to black & white.",
-        data: { instruction, action: "black_white", ...buildImageData(savedName) },
-      });
-    }
-
-    // crop/resize to WxH
-    if (/(crop|trim|cut|resize)/i.test(lower) && /(\d+)\s*[xX]\s*(\d+)/.test(lower)) {
-      const match = lower.match(/(\d+)\s*[xX]\s*(\d+)/);
-      const w = parseInt(match[1], 10);
-      const h = parseInt(match[2], 10);
-      const result = await ImageProcessor.resize(buffer, w, h);
-      const savedName = await ImageProcessor.saveTemp(result, "ai_resize");
-      return res.json({
-        success: true,
-        message: `Image resized to ${w}x${h}.`,
-        data: { instruction, action: "resize", width: w, height: h, ...buildImageData(savedName) },
-      });
-    }
-
-    // Unknown instruction
     return res.json({
-      success: false,
-      message: `I couldn't understand the instruction: "${instruction}".`,
-      supportedInstructions: [
-        "Remove the background",
-        "Replace the background with [color]",
-        "Enhance / improve image quality",
-        "Make it brighter / darker",
-        "Convert to black and white",
-        "Resize to WxH dimensions",
-      ],
+      success: true,
+      message: `AI applied ${executed.length} step${executed.length > 1 ? "s" : ""}: ${stepNames.join(" → ")}.${notices.length > 0 ? " " + notices.join(" ") : ""}${
+        failedAt ? ` Note: step "${describeStep(failedAt)}" failed (${error}) — earlier steps applied.` : ""
+      }`,
+      data: {
+        instruction: instruction.trim(),
+        action: "ai_edit_plan",
+        plan: parsed.plan,
+        executed: stepNames,
+        stepsApplied: executed.length,
+        notices,
+        ...buildImageData(savedName),
+      },
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: `AI edit failed: ${err.message}` });

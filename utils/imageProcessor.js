@@ -1,6 +1,8 @@
 // ============================================================
-// IMAGE PROCESSOR — Sharp Pipeline (PRODUCTION v3.0)
+// IMAGE PROCESSOR — Sharp Pipeline (PRODUCTION v4.0)
 // Exports: ImageProcessor object + TEMP_DIR + backward-compat functions
+// removeBackground: real remove.bg integration if REMOVE_BG_API_KEY set,
+//                   otherwise honest local fallback (PNG conversion only)
 // ============================================================
 
 const sharp = require("sharp");
@@ -33,7 +35,6 @@ const ALLOWED_MIME = ["image/jpeg", "image/png", "image/webp"];
 // ============================================================
 
 const clamp = (num, min, max) => Math.min(Math.max(num, min), max);
-
 const EXT_MAP = { jpeg: "jpg", jpg: "jpg", png: "png", webp: "webp", tiff: "jpg", gif: "jpg" };
 
 function sanitizeNameHint(nameHint) {
@@ -57,7 +58,7 @@ const FILTER_PRESETS = {
   natural: async (img) => img,
   brighten: async (img) => img.modulate({ brightness: 1.3 }),
   darken: async (img) => img.modulate({ brightness: 0.7 }),
-  contrast: async (img) => img.linear(1.5, -128 * 0.5),
+  contrast: async (img) => img.linear(1.5, -64),
   saturate: async (img) => img.modulate({ saturation: 1.8 }),
   desaturate: async (img) => img.modulate({ saturation: 0.2 }),
   warm: async (img) => img.tint({ r: 255, g: 200, b: 150 }).modulate({ saturation: 1.1 }),
@@ -65,11 +66,12 @@ const FILTER_PRESETS = {
   vintage: async (img) =>
     img.tint({ r: 235, g: 200, b: 160 }).modulate({ saturation: 0.6, brightness: 0.9 }).gamma(1.2),
   bw: async (img) => img.toColorspace("b-w"),
-  "black-white": async (img) => img.toColorspace("b-w"), // alias
-  grayscale: async (img) => img.toColorspace("b-w"), // alias
+  "black-white": async (img) => img.toColorspace("b-w"),
+  grayscale: async (img) => img.toColorspace("b-w"),
   cinematic: async (img) =>
     img.modulate({ saturation: 0.4, brightness: 0.9 }).linear(1.3, -32).gamma(1.1),
-  portrait: async (img) => img.modulate({ brightness: 1.1, saturation: 0.9 }).sharpen({ sigma: 1.2 }).blur(0.3),
+  portrait: async (img) =>
+    img.modulate({ brightness: 1.1, saturation: 0.9 }).sharpen({ sigma: 1.2 }).blur(0.3),
   soft: async (img) => img.modulate({ brightness: 1.05 }).blur(0.5).gamma(0.9),
   vivid: async (img) => img.modulate({ saturation: 1.6, brightness: 1.1 }).sharpen({ sigma: 0.8 }),
   dramatic: async (img) =>
@@ -165,7 +167,7 @@ async function applyFilter(buffer, filterName) {
 
 // ============================================================
 // APPLY ADJUSTMENTS — brightness / contrast / saturation
-// contrast is applied around the 128 midpoint so 1.0 = no change
+// contrast applied around 128 midpoint so 1.0 = no change
 // ============================================================
 
 async function applyAdjustments(buffer, adjustments = {}) {
@@ -186,6 +188,12 @@ async function applyAdjustments(buffer, adjustments = {}) {
     const c = clamp(Number(adjustments.contrast), 0.1, 3);
     // out = c * (in - 128) + 128  → identity when c === 1
     img = img.linear(c, 128 * (1 - c));
+  }
+
+  // PNG input with alpha → preserve transparency
+  const meta = await sharp(buffer).metadata();
+  if (meta.format === "png" && meta.hasAlpha) {
+    return img.png().toBuffer();
   }
 
   return img.jpeg({ quality: 92 }).toBuffer();
@@ -304,20 +312,50 @@ async function rotate(buffer, degrees = 90) {
 }
 
 // ============================================================
-// REMOVE BACKGROUND (FALLBACK)
-// NOTE: Local fallback converts to PNG preserving alpha but does NOT
-// segment the subject. For real background removal, integrate a provider:
-//   remove.bg API  → POST https://api.remove.bg/v1.0/removebg
-//   Replicate      → e.g. lucataco/remove-bg model
-// Wire the provider here using process.env.BG_REMOVER_PROVIDER.
+// REMOVE BACKGROUND
+// Provider: remove.bg API if REMOVE_BG_API_KEY env is set (real segmentation)
+// Fallback: local PNG conversion (NO actual subject segmentation — honest)
+// Returns { buffer, provider } where provider is
+//   "remove.bg" | "fallback"
 // ============================================================
 
 async function removeBackground(buffer) {
-  return sharp(buffer).rotate().png().toBuffer();
+  const apiKey = process.env.REMOVE_BG_API_KEY;
+
+  if (apiKey && typeof globalThis.fetch === "function") {
+    try {
+      const form = new FormData();
+      form.append("image_file", new Blob([buffer], { type: "image/png" }), "image.png");
+      form.append("size", "auto");
+
+      const res = await fetch("https://api.remove.bg/v1.0/removebg", {
+        method: "POST",
+        headers: { "X-Api-Key": apiKey },
+        body: form,
+      });
+
+      if (res.ok) {
+        const outBuffer = Buffer.from(await res.arrayBuffer());
+        return { buffer: outBuffer, provider: "remove.bg" };
+      }
+
+      console.error(
+        `[ImageProcessor] remove.bg failed (${res.status}). Falling back to local PNG conversion.`
+      );
+    } catch (err) {
+      console.error(`[ImageProcessor] remove.bg error: ${err.message}. Using fallback.`);
+    }
+  }
+
+  // Honest local fallback — converts to PNG preserving alpha, no segmentation
+  const fallbackBuffer = await sharp(buffer).rotate().png().toBuffer();
+  return { buffer: fallbackBuffer, provider: "fallback" };
 }
 
 // ============================================================
 // REPLACE BACKGROUND (FALLBACK — flattens alpha onto color)
+// Best used AFTER real background removal; without alpha it just
+// composites the image over the color where transparent.
 // ============================================================
 
 async function replaceBackground(buffer, options = {}) {
@@ -348,7 +386,9 @@ async function generatePreview(buffer) {
   const h = metadata.height || 600;
 
   const resizeOpts =
-    w > maxDimension || h > maxDimension ? { width: maxDimension, height: maxDimension, fit: "inside", withoutEnlargement: true } : {};
+    w > maxDimension || h > maxDimension
+      ? { width: maxDimension, height: maxDimension, fit: "inside", withoutEnlargement: true }
+      : {};
 
   await sharp(buffer).rotate().resize(resizeOpts).jpeg({ quality: 80 }).toFile(previewPath);
 
@@ -418,7 +458,7 @@ const ImageProcessor = {
   upscale,
   applyFilter,
   applyAdjustments,
-  adjust: applyAdjustments, // alias used by routes
+  adjust: applyAdjustments,
   resize,
   crop,
   rotate,
@@ -435,7 +475,7 @@ module.exports = {
   TEMP_DIR,
   PREVIEW_DIR,
 
-  // Backward-compatible individual exports (old consumers keep working)
+  // Backward-compatible individual exports
   applyFilter,
   applyAdjustments,
   enhance,
