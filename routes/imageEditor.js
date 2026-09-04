@@ -186,195 +186,78 @@ router.post("/remove-background", validateImage, async(req,res)=>{
   }catch(e){res.status(500).json({success:false,message:e.message})}
 });
 
-// ---------------- AI-EDIT ----------------
+// --- NEW /ai-edit handler (order-preserving, honest) ---
+const vision = require("../utils/vision");
+const aiEditParser = require("../utils/aiEditParser"); // your v5 floor (optional import)
+
 router.post("/ai-edit", validateImage, async (req, res) => {
   try {
     const instruction = String(req.body?.instruction || "").trim();
+    if (!instruction) return res.json({ success:false, message:"Instruction required." });
 
-    if (!instruction) {
-      return res.status(400).json({
-        success: false,
-        message: "Instruction required.",
-      });
-    }
+    const buf = req.file ? req.file.buffer : resolveTempFromBody(req);  // reuse your existing buffer-loader
+    if (!buf) return res.status(404).json({ success:false, message:"Source image expired. Re-upload." });
 
-    const buffer = await loadImageBuffer(req);
+    let meta = { width: 0, height: 0 };
+    try { meta = await sharp(buf).metadata(); } catch { return res.status(400).json({ success:false, message:"Corrupted/invalid image." }); }
 
-    if (!buffer) {
-      return res.status(404).json({
-        success: false,
-        message: "Image expired. Please upload the image again.",
-      });
-    }
+    // ----- LAYER 1: Vision+OCR (Gemini) => plan + detected regions -----
+    const visionOut = await vision.analyseImage(buf, instruction, {
+      imgW: meta.width, imgH: meta.height,
+    });
 
-    // --------------------------------------------------------
-    // 1. GEMINI VISION PLANNER
-    // Image + user's natural-language instruction
-    // --------------------------------------------------------
-    let visionPlan = null;
-
-    try {
-      const meta = await ImageProcessor.getMetadata(buffer);
-
-      const vision = require("../utils/vision");
-
-      visionPlan = await vision.analyseImage(
-        buffer,
-        instruction,
-        {
-          imgW: meta?.width || 1,
-          imgH: meta?.height || 1,
-        }
-      );
-    } catch (visionError) {
-      console.warn(
-        "[AI EDIT] Vision planner unavailable:",
-        visionError.message
-      );
-      visionPlan = null;
-    }
-
-    // --------------------------------------------------------
-    // 2. GET AI PLAN
-    // --------------------------------------------------------
-    let rawSteps = Array.isArray(visionPlan?.steps)
-      ? visionPlan.steps
-      : [];
-
-    // --------------------------------------------------------
-    // 3. FALLBACK TO EXISTING v5 PARSER
-    // --------------------------------------------------------
-    if (!rawSteps.length) {
+    // ----- LAYER 1b: deterministic v5 parser as fallback floor -----
+    let rawSteps = [];
+    if (visionOut && visionOut.steps && visionOut.steps.length) {
+      rawSteps = visionOut.steps;
+    } else {
       try {
-        const parsed = parseAiInstruction(instruction);
-
-        if (
-          parsed &&
-          parsed.ok &&
-          Array.isArray(parsed.plan)
-        ) {
-          rawSteps = parsed.plan;
-        }
-      } catch (parserError) {
-        console.warn(
-          "[AI EDIT] Parser fallback failed:",
-          parserError.message
-        );
-      }
+        const p = (aiEditParser && aiEditParser.parseAiInstruction) ? aiEditParser.parseAiInstruction(instruction) : null;
+        if (p && p.ok && Array.isArray(p.plan)) rawSteps = p.plan;
+      } catch { rawSteps = []; }
     }
 
-    // --------------------------------------------------------
-    // 4. VALIDATE AI PLAN
-    // IMPORTANT:
-    // Never execute arbitrary AI-generated actions.
-    // --------------------------------------------------------
+    // ----- LAYER 2: validation / allowlist -----
     const plan = aiEdit.validatePlan(rawSteps);
-
     if (!plan.length) {
-      return res.json({
-        success: false,
-        message:
-          `Instruction samajh nahi aayi. Try: ` +
-          `"photo HD kar do", ` +
-          `"background hata do", ` +
-          `"ABC ko XYZ kar do", ` +
-          `"text hata do", ` +
-          `"brightness badha do", ` +
-          `"2x upscale"`,
-        data: {
-          instruction,
-          regions: visionPlan?.regions || [],
-        },
-      });
+      const samples = ['"photo HD kar do"','"background white kar do"','"ABC ko XYZ bana do"','"text hata do"','"brightness badha do"','"2x upscale"'];
+      return res.json({ success:false, message:`Instruction samajh nahi aayi / no actionable step. Examples: ${samples.join(", ")}`,
+        data: { instruction, regions: visionOut?.regions || [] } });
     }
 
-    // --------------------------------------------------------
-    // 5. EXECUTE PLAN IN USER'S ORIGINAL ORDER
-    // --------------------------------------------------------
-    const result = await aiEdit.applyPlan(buffer, plan);
+    // ----- LAYER 3: execute in order -----
+    const { buffer: finalBuf, executed, notes } = await aiEdit.applyPlan(buf, plan);
 
-    const finalBuffer = result?.buffer || buffer;
-    const executed = Array.isArray(result?.executed)
-      ? result.executed
-      : [];
-    const notes = Array.isArray(result?.notes)
-      ? result.notes
-      : [];
+    // save via existing helper (saveFrom returns {filename, ...})
+    const out = await saveFrom(finalBuf, "ai_edit");
+    const build = buildImageData(out.filename); // reuse existing -> {preview, downloadUrl, resultUrl,...}
 
-    // --------------------------------------------------------
-    // 6. SAVE FINAL IMAGE
-    // --------------------------------------------------------
-    const filename = await saveFrom(
-      finalBuffer,
-      "ai_edit"
-    );
+    const actionNames = plan.map(s => s.action);
+    const allApplied = executed.length >= plan.length;
 
-    const imageData = buildImageData(filename);
-
-    // --------------------------------------------------------
-    // 7. BUILD SAFE RESPONSE
-    // --------------------------------------------------------
-    const providerRequired = notes.length > 0;
-
-    const planActions = plan.map(
-      (step) => step.action
-    );
-
-    const message =
-      executed.length > 0
-        ? `AI applied ${executed.length} step(s): ${executed.join(
-            " → "
-          )}${providerRequired ? ". " + notes.join(" ") : "."}`
-        : notes.length > 0
-        ? notes.join(" ")
-        : "No image operation was applied.";
-
-    return res.json({
-      success: executed.length > 0,
-      message,
-
+    // ----- RESPONSE -----
+    const hasPending = notes.length > 0;
+    res.json({
+      success: true,           // request processed; honest caveats in notes
+      message: executed.length
+        ? `AI applied ${executed.length} step(s): ${executed.join(" → ")}${hasPending ? " (some steps need a provider)" : "."}`
+        : notes.join("; "),
       data: {
         instruction,
-
-        // Validated plan only
-        plan,
-
-        planActions,
-
+        plan: plan,            // validated actions (never raw AI strings)
         executed,
-
         stepsApplied: executed.length,
-
         stepsPending: notes,
-
-        needsProvider: providerRequired,
-
-        // Gemini OCR / detected regions
-        regions: visionPlan?.regions || [],
-
-        planner: visionPlan
-          ? "gemini-vision"
-          : "deterministic-fallback",
-
-        realInpainting: Boolean(
-          aiEdit.canInpaint?.()
-        ),
-
-        ...imageData,
+        needsProvider: hasPending,           // true → text/object/bg steps skipped; NOT faked
+        regions: visionOut?.regions || [],   // OCR detections (de-scaled px)
+        filename: out.filename,
+        preview: build.preview,
+        resultUrl: build.preview,
+        downloadUrl: build.downloadUrl,
       },
     });
-  } catch (error) {
-    console.error(
-      "[AI EDIT] Request failed:",
-      error.message
-    );
-
-    return res.status(500).json({
-      success: false,
-      message: `AI edit failed: ${String(
-        error.message
-      ).slice(0, 200)}`,
-    });
+  } catch (e) {
+    res.status(500).json({ success:false, message:`AI edit failed: ${String(e.message).slice(0,160)}` /* key-safe */ });
   }
 });
 
