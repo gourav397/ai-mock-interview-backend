@@ -1,95 +1,138 @@
 // ============================================================
-// AI EDIT PARSER — Natural Language Intent Detection (v4.1)
-// Supports: English, Hindi (Latin script), Hinglish
-// NEW: Hinglish spelling normalization (hta → hata, rhne → rehne, ...)
-// NEW: "details ko hta de pic me se only pic ko rhne de"
-//      → recognized as remove background / unwanted surroundings
-// NEW: "black white" (without "and"), "sirf subject rakho", "isolate",
-//      "transparent background"
-// Multi-step: split on "aur / and / then / phir / fir / , / + / or / ya"
-// No external AI API required — deterministic rule-based parser.
+// AI EDIT PARSER — Natural Language Image Editing (v5.0)
+// ============================================================
+// Supports:
+//   English
+//   Hindi (Latin/Roman)
+//   Hinglish
+//   Informal/chat spelling
+//   Multiple actions in one command
+//   User command order preserved
+//
+// Examples:
+//   "photo HD kar do"
+//   "pic ko bright aur clear kar do"
+//   "background hata ke HD kar do"
+//   "background remove karo aur black white kar do"
+//   "face clear karo, brightness thodi badhao"
+//   "photo professional bana do"
+//   "peeche ki saari extra details hata do"
+//   "sirf subject rakho"
+//   "background white kar do"
+//   "2x bada karo"
+//   "1920x1080 kar do"
+//   "crop 50%"
+//   "90 degree ghumao"
 // ============================================================
 
-// ------------------------------------------------------------
-// COLOR VOCABULARY (hex values)
-// ------------------------------------------------------------
 const COLOR_WORDS = {
-  white: "#ffffff", safed: "#ffffff", safaid: "#ffffff", saphed: "#ffffff",
-  black: "#000000", kaala: "#000000", kala: "#000000",
-  blue: "#0000ff", neela: "#0000ff", neeli: "#0000ff",
-  red: "#ff0000", laal: "#ff0000", lal: "#ff0000", surkh: "#ff0000",
-  green: "#00cc66", hara: "#00cc66", sabz: "#00cc66",
-  gray: "#808080", grey: "#808080", slati: "#808080", slate: "#808080",
-  yellow: "#ffff00", peela: "#ffff00", pila: "#ffff00",
-  pink: "#ffc0cb", gulabi: "#ffc0cb",
-  orange: "#ffa500", narangi: "#ffa500",
-  purple: "#800080", baingani: "#800080",
+  white: "#ffffff",
+  safed: "#ffffff",
+  safaid: "#ffffff",
+  saphed: "#ffffff",
+
+  black: "#000000",
+  kala: "#000000",
+  kaala: "#000000",
+
+  blue: "#0000ff",
+  neela: "#0000ff",
+  neeli: "#0000ff",
+
+  red: "#ff0000",
+  laal: "#ff0000",
+  lal: "#ff0000",
+
+  green: "#00cc66",
+  hara: "#00cc66",
+  hari: "#00cc66",
+
+  gray: "#808080",
+  grey: "#808080",
+
+  yellow: "#ffff00",
+  peela: "#ffff00",
+  pila: "#ffff00",
+
+  pink: "#ffc0cb",
+  gulabi: "#ffc0cb",
+
+  orange: "#ffa500",
+  narangi: "#ffa500",
+
+  purple: "#800080",
+  baingani: "#800080",
 };
 
 // ------------------------------------------------------------
-// HINGLISH SPELLING NORMALIZATION
-// Maps common truncated/informal spellings to canonical forms
-// BEFORE intent matching. Order matters.
+// COMMON HINGLISH / CHAT SPELLINGS
 // ------------------------------------------------------------
+
 const SPELLING_RULES = [
   [/\bhataa\b/g, "hata"],
-  [/\bhatade\b/g, "hata de"],
   [/\bhatao\b/g, "hata do"],
-  [/\bhta\b/g, "hata"],           // "hta" → "hata"
+  [/\bhtado\b/g, "hata do"],
   [/\bhtade\b/g, "hata de"],
+  [/\bhta\b/g, "hata"],
+
   [/\bnikaldo\b/g, "nikal do"],
-  [/\bhatado\b/g, "hata do"],
+  [/\bnikalna\b/g, "nikalna"],
+
   [/\bkrdo\b/g, "kar do"],
   [/\bkardo\b/g, "kar do"],
-  [/\bkr\b/g, "kar"],             // "kr" → "kar"
-  [/\bkro\b/g, "karo"],
   [/\bkrna\b/g, "karna"],
-  [/\bkarke\b/g, "kar ke"],
-  [/\brhne\b/g, "rehne"],         // "rhne" → "rehne"
-  [/\brehn\b/g, "rehne"],
-  [/\brhndo\b/g, "rehne do"],
-  [/\brakho\b/g, "rakho"],
-  [/\brakhna\b/g, "rakhna"],
-  [/\bchhodo\b/g, "chhod do"],
-  [/\bchodo\b/g, "chhod do"],
+  [/\bkro\b/g, "karo"],
+  [/\bkr\b/g, "kar"],
+
+  [/\bbnao\b/g, "bana do"],
   [/\bbanao\b/g, "bana do"],
+  [/\bbnado\b/g, "bana do"],
+
+  [/\bbdhao\b/g, "badha do"],
   [/\bbadhaao\b/g, "badha do"],
   [/\bbdhao\b/g, "badha do"],
-  [/\bbada\b/g, "bada"],
+  [/\bbdhado\b/g, "badha do"],
+
+  [/\bghumao\b/g, "ghuma do"],
+  [/\bghumado\b/g, "ghuma do"],
+
+  [/\brhne\b/g, "rehne"],
+  [/\brhn\b/g, "rehne"],
+  [/\brhndo\b/g, "rehne do"],
+
+  [/\brakho\b/g, "rakho"],
+  [/\brkh\b/g, "rakh"],
+
+  [/\bchhodo\b/g, "chhod do"],
+  [/\bchodo\b/g, "chhod do"],
+
   [/\bpiche\b/g, "peeche"],
   [/\bpeechhe\b/g, "peeche"],
   [/\bpeechha\b/g, "peeche"],
-  [/\bsafed\b/g, "safed"],
-  [/\bko\s+htado\b/g, "ko hata do"],
-  [/\bhata\s+de\b/g, "hata de"],
-  [/\bde\s+do\b/g, "de do"],
+
+  [/\bthoda\b/g, "thoda"],
+  [/\bthodi\b/g, "thodi"],
+
+  [/\bzyada\b/g, "zyada"],
+  [/\bjyaada\b/g, "zyada"],
+  [/\bjayada\b/g, "zyada"],
+  [/\bjyada\b/g, "zyada"],
+
+  [/\bsafai\b/g, "saaf"],
 ];
 
 // ------------------------------------------------------------
-// Step priority — background ops first, geometry last
-// ------------------------------------------------------------
-const STEP_PRIORITY = {
-  remove_background: 0,
-  replace_background: 0,
-  filter: 1,
-  adjust: 1,
-  enhance: 2,
-  upscale: 2,
-  resize: 3,
-  crop: 3,
-  rotate: 3,
-};
-
-const MAX_STEPS = 5;
-
-// ------------------------------------------------------------
-// Helpers
+// NORMALIZATION
 // ------------------------------------------------------------
 
 function normalize(text) {
-  let s = String(text || "").toLowerCase().replace(/\s+/g, " ").trim();
+  let s = String(text || "")
+    .toLowerCase()
+    .replace(/[“”‘’]/g, '"')
+    .replace(/[–—]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
 
-  // Apply Hinglish spelling normalization
   for (const [pattern, replacement] of SPELLING_RULES) {
     s = s.replace(pattern, replacement);
   }
@@ -97,305 +140,655 @@ function normalize(text) {
   return s;
 }
 
-// Protect "black and white" style phrases from being split on "and"/"aur"
-function protectPhrases(text) {
-  return text
-    .replace(/black\s*(?:and|&|aur)\s*white/gi, "«BLACKWHITE»")
-    .replace(/black\s+white/gi, "«BLACKWHITE»") // "black white kar do"
-    .replace(/b\s*&\s*w/gi, "«BW»")
-    .replace(/kala\s*(?:and|&|aur)?\s*safed/gi, "«BLACKWHITE»")
-    .replace(/kaala\s*(?:and|&|aur)?\s*safaid/gi, "«BLACKWHITE»");
-}
-
-function restorePhrases(text) {
-  return text
-    .replace(/«BLACKWHITE»/g, "black and white")
-    .replace(/«BW»/g, "b&w");
-}
-
-function splitSegments(instruction) {
-  const protectedText = protectPhrases(normalize(instruction));
-  return protectedText
-    .split(/[,+\n]+|\s+(?:aur|and|then|phir|fir|or|ya|also)\s+/i)
-    .map(restorePhrases)
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
+// ------------------------------------------------------------
+// COLOR
+// ------------------------------------------------------------
 
 function findColor(text) {
-  for (const [name, hex] of Object.entries(COLOR_WORDS)) {
-    if (new RegExp(`\\b${name}\\b`, "i").test(text)) return hex;
+  const s = normalize(text);
+
+  const hex = s.match(/#([0-9a-f]{3}|[0-9a-f]{6})\b/i);
+  if (hex) return hex[0];
+
+  for (const [word, value] of Object.entries(COLOR_WORDS)) {
+    if (new RegExp(`\\b${word}\\b`, "i").test(s)) {
+      return value;
+    }
   }
-  const hexMatch = text.match(/#([0-9a-f]{3}|[0-9a-f]{6})\b/i);
-  if (hexMatch) return hexMatch[0];
+
   return null;
 }
 
-// "kam / thoda / less" vs "zyada / badha / more" modifiers
+// ------------------------------------------------------------
+// INTENSITY
+// ------------------------------------------------------------
+
 function intensity(text) {
-  if (/\b(kam|thoda|thodi|less|decrease|halka|halki|reduce|down)\b/i.test(text)) return "reduce";
-  if (/\b(zyada|jyada|badha|more|increase|high|up|boost)\b/i.test(text)) return "increase";
+  const s = normalize(text);
+
+  if (
+    /\b(kam|thoda\s+kam|thodi\s+kam|less|decrease|reduce|halka|halki|down)\b/i.test(
+      s
+    )
+  ) {
+    return "reduce";
+  }
+
+  if (
+    /\b(zyada|badha|badhao|more|increase|high|up|boost|strong)\b/i.test(s)
+  ) {
+    return "increase";
+  }
+
   return "default";
 }
 
-function dedupeAndSort(plan) {
-  const seen = new Set();
-  const unique = [];
-  for (const step of plan) {
-    const key = JSON.stringify(step);
-    if (!seen.has(key)) {
-      seen.add(key);
-      unique.push(step);
-    }
-  }
-  return unique
-    .sort((a, b) => (STEP_PRIORITY[a.action] ?? 9) - (STEP_PRIORITY[b.action] ?? 9))
-    .slice(0, MAX_STEPS);
+// ------------------------------------------------------------
+// COMMAND ORDER
+// IMPORTANT:
+// We DO NOT sort actions by priority.
+// User order is preserved.
+// ------------------------------------------------------------
+
+const MAX_STEPS = 8;
+
+// ------------------------------------------------------------
+// SPLIT COMMANDS
+// ------------------------------------------------------------
+
+function splitSegments(instruction) {
+  let s = normalize(instruction);
+
+  // Protect black & white from "and/aur" splitting.
+  s = s
+    .replace(
+      /\bblack\s*(?:and|&|aur)\s*white\b/gi,
+      "__BLACK_WHITE__"
+    )
+    .replace(/\bblack\s+white\b/gi, "__BLACK_WHITE__")
+    .replace(/\bkala\s*(?:aur|and|&)?\s*safed\b/gi, "__BLACK_WHITE__")
+    .replace(/\bkaala\s*(?:aur|and|&)?\s*safaid\b/gi, "__BLACK_WHITE__");
+
+  const parts = s
+    .split(
+      /\s*(?:,|;|\+|\n)\s*|\s+(?:aur|and|then|phir|fir|also)\s+/i
+    )
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  return parts.map((x) =>
+    x
+      .replace(/__BLACK_WHITE__/g, "black and white")
+      .trim()
+  );
 }
 
 // ------------------------------------------------------------
-// SINGLE SEGMENT PARSER — detects one intent from one phrase
-// REMOVE BACKGROUND is checked FIRST (highest semantic priority)
+// REMOVE BACKGROUND
+// ------------------------------------------------------------
+
+function wantsBackgroundRemoval(s) {
+  return (
+    /(background|bg|back\s*ground|peeche\s*(?:ka|ki|wala|wali)?)/i.test(s) &&
+    /(hata|remove|nikal|delete|erase|clear|saaf|remove\s*kar)/i.test(s)
+  ) ||
+    /(details?|detail|extra|unwanted|faltu|extra\s*cheeze|cheezein).*(hata|remove|nikal|delete|erase|clear|saaf)/i.test(
+      s
+    ) ||
+    /(sirf|only|just).*(subject|photo|pic|image|person|insaan|face|chehra).*(rakho|rakh|rehne|keep|chhod)/i.test(
+      s
+    ) ||
+    /(subject|photo|pic|image|person|insaan|face|chehra).*(isolate|alag|transparent)/i.test(
+      s
+    ) ||
+    /\btransparent\s+background\b/i.test(s) ||
+    /\bbackground\s*(?:ko\s*)?(?:transparent|remove|hata)/i.test(s);
+}
+
+// ------------------------------------------------------------
+// REPLACE BACKGROUND
+// ------------------------------------------------------------
+
+function parseBackgroundReplacement(s) {
+  const color = findColor(s);
+
+  if (!color) return null;
+
+  if (
+    /(background|bg|peeche|peeche\s+ka|peeche\s+ki)/i.test(s) &&
+    /(white|black|blue|red|green|gray|grey|yellow|pink|orange|purple|safed|kala|neela|laal|hara|peela|gulabi|narangi|baingani|change|replace|badal|bana|make|set|lagao|laga)/i.test(
+      s
+    )
+  ) {
+    return {
+      action: "replace_background",
+      color,
+    };
+  }
+
+  return null;
+}
+
+// ------------------------------------------------------------
+// BLACK & WHITE
+// ------------------------------------------------------------
+
+function wantsBlackWhite(s) {
+  return /\b(black\s*(?:and|&)?\s*white|grayscale|greyscale|monochrome|b\s*&\s*w|kala\s*(?:aur|and)?\s*safed|kaala\s*(?:aur|and)?\s*safaid)\b/i.test(
+    s
+  );
+}
+
+// ------------------------------------------------------------
+// UPSCALE
+// ------------------------------------------------------------
+
+function parseUpscale(s) {
+  const multiplier = s.match(/\b([2-4])\s*x\b/i);
+
+  if (
+    multiplier ||
+    /\b(upscale|enlarge|bada\s+kar|bada\s+do|size\s+badha|resolution\s+badha)\b/i.test(
+      s
+    )
+  ) {
+    return {
+      action: "upscale",
+      scale: multiplier ? Number(multiplier[1]) : 2,
+    };
+  }
+
+  return null;
+}
+
+// ------------------------------------------------------------
+// ENHANCE
+// ------------------------------------------------------------
+
+function wantsEnhance(s) {
+  return /\b(hd|h\.d\.?|high\s*quality|enhance|enhanced|improve|better|behtar|sudhar|sudhaar|sharpen|sharp|clear|clarity|quality|crisp|professional|professional\s+look|clean|clean\s+up|photo\s+ko\s+accha|pic\s+ko\s+accha|photo\s+better|pic\s+better)\b/i.test(s);
+}
+
+// ------------------------------------------------------------
+// BRIGHTNESS
+// ------------------------------------------------------------
+
+function parseBrightness(s) {
+  if (
+    /\b(bright|brightness|ujala|ujla|ujal|roshan|roshni|light|lighten|chamak)\b/i.test(
+      s
+    )
+  ) {
+    return {
+      action: "adjust",
+      adjustments: {
+        brightness: intensity(s) === "reduce" ? 0.75 : 1.3,
+      },
+    };
+  }
+
+  if (/\b(dark|andhera|andhere|dim|darken)\b/i.test(s)) {
+    return {
+      action: "adjust",
+      adjustments: {
+        brightness: 0.72,
+      },
+    };
+  }
+
+  return null;
+}
+
+// ------------------------------------------------------------
+// CONTRAST
+// ------------------------------------------------------------
+
+function parseContrast(s) {
+  if (!/\bcontrast\b/i.test(s)) return null;
+
+  return {
+    action: "adjust",
+    adjustments: {
+      contrast: intensity(s) === "reduce" ? 0.7 : 1.5,
+    },
+  };
+}
+
+// ------------------------------------------------------------
+// SATURATION
+// ------------------------------------------------------------
+
+function parseSaturation(s) {
+  if (
+    /\b(saturation|saturate|vibrant|vivid|chamakdar|rang\s+badha|colors?\s+badha)\b/i.test(
+      s
+    )
+  ) {
+    return {
+      action: "adjust",
+      adjustments: {
+        saturation: intensity(s) === "reduce" ? 0.6 : 1.5,
+      },
+    };
+  }
+
+  if (/\b(desaturate|rang\s+kam|rang\s+halka)\b/i.test(s)) {
+    return {
+      action: "adjust",
+      adjustments: {
+        saturation: 0.6,
+      },
+    };
+  }
+
+  return null;
+}
+
+// ------------------------------------------------------------
+// FILTER
+// ------------------------------------------------------------
+
+function parseFilter(s) {
+  if (/\b(warm|garam|golden|warm\s+tone)\b/i.test(s)) {
+    return { action: "filter", filter: "warm" };
+  }
+
+  if (/\b(cool|thanda|thand|cool\s+tone)\b/i.test(s)) {
+    return { action: "filter", filter: "cool" };
+  }
+
+  if (/\b(vintage|retro|old\s+look|old\s+style|purana\s+look)\b/i.test(s)) {
+    return { action: "filter", filter: "vintage" };
+  }
+
+  if (
+    /\b(cinematic|cinema|film\s+look|movie\s+look|film\s+jaisa)\b/i.test(s)
+  ) {
+    return { action: "filter", filter: "cinematic" };
+  }
+
+  if (/\b(soft|smooth|naram|soft\s+look)\b/i.test(s)) {
+    return { action: "filter", filter: "soft" };
+  }
+
+  if (/\b(dramatic|drama)\b/i.test(s)) {
+    return { action: "filter", filter: "dramatic" };
+  }
+
+  if (
+    /\b(portrait|selfie|face\s+clear|face\s+enhance|chehra\s+clear|chehra\s+saaf)\b/i.test(
+      s
+    )
+  ) {
+    return { action: "filter", filter: "portrait" };
+  }
+
+  return null;
+}
+
+// ------------------------------------------------------------
+// RESIZE
+// ------------------------------------------------------------
+
+function parseResize(s) {
+  const dims = s.match(/(\d{2,5})\s*[xX×]\s*(\d{2,5})/);
+
+  if (!dims) return null;
+
+  const width = Number(dims[1]);
+  const height = Number(dims[2]);
+
+  if (
+    width < 8 ||
+    height < 8 ||
+    width > 8192 ||
+    height > 8192
+  ) {
+    return null;
+  }
+
+  return {
+    action: "resize",
+    width,
+    height,
+  };
+}
+
+// ------------------------------------------------------------
+// CROP
+// ------------------------------------------------------------
+
+function parseCrop(s) {
+  if (!/\b(crop|trim|cut|kaat|kat)\b/i.test(s)) {
+    return null;
+  }
+
+  const percent = s.match(/\b(?:crop\s*(?:to\s*)?)(\d{1,2})\s*%/i);
+
+  if (percent) {
+    const p = Math.min(
+      Math.max(Number(percent[1]), 10),
+      90
+    ) / 100;
+
+    return {
+      action: "crop_percent",
+      percent: p,
+    };
+  }
+
+  return {
+    action: "crop_percent",
+    percent: 0.8,
+  };
+}
+
+// ------------------------------------------------------------
+// ROTATE
+// ------------------------------------------------------------
+
+function parseRotate(s) {
+  if (!/\b(rotate|ghuma|ghumao|ghuma\s+do|turn)\b/i.test(s)) {
+    return null;
+  }
+
+  if (/\bulta|upside\s*down\b/i.test(s)) {
+    return {
+      action: "rotate",
+      degrees: 180,
+    };
+  }
+
+  const degree = s.match(
+    /\b(90|180|270|360)\s*(?:degree|degrees|deg|°)?\b/i
+  );
+
+  return {
+    action: "rotate",
+    degrees: degree ? Number(degree[1]) % 360 : 90,
+  };
+}
+
+// ------------------------------------------------------------
+// PARSE ONE SEGMENT
+//
+// IMPORTANT:
+// This function can return MULTIPLE actions.
 // ------------------------------------------------------------
 
 function parseSegment(segment) {
   const s = normalize(segment);
+  const steps = [];
 
-  // ---------- REMOVE BACKGROUND ----------
-  // Matches (after normalization):
-  //   "background hata do" / "background remove kar do" / "bg nikal do"
-  //   "pic ka background hata de"
-  //   "details ko hata de pic me se only pic ko rehne de"   ← the failing case
-  //   "sirf main subject rakho" / "only photo rehne do"
-  //   "photo ko isolate kar do" / "background remove karke transparent kar do"
-  if (
-    // background + removal verb (any order)
-    /(background|bg|peeche\s+ka|peeche\s+ki)\s*(?:ko|to)?\s*(?:se\s*)?(hata|remove|nikal|delete|erase|clear|saaf)/.test(s) ||
-    /(hata|remove|nikal|delete|erase)\s*(?:do|de|dijiye|karo|kar)?\s*(?:the\s+)?(background|bg)/.test(s) ||
-    /(background|bg)\s+(?:nikal|hata|remove|delete)/.test(s) ||
-    // "details ko hata de ..." — remove unwanted surrounding details
-    /(details?|detail)\s*(?:ko|to)?\s*(?:se\s*)?(hata|remove|nikal|delete|erase)/.test(s) ||
-    // "only/sirf ... subject/photo/pic ... rakho/rehne do/keep"
-    /(only|sirf|sirph|just)\s+(?:main\s+|subject\s+|photo\s+|pic\s+|image\s+)*(subject|photo|pic|image|person|insaan|object|chehra|face)\s*(?:ko)?\s*(rakho|rakh|rehne|rehn|keep|chhod)/.test(s) ||
-    /(sirf|only)\s+(?:main\s+)?(photo|pic|image|subject)\s+(?:rehne|rakho|rakh)/.test(s) ||
-    // "photo ko isolate kar do" / "transparent background"
-    /(photo|pic|image|subject)\s*(?:ko)?\s*(isolate|transparent)\s*(?:kar|karo|karna)?/.test(s) ||
-    /(transparent\s+background)/.test(s) ||
-    /(unwanted)\s+(?:details?|surroundings?|background)/.test(s)
-  ) {
-    return { action: "remove_background" };
+  // Background removal
+  if (wantsBackgroundRemoval(s)) {
+    steps.push({
+      action: "remove_background",
+    });
   }
 
-  // ---------- REPLACE BACKGROUND ----------
-  const color = findColor(s);
-  if (
-    color &&
-    /(background|bg|peeche|peeche\s+ka)/.test(s) &&
-    /(kar|karo|karna|do|de|lagao|laga|change|replace|badal|set|bana|banana|make)/.test(s)
-  ) {
-    return { action: "replace_background", color };
-  }
-  if (/(replace|change|badal)\s+(?:the\s+)?(background|bg)/.test(s) && color) {
-    return { action: "replace_background", color };
+  // Background replacement
+  const replacement = parseBackgroundReplacement(s);
+  if (replacement) {
+    steps.push(replacement);
   }
 
-  // ---------- BLACK & WHITE ----------
-  if (
-    /(black\s*(?:and|&)?\s*white|grayscale|greyscale|monochrome|b\s*&\s*w|kala\s*(?:aur\s*)?safed|kaala\s*(?:aur\s*)?safaid)/.test(s)
-  ) {
-    return { action: "filter", filter: "black-white" };
+  // Black & white
+  if (wantsBlackWhite(s)) {
+    steps.push({
+      action: "filter",
+      filter: "black-white",
+    });
   }
 
-  // ---------- UPSCALE ----------
-  // "2x bada kar do", "2x upscale", "photo bada kar do"
-  if (/(upscale|enlarge|bada\s*kar|badha\s*(?:do|de)?\s*(?:size|resolution))/.test(s) || /\b([234])\s*x\b/.test(s)) {
-    const m = s.match(/\b([234])\s*x\b/);
-    const factor = m ? parseInt(m[1], 10) : 2;
-    return { action: "upscale", scale: factor };
+  // Brightness
+  const brightness = parseBrightness(s);
+  if (brightness) {
+    steps.push(brightness);
   }
 
-  // ---------- ENHANCE / HD / CLEAR ----------
-  if (
-    /(hd|h\.d\.?|high\s*quality|enhance|improve|better|behtar|sudhar|sudhaar|sharpen|sharp|clear|saaf\s*kar|quality|crisp)/.test(s)
-  ) {
-    return { action: "enhance", scale: 1, sharpness: 1.2 };
+  // Contrast
+  const contrast = parseContrast(s);
+  if (contrast) {
+    steps.push(contrast);
   }
 
-  // ---------- BRIGHTNESS ----------
-  if (/(bright|brightness|ujala|ujlaa|ujal|roshan|roshni|light|lighten|chamak)/.test(s)) {
-    const level = intensity(s);
-    if (/(dark|andhera|dheema|dim)/.test(s) || level === "reduce") {
-      return { action: "adjust", adjustments: { brightness: 0.72 } };
-    }
-    return { action: "adjust", adjustments: { brightness: 1.3 } };
-  }
-  if (/(dark|andhera|andhere|dheema|dim|darken)/.test(s)) {
-    return { action: "adjust", adjustments: { brightness: 0.72 } };
+  // Saturation
+  const saturation = parseSaturation(s);
+  if (saturation) {
+    steps.push(saturation);
   }
 
-  // ---------- CONTRAST ----------
-  if (/contrast/.test(s)) {
-    const level = intensity(s);
-    if (level === "reduce") return { action: "adjust", adjustments: { contrast: 0.7 } };
-    return { action: "adjust", adjustments: { contrast: 1.5 } };
+  // Filters
+  const filter = parseFilter(s);
+  if (filter) {
+    steps.push(filter);
   }
 
-  // ---------- SATURATION ----------
-  if (
-    /(saturat|vibrant|vivid|chamakdar|colors?\s*(?:badha|zyada|vibrant)|rang\s*(?:badha|zyada|gahra))/.test(s)
-  ) {
-    const level = intensity(s);
-    if (level === "reduce" || /(kam|desaturate|halka)/.test(s)) {
-      return { action: "adjust", adjustments: { saturation: 0.6 } };
-    }
-    return { action: "adjust", adjustments: { saturation: 1.5 } };
-  }
-  if (/(desaturate|saturation\s*kam|rang\s*(?:kam|halka|hate))/.test(s)) {
-    return { action: "adjust", adjustments: { saturation: 0.6 } };
+  // Enhance
+  if (wantsEnhance(s)) {
+    steps.push({
+      action: "enhance",
+      scale: 1,
+      sharpness: 1.2,
+    });
   }
 
-  // ---------- FILTERS ----------
-  if (/(warm|garam|golden|warm\s*tone)/.test(s)) {
-    return { action: "filter", filter: "warm" };
-  }
-  if (/(cool|thanda|thand|cool\s*tone)/.test(s)) {
-    return { action: "filter", filter: "cool" };
-  }
-  if (/(vintage|retro|purane\s*(?:zamaane\s*)?(?:look|style)|old\s*(?:look|style|photo))/.test(s)) {
-    return { action: "filter", filter: "vintage" };
-  }
-  if (/(cinematic|film\s*look|movie\s*look|film\s*jaisa)/.test(s)) {
-    return { action: "filter", filter: "cinematic" };
-  }
-  if (/(soft|naram|smooth|soft\s*look)/.test(s)) {
-    return { action: "filter", filter: "soft" };
-  }
-  if (/(dramatic|drama)/.test(s)) {
-    return { action: "filter", filter: "dramatic" };
-  }
-  if (/(portrait|face\s*(?:clear|enhance|better|behtar|saaf)|chehra\s*(?:clear|saaf|behtar)|selfie)/.test(s)) {
-    return { action: "filter", filter: "portrait" };
+  // Upscale
+  const upscale = parseUpscale(s);
+  if (upscale) {
+    steps.push(upscale);
   }
 
-  // ---------- RESIZE ----------
-  const dims = s.match(/(\d{2,5})\s*[xX×]\s*(\d{2,5})/);
-  if (dims) {
-    const w = parseInt(dims[1], 10);
-    const h = parseInt(dims[2], 10);
-    if (w >= 8 && h >= 8 && w <= 8192 && h <= 8192) {
-      return { action: "resize", width: w, height: h };
+  // Resize
+  const resize = parseResize(s);
+  if (resize) {
+    steps.push(resize);
+  }
+
+  // Crop
+  const crop = parseCrop(s);
+  if (crop) {
+    steps.push(crop);
+  }
+
+  // Rotate
+  const rotate = parseRotate(s);
+  if (rotate) {
+    steps.push(rotate);
+  }
+
+  return steps;
+}
+
+// ------------------------------------------------------------
+// DEDUPE
+// DOES NOT SORT.
+// USER ORDER / DETECTION ORDER IS PRESERVED.
+// ------------------------------------------------------------
+
+function dedupe(plan) {
+  const seen = new Set();
+  const result = [];
+
+  for (const step of plan) {
+    const key = JSON.stringify(step);
+
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(step);
     }
   }
-  if (/(resize|size\s*badal|size\s*change)/.test(s)) {
-    return { action: "resize", width: 1024, height: 1024, _ambiguous: "no dimensions given" };
-  }
 
-  // ---------- CROP ----------
-  if (/(crop|kaat|kaat\s*do|kat\s*do|trim|cut\s*kar|center\s*crop)/.test(s)) {
-    const box = s.match(/(\d{1,5})\s*[, ]\s*(\d{1,5})\s*(?:\(|,| )?\s*(\d{2,5})\s*[xX×]\s*(\d{2,5})/);
-    if (box) {
-      return {
-        action: "crop",
-        left: parseInt(box[1], 10),
-        top: parseInt(box[2], 10),
-        width: parseInt(box[3], 10),
-        height: parseInt(box[4], 10),
-      };
-    }
-    const pct = s.match(/crop\s*(?:to\s*)?(\d{1,2})\s*%/);
-    if (pct) {
-      const p = Math.min(Math.max(parseInt(pct[1], 10), 10), 90) / 100;
-      return { action: "crop_percent", percent: p };
-    }
-    return { action: "crop_percent", percent: 0.8 };
-  }
-
-  // ---------- ROTATE ----------
-  if (/(rotate|ghuma|ghumao|turn)/.test(s)) {
-    const deg = s.match(/(\d{1,3})\s*(?:degree|deg|°)?/);
-    if (deg) {
-      const d = parseInt(deg[1], 10);
-      if (d > 0 && d <= 359) return { action: "rotate", degrees: d };
-    }
-    if (/(ulta|upside)/.test(s)) return { action: "rotate", degrees: 180 };
-    return { action: "rotate", degrees: 90 };
-  }
-  if (/\b(90|180|270)\s*(?:degree|deg|°)?\b/.test(s) && /(photo|image|pic|kar|do)/.test(s)) {
-    const d = parseInt(s.match(/\b(90|180|270)\b/)[1], 10);
-    return { action: "rotate", degrees: d };
-  }
-
-  return null; // segment not understood
+  return result.slice(0, MAX_STEPS);
 }
 
 // ------------------------------------------------------------
 // MAIN PARSER
-// Returns { ok: true, plan } or { ok: false }
 // ------------------------------------------------------------
 
 function parseAiInstruction(instruction) {
-  const segments = splitSegments(instruction);
+  const original = String(instruction || "").trim();
+
+  if (!original) {
+    return {
+      ok: false,
+      reason: "empty_instruction",
+    };
+  }
+
+  const segments = splitSegments(original);
+
   let plan = [];
 
+  // Parse each segment.
   for (const segment of segments) {
-    const step = parseSegment(segment);
-    if (step) plan.push(step);
+    const steps = parseSegment(segment);
+    plan.push(...steps);
   }
 
-  // Whole-instruction fallbacks (patterns spanning segments)
+  // ----------------------------------------------------------
+  // Whole-command semantic fallbacks
+  // ----------------------------------------------------------
+
   if (plan.length === 0) {
-    const whole = normalize(instruction);
+    const whole = normalize(original);
 
-    if (/(hd|enhance|behtar|saaf|clear|quality)/.test(whole)) {
-      plan.push({ action: "enhance", scale: 1, sharpness: 1.2 });
+    // Generic "professional / beautiful / improve" request
+    if (
+      /\b(professional|beautiful|attractive|acchi|accha|sundar|better|behtar|clean|clear|quality)\b/i.test(
+        whole
+      )
+    ) {
+      plan.push({
+        action: "enhance",
+        scale: 1,
+        sharpness: 1.2,
+      });
     }
-    if (/(bright|ujala|roshan)/.test(whole)) {
-      plan.push({ action: "adjust", adjustments: { brightness: 1.3 } });
+
+    // Generic light request
+    if (
+      /\b(roshan|ujala|bright|brightness|light)\b/i.test(whole)
+    ) {
+      plan.push({
+        action: "adjust",
+        adjustments: {
+          brightness: 1.3,
+        },
+      });
     }
-    if (plan.length === 0) {
-      return { ok: false };
+
+    // Generic dark request
+    if (
+      /\b(dark|andhera|dim)\b/i.test(whole)
+    ) {
+      plan.push({
+        action: "adjust",
+        adjustments: {
+          brightness: 0.72,
+        },
+      });
+    }
+
+    // Generic background request
+    if (
+      /\b(background|bg|peeche)\b/i.test(whole) &&
+      /\b(remove|hata|nikal|clear|saaf)\b/i.test(whole)
+    ) {
+      plan.push({
+        action: "remove_background",
+      });
     }
   }
 
-  plan = dedupeAndSort(plan);
-  return { ok: true, plan };
+  plan = dedupe(plan);
+
+  if (plan.length === 0) {
+    return {
+      ok: false,
+      reason: "unsupported_instruction",
+      normalized: normalize(original),
+    };
+  }
+
+  return {
+    ok: true,
+    plan,
+    normalized: normalize(original),
+    segments,
+  };
 }
 
 // ------------------------------------------------------------
-// HUMAN-READABLE STEP NAMES (for response messages)
+// HUMAN-READABLE STEP
 // ------------------------------------------------------------
 
 function describeStep(step) {
+  if (!step) return "unknown action";
+
   switch (step.action) {
     case "remove_background":
       return "remove background";
+
     case "replace_background":
       return `replace background with ${step.color}`;
+
     case "filter":
       return `filter: ${step.filter}`;
+
     case "adjust": {
       const parts = [];
-      if (step.adjustments.brightness !== undefined) parts.push(`brightness ${step.adjustments.brightness}x`);
-      if (step.adjustments.contrast !== undefined) parts.push(`contrast ${step.adjustments.contrast}x`);
-      if (step.adjustments.saturation !== undefined) parts.push(`saturation ${step.adjustments.saturation}x`);
+
+      if (step.adjustments?.brightness !== undefined) {
+        parts.push(
+          `brightness ${step.adjustments.brightness}x`
+        );
+      }
+
+      if (step.adjustments?.contrast !== undefined) {
+        parts.push(
+          `contrast ${step.adjustments.contrast}x`
+        );
+      }
+
+      if (step.adjustments?.saturation !== undefined) {
+        parts.push(
+          `saturation ${step.adjustments.saturation}x`
+        );
+      }
+
       return `adjust (${parts.join(", ")})`;
     }
+
     case "enhance":
       return `enhance ${step.scale || 1}x`;
+
     case "upscale":
       return `upscale ${step.scale}x`;
+
     case "resize":
       return `resize to ${step.width}x${step.height}`;
+
     case "crop":
       return `crop ${step.width}x${step.height} at (${step.left},${step.top})`;
+
     case "crop_percent":
-      return `center crop to ${Math.round(step.percent * 100)}%`;
+      return `center crop to ${Math.round(
+        step.percent * 100
+      )}%`;
+
     case "rotate":
       return `rotate ${step.degrees}°`;
+
     default:
       return step.action;
   }
 }
+
+// ------------------------------------------------------------
+// EXPORTS
+// ------------------------------------------------------------
 
 module.exports = {
   parseAiInstruction,
