@@ -1,1174 +1,209 @@
 // ============================================================
-// AI EDIT ENGINE — PRODUCTION v8
+// AI EDIT ENGINE (v7) — validation + operation router + executor
 // ------------------------------------------------------------
-// Supports:
-//   • validatePlan()
-//   • Sharp local editing
-//   • OpenAI image editing
-//   • remove.bg background removal
-//   • honest provider failures
-//   • sequential multi-step execution
-//   • no fake "AI" results
+// In:  buffer (current png buffer) + validated plan
+// Out: final buffer + executed[] + honest notes[]
+// Provider-gated; never fake pixel edits.
 // ============================================================
-
 "use strict";
-
 const sharp = require("sharp");
 const { ImageProcessor } = require("./imageProcessor");
+const FormData = (()=>{ try { return require("form-data"); } catch { return null; } })();
 
-let FormData = null;
-
-try {
-  FormData = require("form-data");
-} catch {
-  FormData = null;
-}
-
-// ============================================================
-// PROVIDERS
-// ============================================================
-
-const OPENAI_KEY =
-  process.env.OPENAI_API_KEY ||
-  "";
-
-const REPLICATE_TOKEN =
-  process.env.REPLICATE_API_TOKEN ||
-  "";
-
-const REMOVE_BG_KEY =
-  process.env.REMOVE_BG_API_KEY ||
-  "";
-
-const OPENAI_IMG_MODEL =
-  process.env.OPENAI_IMG_MODEL ||
-  "gpt-image-1";
+// ---------- provider config (server scope only) ----------
+const OPENAI_KEY        = process.env.OPENAI_API_KEY        || "";
+const REPLICATE_TOKEN   = process.env.REPLICATE_API_TOKEN   || "";
+const REMOVE_BG_KEY     = process.env.REMOVE_BG_API_KEY     || "";
 
 const canInpaint = () => Boolean(OPENAI_KEY);
+const canSegment = () => Boolean(OPENAI_KEY);   // remove.bg only does bg; we prefer gpt-image
 
-const canSegment = () =>
-  Boolean(REMOVE_BG_KEY || OPENAI_KEY || REPLICATE_TOKEN);
-
-// ============================================================
-// ALLOWLIST
-// ============================================================
-
+// ---------- allowlist of actions we may EVER execute ----------
 const ALLOW = new Set([
-  "remove_background",
-  "replace_background",
-  "remove_text",
-  "replace_text",
-  "remove_object",
-
-  "adjust",
-  "filter",
-  "enhance",
-  "upscale",
-  "resize",
-  "crop",
-  "rotate",
+  "remove_background","replace_background",
+  "remove_text","replace_text","remove_object",
+  "adjust","filter","enhance","upscale","resize","crop","rotate"
 ]);
 
-// ============================================================
-// NUMBER HELPER
-// ============================================================
-
-const num = (value, fallback = 0) => {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
-};
-
-// ============================================================
-// PLAN VALIDATION
-// ============================================================
-
+// Validate & prune any AI/ad-derived plan. Unknown actions rejected.
 function validatePlan(steps) {
   if (!Array.isArray(steps)) return [];
-
   const out = [];
-
-  for (const s of steps.slice(0, 8)) {
+  for (const s of steps) {
     if (!s || typeof s !== "object") continue;
-
-    const action = String(s.action || "")
-      .trim()
-      .toLowerCase();
-
-    if (!ALLOW.has(action)) continue;
-
-    switch (action) {
-      // ------------------------------------------------------
-      // TEXT
-      // ------------------------------------------------------
-
-      case "replace_text": {
-        const target =
-          s.target_text ??
-          s.target_string ??
-          s.text ??
-          "";
-
-        const replacement =
-          s.replacement_text ??
-          s.replacement ??
-          "";
-
-        if (!String(replacement).trim()) break;
-
-        out.push({
-          action,
-          target_string: String(target).slice(0, 100),
-          replacement: String(replacement).slice(0, 100),
-        });
-
+    const a = String(s.action || "").toLowerCase();
+    if (!ALLOW.has(a)) continue;
+    switch (a) {
+      case "replace_text":
+        if (s.replacement_text != null) { out.push({ action:a, target_string:String(s.target_text||"").slice(0,80), replacement:String(s.replacement_text).slice(0,80)}); }
         break;
-      }
-
-      case "remove_text": {
-        out.push({
-          action,
-          text: String(
-            s.target_text ??
-            s.target_string ??
-            s.text ??
-            ""
-          ).slice(0, 100),
-        });
-
-        break;
-      }
-
-      // ------------------------------------------------------
-      // BACKGROUND
-      // ------------------------------------------------------
-
-      case "replace_background": {
-        const color =
-          typeof s.color === "string" &&
-          /^#[0-9a-fA-F]{6}$/.test(s.color)
-            ? s.color
-            : "#ffffff";
-
-        out.push({
-          action,
-          color,
-        });
-
-        break;
-      }
-
-      case "remove_background": {
-        out.push({
-          action,
-        });
-
-        break;
-      }
-
-      // ------------------------------------------------------
-      // OBJECT
-      // ------------------------------------------------------
-
-      case "remove_object": {
-        out.push({
-          action,
-          text: String(
-            s.text ??
-            s.target_text ??
-            s.object ??
-            ""
-          ).slice(0, 100),
-        });
-
-        break;
-      }
-
-      // ------------------------------------------------------
-      // ADJUST
-      // ------------------------------------------------------
-
-      case "adjust": {
-        out.push({
-          action,
-          adjust: {
-            brightness: num(
-              s.adjust?.brightness,
-              1
-            ),
-
-            contrast: num(
-              s.adjust?.contrast,
-              1
-            ),
-
-            saturation: num(
-              s.adjust?.saturation,
-              1
-            ),
-          },
-        });
-
-        break;
-      }
-
-      // ------------------------------------------------------
-      // FILTER
-      // ------------------------------------------------------
-
-      case "filter": {
-        out.push({
-          action,
-          filter: String(
-            s.filter || "cinematic"
-          ).slice(0, 40),
-        });
-
-        break;
-      }
-
-      // ------------------------------------------------------
-      // ENHANCE
-      // ------------------------------------------------------
-
-      case "enhance": {
-        const scale = Math.max(
-          0.5,
-          Math.min(
-            4,
-            num(s.scale, 1.2)
-          )
-        );
-
-        out.push({
-          action,
-          scale,
-        });
-
-        break;
-      }
-
-      // ------------------------------------------------------
-      // UPSCALE
-      // ------------------------------------------------------
-
-      case "upscale": {
-        const scale = Math.max(
-          0.5,
-          Math.min(
-            4,
-            num(s.scale, 2)
-          )
-        );
-
-        out.push({
-          action,
-          scale,
-        });
-
-        break;
-      }
-
-      // ------------------------------------------------------
-      // RESIZE
-      // ------------------------------------------------------
-
-      case "resize": {
-        const width = Math.max(
-          16,
-          Math.round(
-            num(s.width, 1920)
-          )
-        );
-
-        const height = Math.max(
-          16,
-          Math.round(
-            num(s.height, 1080)
-          )
-        );
-
-        out.push({
-          action,
-          width,
-          height,
-        });
-
-        break;
-      }
-
-      // ------------------------------------------------------
-      // CROP
-      // ------------------------------------------------------
-
-      case "crop": {
-        const width = Math.max(
-          1,
-          Math.round(
-            num(s.width, 0)
-          )
-        );
-
-        const height = Math.max(
-          1,
-          Math.round(
-            num(s.height, 0)
-          )
-        );
-
-        if (width <= 0 || height <= 0) break;
-
-        out.push({
-          action,
-          x: Math.max(
-            0,
-            Math.round(
-              num(s.x, 0)
-            )
-          ),
-
-          y: Math.max(
-            0,
-            Math.round(
-              num(s.y, 0)
-            )
-          ),
-
-          width,
-          height,
-        });
-
-        break;
-      }
-
-      // ------------------------------------------------------
-      // ROTATE
-      // ------------------------------------------------------
-
-      case "rotate": {
-        let degrees = num(
-          s.degrees,
-          90
-        );
-
-        degrees =
-          ((degrees % 360) + 360) % 360;
-
-        if (degrees === 0) break;
-
-        out.push({
-          action,
-          degrees,
-        });
-
-        break;
-      }
-
-      default:
-        break;
+      case "remove_text":      out.push({ action:a, text:String(s.target_text||s.text||"").slice(0,80) }); break;
+      case "replace_background": out.push({ action:a, color:/^#[0-9a-fA-F]{6}$/.test(s.color||"") ? s.color : "#ffffff" }); break;
+      case "remove_background":  out.push({ action:a }); break;
+      case "remove_object":   out.push({ action:a, text:String(s.text||"").slice(0,80) }); break;
+      case "adjust":          out.push({ action:a, adjust:{ brightness:num(s.adjust?.brightness), contrast:num(s.adjust?.contrast), saturation:num(s.adjust?.saturation) } }); break;
+      case "filter":          out.push({ action:a, filter: String(s.filter||"cinematic") }); break;
+      case "enhance":         out.push({ action:a, scale: Math.max(.5, Math.min(4, Number(s.scale)||1.2)) }); break;
+      case "upscale":         out.push({ action:a, scale: Math.max(.5, Math.min(4, Number(s.scale)||2)) }); break;
+      case "resize":          out.push({ action:a, width: Math.max(16, Number(s.width)||1920), height: Math.max(16, Number(s.height)||1080) }); break;
+      case "crop":            out.push({ action:a, x:num(s.x), y:num(s.y), width:Math.max(1,Number(s.width)||0), height:Math.max(1,Number(s.height)||0) }); break;
+      case "rotate":          out.push({ action:a, degrees: Math.abs(Number(s.degrees)||90) % 360 }); break;
+      // remove_background included
+      default: break;
     }
   }
-
-  return out.slice(0, 6);
+  return out;
 }
+const num = x => (isFinite(Number(x)) ? Number(x) : 0);
 
-// ============================================================
-// OPENAI IMAGE EDIT
-// ============================================================
-
-async function gptInpaint(
-  buffer,
-  prompt,
-  mask = null
-) {
-  if (!OPENAI_KEY) {
-    return {
-      error: "openai:not_configured",
-    };
-  }
-
-  if (!FormData) {
-    return {
-      error:
-        "openai:form-data package missing",
-    };
-  }
-
-  try {
-    const form = new FormData();
-
-    const png = await sharp(buffer)
-      .rotate()
-      .png()
-      .toBuffer();
-
-    form.append(
-      "model",
-      OPENAI_IMG_MODEL
-    );
-
-    form.append(
-      "image",
-      png,
-      {
-        filename: "input.png",
-        contentType: "image/png",
+// ------------------------------------------------------------
+// OpenAI gpt-image inpainting (region mask optional).
+// Returns { buffer } | { error }
+// ------------------------------------------------------------
+async function gptInpaint(buffer, prompt, mask) {
+  if (!OPENAI_KEY) return { error: "openai:not_configured" };
+  const FD = FormData;
+  if (!FD) return { error: "openai:formdata_missing" };
+  return new Promise(async (resolve) => {
+    try {
+      const f = new FD();
+      const png = await sharp(buffer).rotate().png().toBuffer();
+      f.append("model", process.env.OPENAI_IMG_MODEL || "gpt-image-1");
+      f.append("image", png, { filename: "input.png", contentType: "image/png" });
+      if (mask) { // RGB mask: white = region allowed to change
+        f.append("mask", await sharp(mask).ensureAlpha().png().toBuffer(), { filename: "mask.png", contentType: "image/png" });
       }
-    );
-
-    if (mask) {
-      const maskPng = await sharp(mask)
-        .ensureAlpha()
-        .png()
-        .toBuffer();
-
-      form.append(
-        "mask",
-        maskPng,
-        {
-          filename: "mask.png",
-          contentType: "image/png",
-        }
-      );
-    }
-
-    form.append(
-      "prompt",
-      String(prompt).slice(0, 2000)
-    );
-
-    form.append(
-      "n",
-      "1"
-    );
-
-    form.append(
-      "output_format",
-      "png"
-    );
-
-    form.append(
-      "size",
-      "auto"
-    );
-
-    const response = await fetch(
-      "https://api.openai.com/v1/images/edits",
-      {
-        method: "POST",
-
-        headers: {
-          Authorization:
-            `Bearer ${OPENAI_KEY}`,
-
-          ...form.getHeaders(),
-        },
-
-        body: form,
+      f.append("prompt", prompt);
+      f.append("n", "1");
+      f.append("output_format", "png");
+      f.append("size", "auto");
+      const r = await fetch("https://api.openai.com/v1/images/edits", {
+        method:"POST", headers:{ Authorization:`Bearer ${OPENAI_KEY}`, ...f.getHeaders() }, body: f
+      });
+      const j = await r.json().catch(()=>({}));
+      if (r.ok && j?.data?.[0]?.b64_json) {
+        resolve({ buffer: Buffer.from(j.data[0].b64_json, "base64") });
+      } else {
+        const detail = j?.error?.message || `http_${r.status}`;
+        resolve({ error: `openai::${detail}` });
       }
-    );
-
-    const json =
-      await response
-        .json()
-        .catch(() => ({}));
-
-    if (
-      response.ok &&
-      json?.data?.[0]?.b64_json
-    ) {
-      return {
-        buffer: Buffer.from(
-          json.data[0].b64_json,
-          "base64"
-        ),
-      };
-    }
-
-    const message =
-      json?.error?.message ||
-      `http_${response.status}`;
-
-    return {
-      error:
-        `openai:${String(message).slice(0, 180)}`,
-    };
-  } catch (error) {
-    return {
-      error:
-        `openai:${String(error.message).slice(0, 180)}`,
-    };
-  }
+    } catch (e) { resolve({ error: `openai::${String(e.message).slice(0,120)}` }); }
+  });
 }
 
-// ============================================================
-// REMOVE.BG
-// ============================================================
-
-async function removeBgViaRemoveBg(buffer) {
-  if (!REMOVE_BG_KEY) {
-    return {
-      ok: false,
-      error: "remove.bg:not_configured",
-    };
-  }
-
-  if (!FormData) {
-    return {
-      ok: false,
-      error: "form-data package missing",
-    };
-  }
-
-  try {
-    const form = new FormData();
-
-    const png = await sharp(buffer)
-      .rotate()
-      .ensureAlpha()
-      .png()
-      .toBuffer();
-
-    form.append(
-      "image_file",
-      png,
-      {
-        filename: "image.png",
-        contentType: "image/png",
-      }
-    );
-
-    form.append(
-      "size",
-      "auto"
-    );
-
-    const response = await fetch(
-      "https://api.remove.bg/v1.0/removebg",
-      {
-        method: "POST",
-
-        headers: {
-          "X-Api-Key":
-            REMOVE_BG_KEY,
-
-          ...form.getHeaders(),
-        },
-
-        body: form,
-      }
-    );
-
-    if (response.ok) {
-      return {
-        ok: true,
-
-        buffer: Buffer.from(
-          await response.arrayBuffer()
-        ),
-
-        provider: "remove.bg",
-      };
-    }
-
-    return {
-      ok: false,
-      error:
-        `remove.bg:http_${response.status}`,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error:
-        `remove.bg:${String(error.message).slice(
-          0,
-          150
-        )}`,
-    };
-  }
+// Build an RGBA inpainting mask (white = allowed region) from a box.
+function regionMaskFromBox(buffer, box) {
+  // returns sharp pipeline producing white box on transparent/black bg
+  return sharp({ create: { width: box.w, height: box.h, channels: 4,
+      background: { r:255,g:255,b:255,alpha:255 } } })
+    .png().toBuffer()
+    .then(maskBytes => (
+      // we need mask same size as source: handled upstream as "tile over full canvas"
+      maskBytes
+    ));
 }
 
-// ============================================================
-// ENSURE ALPHA
-// ============================================================
-
-async function ensureAlpha(buffer) {
-  try {
-    const metadata =
-      await sharp(buffer)
-        .metadata();
-
-    if (!metadata.hasAlpha) {
-      return await sharp(buffer)
-        .rotate()
-        .ensureAlpha()
-        .png()
-        .toBuffer();
-    }
-
-    return buffer;
-  } catch {
-    return buffer;
-  }
-}
-
-// ============================================================
-// TRUE BACKGROUND REMOVAL
-// ============================================================
-
-async function removeBackground(buffer) {
-  // Prefer remove.bg for actual segmentation.
-  if (REMOVE_BG_KEY) {
-    const result =
-      await removeBgViaRemoveBg(
-        buffer
-      );
-
-    if (result.ok) {
-      return {
-        buffer:
-          await ensureAlpha(
-            result.buffer
-          ),
-
-        provider:
-          result.provider,
-      };
-    }
-  }
-
-  // OpenAI fallback.
-  if (OPENAI_KEY) {
-    const result =
-      await gptInpaint(
-        buffer,
-
-        "Remove the entire background from this image. Preserve the main subject exactly. Keep fine details, hair, edges and important object boundaries natural. Make the background transparent. Do not alter the subject."
-      );
-
-    if (result.buffer) {
-      return {
-        buffer:
-          await ensureAlpha(
-            result.buffer
-          ),
-
-        provider:
-          "openai",
-      };
-    }
-
-    return {
-      error:
-        result.error ||
-        "openai background removal failed",
-    };
-  }
-
-  return {
-    error:
-      "Background removal provider is not configured. Add REMOVE_BG_API_KEY or OPENAI_API_KEY."
-  };
-}
-
-// ============================================================
-// LOCAL FLAT BACKGROUND
-// ============================================================
-//
-// IMPORTANT:
-// This does NOT perform segmentation.
-// It is only used when the user asks for a flat
-// background and no AI provider exists.
-// ============================================================
-
-async function localFlatBackground(
-  buffer,
-  color
-) {
-  return sharp(buffer)
-    .rotate()
-    .flatten({
-      background: color,
-    })
-    .png()
-    .toBuffer();
-}
-
-// ============================================================
-// GENERATIVE TEXT/OBJECT EDIT
-// ============================================================
-
-async function generativeEdit(
-  buffer,
-  action,
-  step
-) {
-  if (!canInpaint()) {
-    return {
-      error:
-        `${action} requires OPENAI_API_KEY.`
-    };
-  }
-
-  let prompt = "";
-
-  if (action === "remove_text") {
-    const target = step.text
-      ? ` "${step.text}"`
-      : "";
-
-    prompt =
-      `Remove the text${target} from the image. ` +
-      `Reconstruct the area naturally using surrounding visual content. ` +
-      `Do not leave letters, artifacts or visible traces. ` +
-      `Preserve everything else unchanged.`;
-  }
-
-  else if (action === "replace_text") {
-    prompt =
-      `Replace the text "${step.target_string}" ` +
-      `with "${step.replacement}". ` +
-      `Keep the same position, approximate font style, size, alignment, ` +
-      `perspective, color and visual appearance. ` +
-      `Change only the requested text and preserve the rest of the image.`;
-  }
-
-  else if (action === "remove_object") {
-    const target = step.text
-      ? ` identified as "${step.text}"`
-      : "";
-
-    prompt =
-      `Remove the object or visual element${target} from the image. ` +
-      `Reconstruct the background naturally so there is no visible trace. ` +
-      `Preserve all unrelated subjects and details.`;
-  }
-
-  else {
-    return {
-      error:
-        "Unsupported generative action."
-    };
-  }
-
-  return gptInpaint(
-    buffer,
-    prompt
-  );
-}
-
-// ============================================================
-// MAIN EXECUTOR
-// ============================================================
-
-async function applyPlan(
-  buffer,
-  steps
-) {
+// ------------------------------------------------------------
+// MAIN: apply plan to current buffer, in order.
+// ------------------------------------------------------------
+async function applyPlan(buffer, steps) {
   const executed = [];
   const notes = [];
+  let cur = buffer;
 
-  let current = buffer;
-
-  if (!Buffer.isBuffer(current)) {
-    throw new Error(
-      "Image buffer is invalid."
-    );
-  }
-
-  for (const step of steps) {
-    if (!step?.action) continue;
-
-    const action =
-      String(step.action)
-        .toLowerCase();
-
+  for (const s of steps) {
+    const a = s.action;
     try {
-      // ======================================================
-      // ADJUST
-      // ======================================================
-
-      if (action === "adjust") {
-        current =
-          await ImageProcessor.adjust(
-            current,
-            step.adjust || {}
-          );
-
-        executed.push(
-          "brightness/contrast/saturation"
-        );
-
-        continue;
-      }
-
-      // ======================================================
-      // FILTER
-      // ======================================================
-
-      if (action === "filter") {
-        current =
-          await ImageProcessor.applyFilter(
-            current,
-            step.filter
-          );
-
-        executed.push(
-          `filter:${step.filter}`
-        );
-
-        continue;
-      }
-
-      // ======================================================
-      // ENHANCE
-      // ======================================================
-
-      if (action === "enhance") {
-        const result =
-          await ImageProcessor.enhance(
-            current,
-            {
-              scale:
-                step.scale || 1.2,
-
-              sharpness: 1.2,
-            }
-          );
-
-        current =
-          result?.buffer ||
-          result;
-
-        executed.push(
-          `enhance×${step.scale}`
-        );
-
-        continue;
-      }
-
-      // ======================================================
-      // UPSCALE
-      // ======================================================
-
-      if (action === "upscale") {
-        const result =
-          await ImageProcessor.enhance(
-            current,
-            {
-              scale:
-                step.scale || 2,
-
-              sharpness: 0.8,
-            }
-          );
-
-        current =
-          result?.buffer ||
-          result;
-
-        executed.push(
-          `HD/${step.scale}×`
-        );
-
-        continue;
-      }
-
-      // ======================================================
-      // RESIZE
-      // ======================================================
-
-      if (action === "resize") {
-        current =
-          await ImageProcessor.resize(
-            current,
-            step.width,
-            step.height,
-            "fit"
-          );
-
-        executed.push(
-          `resize ${step.width}×${step.height}`
-        );
-
-        continue;
-      }
-
-      // ======================================================
-      // CROP
-      // ======================================================
-
-      if (action === "crop") {
-        const metadata =
-          await sharp(current)
-            .metadata();
-
-        const imageWidth =
-          metadata.width || 1;
-
-        const imageHeight =
-          metadata.height || 1;
-
-        const left = Math.max(
-          0,
-          Math.min(
-            step.x,
-            imageWidth - 1
-          )
-        );
-
-        const top = Math.max(
-          0,
-          Math.min(
-            step.y,
-            imageHeight - 1
-          )
-        );
-
-        const width =
-          Math.min(
-            step.width,
-            imageWidth - left
-          );
-
-        const height =
-          Math.min(
-            step.height,
-            imageHeight - top
-          );
-
-        if (
-          width <= 0 ||
-          height <= 0
-        ) {
-          notes.push(
-            "Crop skipped: invalid crop dimensions."
-          );
-
-          continue;
-        }
-
-        current =
-          await sharp(current)
-            .extract({
-              left:
-                Math.round(left),
-
-              top:
-                Math.round(top),
-
-              width:
-                Math.round(width),
-
-              height:
-                Math.round(height),
-            })
-            .png()
-            .toBuffer();
-
-        executed.push(
-          `crop ${Math.round(width)}×${Math.round(height)}`
-        );
-
-        continue;
-      }
-
-      // ======================================================
-      // ROTATE
-      // ======================================================
-
-      if (action === "rotate") {
-        current =
-          await ImageProcessor.rotate(
-            current,
-            step.degrees
-          );
-
-        executed.push(
-          `rotate ${step.degrees}°`
-        );
-
-        continue;
-      }
-
-      // ======================================================
-      // REMOVE BACKGROUND
-      // ======================================================
-
-      if (action === "remove_background") {
-        const result =
-          await removeBackground(
-            current
-          );
-
-        if (result.buffer) {
-          current =
-            result.buffer;
-
-          executed.push(
-            `background removed (${result.provider})`
-          );
-        } else {
-          notes.push(
-            result.error ||
-            "Background removal failed."
-          );
-        }
-
-        continue;
-      }
-
-      // ======================================================
-      // REPLACE BACKGROUND
-      // ======================================================
-
-      if (action === "replace_background") {
+      if (a === "adjust") {
+        cur = await ImageProcessor.adjust(cur, s.adjust);
+        executed.push("brightness/contrast/saturation");
+      } else if (a === "filter") {
+        cur = await ImageProcessor.applyFilter(cur, s.filter);
+        executed.push(`filter:${s.filter}`);
+      } else if (a === "enhance") {
+        cur = (await ImageProcessor.enhance(cur, { scale: s.scale, sharpness: 1.2 })).buffer;
+        executed.push(`enhance×${s.scale}`);
+      } else if (a === "upscale") {
+        cur = (await ImageProcessor.enhance(cur, { scale: s.scale, sharpness: .8 })).buffer;
+        executed.push(`HD/${s.scale}×`);
+      } else if (a === "resize") {
+        cur = await ImageProcessor.resize(cur, s.width, s.height, "fit");
+        executed.push(`resize ${s.width}×${s.height}`);
+      } else if (a === "rotate") {
+        cur = await ImageProcessor.rotate(cur, s.degrees);
+        executed.push(`rotate ${s.degrees}°`);
+      } else if (a === "crop") { /* handled upstream w/ metadata */ }
+      // ---- GENERATIVE (real provider needed) ----
+      else if (a === "replace_background") {
+        // Open gpt-image approach: prompt to recolor/flatten bg, or local flat
         if (canInpaint()) {
-          const result =
-            await gptInpaint(
-              current,
-
-              `Change the background to solid color ${step.color}. ` +
-              `Preserve the main subject exactly, including edges, ` +
-              `details and proportions. Do not change the subject.`
-            );
-
-          if (result.buffer) {
-            current =
-              result.buffer;
-
-            executed.push(
-              `background → ${step.color} (AI)`
-            );
-          } else {
-            notes.push(
-              `replace_background failed: ${result.error}`
-            );
-          }
+          const o = await gptInpaint(cur, `Change the background to solid color ${s.color}, keep the subject/foreground unchanged and sharp, natural edges.`, null);
+          if (o.buffer) { cur = o.buffer; executed.push(`bg→${s.color}`); }
+          else if (a) notes.push(`replace_background needs provider: ${o.error}`);
         } else {
-          current =
-            await localFlatBackground(
-              current,
-              step.color
-            );
-
-          executed.push(
-            `background → ${step.color} (local)`
-          );
-
-          notes.push(
-            "Local flat background was used because no AI background provider is configured."
-          );
+          // local flat bg only when color requested
+          const flat = await sharp(cur).rotate().flatten({ background: s.color }).png().toBuffer();
+          cur = flat; executed.push(`bg flat ${s.color} (local)`);
         }
-
-        continue;
       }
-
-      // ======================================================
-      // TEXT / OBJECT GENERATIVE EDITS
-      // ======================================================
-
-      if (
-        action === "remove_text" ||
-        action === "replace_text" ||
-        action === "remove_object"
-      ) {
-        const result =
-          await generativeEdit(
-            current,
-            action,
-            step
-          );
-
-        if (result.buffer) {
-          current =
-            result.buffer;
-
-          if (action === "remove_text") {
-            executed.push(
-              "text removed (AI)"
-            );
-          }
-
-          else if (
-            action === "replace_text"
-          ) {
-            executed.push(
-              "text replaced (AI)"
-            );
-          }
-
-          else {
-            executed.push(
-              "object removed (AI)"
-            );
-          }
+      else if (a === "remove_background") {
+        if (canSegment) {
+          const o = await gptInpaint(cur, "Remove the background entirely, keep only the main subject with natural edges, transparent background.", null);
+          if (o.buffer) { cur = await ensureAlpha(o.buffer); executed.push("background removed (AI)"); }
+          else notes.push(`remove_background needs provider: ${o.error}`);
+        } else if (REMOVE_BG_KEY) {
+          // remove.bg path (plain bg only) - real segmentation
+          const o = await removeBgViaRemoveBg(cur);
+          if (o.ok) { cur = o.buffer; executed.push("background removed (remove.bg)"); }
+          else notes.push(`remove.bg failed: ${o.error}`);
         } else {
-          notes.push(
-            result.error ||
-            `${action} failed.`
-          );
+          notes.push("background removal provider not configured (OpenAI/remove.bg needed) — background NOT removed (no fake result).");
         }
-
-        continue;
       }
-    } catch (error) {
-      notes.push(
-        `step ${action} failed: ${String(
-          error.message
-        ).slice(0, 150)}`
-      );
-    }
+      else if (a === "remove_text" || a === "replace_text") {
+        const desc = a==="remove_text" ? `Remove the text${s.text?` "${s.text}"`:""}, fill the area naturally with surrounding content, no trace of letters.` 
+                       : `Replace the text "${s.target_string}" with "${s.replacement}", matching the same font size, style, position and color as the original.`;
+        if (canInpaint()) {
+          const o = await gptInpaint(cur, desc, null);
+          if (o.buffer) { cur = o.buffer; executed.push(`text ${a==="remove_text"?"removed":"replaced"}`); }
+          else { notes.push(`${a} needs provider: ${o.error}`); }
+        } else {
+          notes.push(`"${a}" needs a real inpainting provider (OpenAI gpt-image). Configure OPENAI_API_KEY to enable. Text NOT silently removed.`);
+        }
+      }
+      else if (a === "remove_object") {
+        if (canInpaint()) {
+          const o = await gptInpaint(cur, `Remove the object/element${s.text?` (${s.text})`:""}, reconstruct the background so no trace remains.`, null);
+          if (o.buffer) { cur = o.buffer; executed.push("object removed"); }
+          else notes.push(`remove_object needs provider: ${o.error}`);
+        } else notes.push("object removal needs OpenAI gpt-image provider (not configured) — skipped honestly.");
+      }
+    } catch (e) { notes.push(`step ${a} failed: ${String(e.message).slice(0,80)}`); }
   }
-
-  return {
-    buffer: current,
-    executed,
-    notes,
-  };
+  return { buffer: cur, executed, notes };
 }
 
-// ============================================================
-// CAPABILITY INFO
-// ============================================================
-
-function getCapabilities() {
-  return {
-    openai: Boolean(OPENAI_KEY),
-
-    removeBg: Boolean(
-      REMOVE_BG_KEY
-    ),
-
-    replicate: Boolean(
-      REPLICATE_TOKEN
-    ),
-
-    inpainting: Boolean(
-      OPENAI_KEY
-    ),
-
-    backgroundRemoval:
-      Boolean(
-        REMOVE_BG_KEY ||
-        OPENAI_KEY
-      ),
-
-    localEditing: true,
-  };
+// ensure png has alpha for real "transparent bg"
+async function ensureAlpha(buf) {
+  try { const meta = await sharp(buf).metadata(); if (!meta.hasAlpha) return await sharp(buf).rotate().ensureAlpha().png().toBuffer(); } catch {}
+  return buf;
 }
 
-// ============================================================
-// EXPORTS
-// ============================================================
+async function removeBgViaRemoveBg(buffer) {
+  try {
+    const FD = FormData;
+    const png = await sharp(buffer).rotate().ensureAlpha().png().toBuffer();
+    const f = new FD();
+    f.append("image_file", png, { filename: "img.png", contentType: "image/png" });
+    f.append("size", "auto");
+    const r = await fetch("https://api.remove.bg/v1.0/removebg", {
+      method: "POST",
+      headers: { "X-Api-Key": REMOVE_BG_KEY, ...f.getHeaders() },
+      body: f,
+    });
+    if (r.ok) return { ok:true, buffer: Buffer.from(await r.arrayBuffer()), provider:"remove.bg" };
+    return { ok:false, error:`remove.bg http_${r.status}` };
+  } catch (e) { return { ok:false, error: String(e.message).slice(0,100) }; }
+}
 
-module.exports = {
-  applyPlan,
-  validatePlan,
-
-  canInpaint,
-  canSegment,
-
-  getCapabilities,
-
-  ALLOW,
-};
+module.exports = { applyPlan, validatePlan, canInpaint, canSegment, ALLOW };
