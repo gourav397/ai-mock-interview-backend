@@ -1,0 +1,107 @@
+Easy/Medium/Hard wherever the existing QuestionBank contains those banks.
+
+Verify that REAL questions are returned.
+
+==================================================
+PHASE 18 — FRONTEND TEST
+========================
+
+Run/build the actual frontend.
+
+Verify:
+
+category appears
+category click works
+Start Interview works
+correct API request is generated
+backend receives request
+questions are returned
+questions render in the interview UI
+
+The browser must NOT show:
+
+Route Not Found
+
+==================================================
+PHASE 19 — PRODUCTION
+=====================
+
+After local verification, inspect the deployed production configuration.
+
+Production backend:
+
+https://ai-interview-backend-production-6da2.up.railway.app
+
+Verify the production server responds and the relevant route is actually deployed.
+
+Do not claim production success if it cannot be verified.
+
+==================================================
+PHASE 20 — PRESERVE ALEX
+========================
+
+Do not break:
+
+HealthMonitor
+SecurityAgent
+EmployeeAgent
+IncidentManager
+DecisionEngine
+AuditLogger
+NotificationManager
+owner authentication
+owner commands
+ALEX dashboard
+existing health checks
+
+==================================================
+FINAL RULE
+==========
+
+THIS IS NOT COMPLETE AFTER "ANALYSIS COMPLETE".
+
+If analysis says:
+
+"Requires code changes"
+
+THEN CONTINUE AND MAKE THE CODE CHANGES.
+
+If a test fails:
+inspect the failure
+identify the root cause
+modify the responsible existing file
+restart
+test again
+
+Repeat until the actual category → Start Interview → API → backend → QuestionBank → questions → frontend flow works.
+
+Do NOT create a file called:
+
+router.post
+
+Do NOT interpret "router.post" as a filename.
+
+Do NOT stop at IncidentManager validation.
+
+Do NOT stop at route discovery.
+
+Do NOT report SUCCESS merely because files were modified.
+
+Only report SUCCESS after the actual working flow has been tested.
+
+FINAL REPORT MUST CONTAIN:
+
+1. Root cause
+2. Files actually modified
+3. Exact canonical API endpoint
+4. HTTP method
+5. Authentication status
+6. QuestionBank status
+7. Categories tested
+8. Difficulties tested
+9. Frontend result
+10. Backend result
+11. Production verification result
+12. Any remaining issue
+
+If any acceptance test fails, report FAILED and continue fixing instead of claiming success.

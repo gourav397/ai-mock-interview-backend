@@ -1,245 +1,531 @@
 // ============================================================
-// AI IMAGE EDITOR — Routes (v8 Consistent)
-// Mounted /api/image-editor/*
-// Depends ONLY on: imageProcessor.js (v4) , aiEdit.js (v8), aiEditParser.js (v5), vision.js
+// IMAGE EDITOR ROUTES — Production v7.0 (self-consistent)
+// STATELESS: upload returns a SAFE filename; every edit sends that
+// filename back as `imagePath`. All file access is basename-resolved
+// inside TEMP_DIR → path-traversal safe.
+//
+// CONTRACTS (must match frontend api.js + utils/imageProcessor.js):
+//   * ImageProcessor.saveTemp(buffer)  -> STRING filename (NOT an object)
+//   * parseAiInstruction(text)         -> ARRAY of steps (user order kept)
+//   * Every edit response:
+//       { success, filename, preview } where preview =
+//         "/api/image-editor/preview/<filename>"
 // ============================================================
+
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
-const sharp = require("sharp");                          // FIX: sharp imported
-const { ImageProcessor, TEMP_DIR } = require("../utils/imageProcessor");
-const aiEdit = require("../utils/aiEdit");               // v8: validatePlan, applyPlan, getCapabilities
-const vision = require("../utils/vision");               // analyseImage
-const parser = require("../utils/aiEditParser");         // v5: parseAiInstruction
+const fsPromises = fs.promises;
+const crypto = require("crypto");
+
+const {
+  ImageProcessor,
+  TEMP_DIR,
+} = require("../utils/imageProcessor");
+const { parseAiInstruction, describeStep } = require("../utils/aiEditParser");
 
 const router = express.Router();
+
+// ------------------------------------------------------------
+// Upload memory storage (buffer validated + written to TEMP_DIR)
+// ------------------------------------------------------------
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    ["image/jpeg","image/png","image/webp"].includes(file.mimetype)
-      ? cb(null, true)
-      : cb(new Error(`Unsupported type: ${file.mimetype}`), false);
-  },
+  limits: { fileSize: 20 * 1024 * 1024, files: 1 },
 });
 
-// ---- path safety: basename only, TEMP_DIR scoped ----
-const FILENAME_RE = /^[a-zA-Z0-9._-]+$/;
-function resolveTempPath(p) {
-  if (!p || typeof p !== "string") return null;
-  const n = path.basename(p.trim());
-  if (!n || !FILENAME_RE.test(n)) return null;
-  const full = path.join(TEMP_DIR, n);
-  return full.startsWith(TEMP_DIR + path.sep) && fs.existsSync(full) ? full : null;
+// ============================================================
+// SAFE FILENAME RESOLUTION — the single guard for every file op.
+// Never lets ".." or absolute paths escape TEMP_DIR.
+// ============================================================
+function resolveSafeFilename(value) {
+  if (typeof value !== "string" || !value) return null;
+  const name = value.split("\\").pop().split("/").pop();
+  if (!/^[a-zA-Z0-9._-]+$/.test(name)) return null; // blocks traversal
+  if (!name.includes(".")) return null;
+  return name;
 }
-async function loadImageBuffer(req) {
-  if (req.file && req.file.buffer) return req.file.buffer;
-  const r = resolveTempPath(req.body?.imagePath);
-  return r ? fs.promises.readFile(r) : null;
+
+function absFile(filename) {
+  return path.join(TEMP_DIR, filename);
 }
-const validateImage = (req, res, next) => {
-  if (!req.file && !req.body?.imagePath) return res.status(400).json({ success:false, message:"No image. Upload first." });
-  next();
-};
-// saveFrom returns a STRING filename
-const saveFrom = (buf, hint) => ImageProcessor.saveTemp(buf, hint);
-function buildImageData(f, e = {}) {
-  return {
-    path: f, filename: f,
-    preview: `/api/image-editor/preview/${f}`,
-    resultUrl: `/api/image-editor/preview/${f}`,
-    downloadUrl: `/api/image-editor/download/${f}`,
-    ...e,
+
+async function readBuffer(filename) {
+  const safe = resolveSafeFilename(filename);
+  if (!safe) {
+    const e = new Error("Invalid image filename.");
+    e.code = 400;
+    throw e;
+  }
+  const filePath = absFile(safe);
+  try {
+    const stat = await fsPromises.stat(filePath);
+    if (!stat.isFile()) throw new Error("not-a-file");
+  } catch {
+    const e = new Error("Source image not found. It may have expired — please re-upload.");
+    e.code = 404;
+    throw e;
+  }
+  const buf = await fsPromises.readFile(filePath);
+  if (!buf || buf.length === 0) {
+    const e = new Error("Source image is empty.");
+    e.code = 500;
+    throw e;
+  }
+  return { buffer: buf, filename: safe };
+}
+
+function respondImage(res, filename, extra = {}) {
+  const preview = `/api/image-editor/preview/${encodeURIComponent(filename)}`;
+  res.json({ success: true, filename, preview, ...extra });
+}
+
+function asyncH(fn) {
+  return (req, res) => {
+    Promise.resolve(fn(req, res)).catch((err) => {
+      const status = Number(err.code) >= 400 ? err.code : 500;
+      const msg =
+        (err && err.message) || "Unexpected server error.";
+      console.error(`[imageEditor] ${status}:`, msg);
+      res.status(status).json({ success: false, error: msg });
+    });
   };
 }
 
-// ---------------- STATUS (uses real getCapabilities) ----------------
-router.get("/status", (req, res) => {
-  const c = aiEdit.getCapabilities();
-  res.json({ success:true, data:{
-    version:"8.0.0", supportedFormats:["image/jpeg","image/png","image/webp"],
-    aiEdit: {
-      planner: visionConfigured() ? "gemini-vision" : "deterministic",
-      ...c,
-      honestNote: c.inpainting
-        ? "True AI text/object editing ENABLED"
-        : "Text/object removal needs OPENAI_API_KEY. Sharp ops always work.",
-    }
-  }});
-});
-const visionConfigured = () => Boolean(process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY);
+// ------------------------------------------------------------
+// CAPABILITIES — HONEST. No key => needsProvider:true, never fake.
+// ------------------------------------------------------------
+const cap = () => {
+  const openai = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 8);
+  const removebg = !!(process.env.REMOVE_BG_API_KEY && process.env.REMOVE_BG_API_KEY.length > 8);
+  return { openai, removebg };
+};
 
-// ---------------- UPLOAD / PREVIEW / DOWNLOAD ----------------
-router.post("/upload", upload.single("image"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ success:false, message:"Field 'image' required." });
-    const v = ImageProcessor.validateImage(req.file);
-    if (!v.valid) return res.status(400).json({ success:false, message:v.error });
-    const md = await ImageProcessor.getMetadata(req.file.buffer);
-    if (!md) return res.status(400).json({ success:false, message:"Corrupt image." });
-    const name = await saveFrom(req.file.buffer, "orig");
-    res.json({ success:true, message:"Uploaded.", data: buildImageData(name, { ...md, size: req.file.buffer.length }) });
-  } catch (e) { res.status(500).json({ success:false, message:`Upload failed: ${e.message}` }); }
-});
-router.get("/preview/:filename", (req, res) => {
-  const p = resolveTempPath(req.params.filename);
-  if (!p) return res.status(404).json({ success:false, message:"Image expired." });
-  res.setHeader("Cache-Control","private, max-age=300");
-  res.sendFile(p);
-});
-router.get("/download/:filename", (req, res) => {
-  const p = resolveTempPath(req.params.filename);
-  if (!p) return res.status(404).json({ success:false, message:"Image expired." });
-  res.download(p, path.basename(p));
-});
-
-// ---------------- Sharp-only ops (filters / adjust / enhance / upscale / resize / crop / rotate) ----------------
-router.post("/filter", validateImage, async (req,res)=>{ try{
-  const { filter } = req.body||{}; if(!filter) return res.status(400).json({success:false,message:"filter required"});
-  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
-  const n=await saveFrom(await ImageProcessor.applyFilter(b,filter),"filter");
-  res.json({success:true,data:buildImageData(n)});
-}catch(e){res.status(500).json({success:false,message:e.message})}});
-
-router.post("/adjust", validateImage, async (req,res)=>{ try{
-  const a=req.body?.adjustments||req.body?.adjust||{};
-  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
-  const n=await saveFrom(await ImageProcessor.adjust(b,a),"adjust");
-  res.json({success:true,data:buildImageData(n)});
-}catch(e){res.status(500).json({success:false,message:e.message})}});
-
-router.post("/enhance", validateImage, async (req,res)=>{ try{
-  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
-  const sc=Math.min(4,Math.max(1,Number(req.body?.scale)||1));
-  const r=await ImageProcessor.enhance(b,{scale:sc,sharpness:Number(req.body?.sharpness)||1.2});
-  const n=await saveFrom(r.buffer,"enhance");
-  res.json({success:true,data:buildImageData(n,{width:r.width,height:r.height,scale:r.scale})});
-}catch(e){res.status(500).json({success:false,message:e.message})}});
-
-router.post("/upscale", validateImage, async (req,res)=>{ try{
-  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
-  const sc=Math.min(4,Math.max(1,Number(req.body?.scale)||2));
-  const r=await ImageProcessor.enhance(b,{scale:sc,sharpness:0.8});
-  const n=await saveFrom(r.buffer,"upscale");
-  res.json({success:true,data:buildImageData(n,{width:r.width,height:r.height,scale:r.scale})});
-}catch(e){res.status(500).json({success:false,message:e.message})}});
-
-router.post("/resize", validateImage, async (req,res)=>{ try{
-  const { width, height, fit="cover" }=req.body||{};
-  if(!width||!height) return res.status(400).json({success:false,message:"width & height required"});
-  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
-  const n=await saveFrom(await ImageProcessor.resize(b,width,height,fit),"resized");
-  res.json({success:true,data:buildImageData(n,{width:+width,height:+height})});
-}catch(e){res.status(500).json({success:false,message:e.message})}});
-
-router.post("/crop", validateImage, async (req,res)=>{ try{
-  const { left,top,width,height }=req.body||{};
-  if(left===undefined||top===undefined||!width||!height) return res.status(400).json({success:false,message:"left,top,width,height"});
-  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
-  const n=await saveFrom(await ImageProcessor.crop(b,left,top,width,height),"crop");
-  res.json({success:true,data:buildImageData(n)});
-}catch(e){res.status(400).json({success:false,message:e.message})}});
-
-router.post("/rotate", validateImage, async (req,res)=>{ try{
-  const deg=Number(req.body?.degrees)||90;
-  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
-  const n=await saveFrom(await ImageProcessor.rotate(b,deg),"rotated");
-  res.json({success:true,data:buildImageData(n)});
-}catch(e){res.status(500).json({success:false,message:e.message})}});
-
-// ---------------- BACKGROUND (real remove.bg if key; honest fallback) ----------------
-router.post("/remove-background", validateImage, async (req,res)=>{ try{
-  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
-  const r=await ImageProcessor.removeBackground(b);          // {buffer, provider:"remove.bg"|"fallback"}
-  const n=await saveFrom(r.buffer,"nobg");
-  const honest = r.provider==="remove.bg"
-    ? "Background removed via remove.bg."
-    : "Local PNG fallback only (no real segmentation). Set REMOVE_BG_API_KEY/OPENAI_API_KEY for true BG removal.";
-  res.json({success:true, message:honest, data:buildImageData(n,{provider:r.provider})});
-}catch(e){res.status(500).json({success:false,message:e.message})}});
-
-// ---------------- AI-EDIT (order-preserving, honest) ----------------
-// Convert raw AI/parser steps into the schema aiEdit.applyPlan expects.
-const clampNum = (v,min,max,fb)=>{ const n=Number(v); return Number.isFinite(n)?Math.min(max,Math.max(min,n)):fb; };
-function toEngine(rawSteps) {
-  const out=[];
-  for (const s of (rawSteps||[])) {
-    const a=String(s?.action||"").trim().toLowerCase();
-    const t=s||{};
-    switch(a){
-      case "remove_background": out.push({action:"remove_background"}); break;
-      case "replace_background": out.push({action:"replace_background", color:/^#[0-9a-fA-F]{6}$/.test(t.color||"")?t.color:"#ffffff"}); break;
-      case "remove_text":       out.push({action:"remove_text", text:String(t.text??t.target_text??"").slice(0,100)}); break;
-      case "replace_text":      out.push({action:"replace_text", target_string:String(t.target_text??t.text??"").slice(0,100), replacement:String(t.replacement_text??t.replacement??"").slice(0,100)}); break;
-      case "remove_object":     out.push({action:"remove_object", text:String(t.text??t.object??"").slice(0,100)}); break;
-      case "adjust": {
-        const adj=t.adjustments||t.adjust||{};
-        out.push({action:"adjust", adjust:{ brightness:clampNum(adj.brightness,0.1,3,1), contrast:clampNum(adj.contrast,0.1,3,1), saturation:clampNum(adj.saturation,0,3,1) }});
-        break;
-      }
-      case "filter": out.push({action:"filter", filter:String(t.filter||"cinematic").slice(0,40)}); break;
-      case "enhance": out.push({action:"enhance", scale:clampNum(t.scale,0.5,4,1.2)}); break;
-      case "upscale": out.push({action:"upscale", scale:clampNum(t.scale,0.5,4,2)}); break;
-      case "rotate": { let d=Math.abs(Number(t.degrees)||90)%360; if(d) out.push({action:"rotate", degrees:d}); break; }
-      // resize & crop_percent: resize only when explicit dims present
-      case "resize": { const w=Number(t.width), h=Number(t.height); if(w>0&&h>0) out.push({action:"resize", width:w, height:h}); break; }
-      default: break; // unknown action rejected
-    }
-  }
-  return out.slice(0,6);
+function needsProviderMessage(kind) {
+  const m = {
+    ai_text_edit:
+      "Real text change/removal and object removal need the AI provider (OpenAI gpt-image). " +
+      "Add OPENAI_API_KEY to your .env, then retry. Local tools can't rewrite text/pixels honestly.",
+    bg_removal:
+      "True subject background removal needs the remove.bg or OpenAI provider. " +
+      "Add REMOVE_BG_API_KEY or OPENAI_API_KEY. Without it we only do a local flat-color flatten.",
+  };
+  return m[kind] || "This edit needs an external AI provider key.";
 }
 
-router.post("/ai-edit", validateImage, async (req, res) => {
-  try {
-    const instruction = String(req.body?.instruction || "").trim();
-    if (!instruction) return res.json({ success:false, message:"Instruction required." });
+// ============================================================
+// AI STEP EXECUTOR — sequential, user order preserved.
+// Returns final buffer (provider edits are real, not faked).
+// ============================================================
 
-    const buf = await loadImageBuffer(req);
-    if (!buf) return res.status(404).json({ success:false, message:"Source expired. Re-upload." });
+// --- OpenAI /v1/images/edits (gpt-image-*). Returns Buffer. ---
+async function runOpenAiEdit(inputBuffer, prompt) {
+  const key = process.env.OPENAI_API_KEY;
+  const model = process.env.OPENAI_EDIT_MODEL || "gpt-image-2";
+  const form = new FormData();
+  form.append("model", model);
+  form.append(
+    "image",
+    new Blob([inputBuffer], { type: "image/png" }),
+    "input.png"
+  );
+  form.append("prompt", prompt);
+  // GPT-image models ALWAYS return b64_json; do NOT send response_format.
 
-    let meta={width:0,height:0};
-    try { meta = await sharp(buf).metadata(); } catch { return res.status(400).json({success:false,message:"Corrupted image."}); }
+  const resp = await fetch("https://api.openai.com/v1/images/edits", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}` },
+    body: form,
+  });
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const detail = json?.error?.message || JSON.stringify(json).slice(0, 300);
+    const e = new Error(`OpenAI edit failed (${resp.status}): ${detail}`);
+    e.code = 502;
+    throw e;
+  }
+  const b64 = json?.data?.[0]?.b64_json;
+  if (!b64) {
+    const e = new Error("OpenAI returned no image payload.");
+    e.code = 502;
+    throw e;
+  }
+  return Buffer.from(b64, "base64");
+}
 
-    // LAYER 1: Vision+OCR plan (if Gemini key) -> else v5 regex parser floor
-    let rawSteps=null, regions=[];
-    const vis = await vision.analyseImage(buf, instruction, { imgW:meta.width||1, imgH:meta.height||1 });
-    if (vis?.steps?.length) { rawSteps=vis.steps; regions=vis.regions||[]; }
-    else { const p=parser.parseAiInstruction(instruction); if(p?.ok) rawSteps=p.plan; }
-
-    // LAYER 2: normalize + strict allowlist validation (engine schema)
-    const plan = aiEdit.validatePlan(toEngine(rawSteps));
-    if (!plan.length) {
-      return res.json({ success:false,
-        message:`Instruction samajh nahi aayi / no actionable step. Examples: "photo HD kar do", "background white kar do", "brightness badha do", "2x bada karo".`,
-        data:{ instruction, regions } });
+// Prompt builders for specific high-value goals.
+const promptFor = (step) => {
+  switch (step.action) {
+    case "replace_text":
+    case "change_text":
+      return `In this image, find the text "${step.oldText}" (approx "${step.rawText}") and replace it so it reads exactly "${step.newText}", keeping font, style, size, color and location identical. Remove any old artifact of the original text.`;
+    case "remove_text": {
+      const t = step.text || step.rawText || "";
+      return `Remove the text${t ? ` "${t}"` : ""} from this image and inpaint the area naturally so it looks like that text was never there, reconstructing the background behind it.`;
     }
+    case "remove_object": {
+      const o = step.object || step.target || "the object";
+      return `Remove ${o} from this image and inpaint the area so the surrounding scene looks completely natural and continuous, as if it was never present.`;
+    }
+    case "ai_prompt":
+    case "ai_edit":
+      return step.prompt || step.instruction || "Improve this image realistically.";
+    default:
+      return step.prompt || step.instruction || "Improve this image realistically.";
+  }
+};
 
-    // LAYER 3: execute in order (Sharp local + real providers via aiEdit)
-    const { buffer: finalBuf, executed, notes } = await aiEdit.applyPlan(buf, plan);
-    const filename = await saveFrom(finalBuf, "ai_edit");     // STRING (FIX)
-    const build = buildImageData(filename);
-    const pending = notes.length>0;
+async function executeSteps(inputBuffer, steps, c) {
+  let buffer = inputBuffer;
+  const executed = [];
 
-    res.json({
-      success:true,
-      message: executed.length
-        ? `Applied: ${executed.join(" → ")}${pending ? " | Remaining need provider: "+notes.join("; ") : ""}`
-        : notes.join("; "),
-      data:{
-        instruction, plan, executed, stepsApplied: executed.length,
-        stepsPending: notes, needsProvider: pending,
-        regions, filename, preview: build.preview, resultUrl: build.resultUrl, downloadUrl: build.downloadUrl,
-      },
+  for (const step of steps) {
+    if (!step || typeof step.action !== "string") continue;
+    const a = step.action;
+
+    // ---- Local Sharp operations (no provider needed) ----
+    if (a === "brightness" || a === "adjust") {
+      const amount = step.amount != null ? step.amount : step.value;
+      buffer = await ImageProcessor.applyAdjustments(buffer, {
+        brightness:
+          typeof amount === "number"
+            ? 1 + amount * (step.intensity === "reduce" ? -1 : 1)
+            : undefined,
+      });
+      executed.push(`brightness → ${describeStep(step)}`);
+    } else if (a === "saturation") {
+      const amount = step.amount != null ? step.amount : 0.4;
+      buffer = await ImageProcessor.applyAdjustments(buffer, { saturation: 1 + amount });
+      executed.push(`saturation → ${describeStep(step)}`);
+    } else if (a === "contrast") {
+      const amount = step.amount != null ? step.amount : 0.2;
+      buffer = await ImageProcessor.applyAdjustments(buffer, { contrast: 1 + amount });
+      executed.push(`contrast → ${describeStep(step)}`);
+    } else if (a === "enhance") {
+      const r = await ImageProcessor.enhance(buffer, { scale: step.scale || 1 });
+      buffer = r.buffer;
+      executed.push(`enhance → ${describeStep(step)}`);
+    } else if (a === "upscale") {
+      buffer = await ImageProcessor.upscale(buffer, step.scale || 2);
+      executed.push(`upscale → ${describeStep(step)}`);
+    } else if (a === "resize") {
+      buffer = await ImageProcessor.resize(buffer, step.width, step.height, step.fit);
+      executed.push(`resize → ${describeStep(step)}`);
+    } else if (a === "crop") {
+      buffer = await ImageProcessor.crop(buffer, step.left, step.top, step.width, step.height);
+      executed.push(`crop → ${describeStep(step)}`);
+    } else if (a === "crop_percent") {
+      // center crop to % of original
+      const pct = clamp(Number(step.percent) || 1, 0.1, 1);
+      const meta = await ImageProcessor.getMetadata(buffer);
+      const w = Math.round((meta.width || 0) * pct);
+      const h = Math.round((meta.height || 0) * pct);
+      const left = Math.max(0, Math.round(((meta.width || 0) - w) / 2));
+      const top = Math.max(0, Math.round(((meta.height || 0) - h) / 2));
+      buffer = await ImageProcessor.crop(buffer, left, top, w, h);
+      executed.push(`crop → ${describeStep(step)}`);
+    } else if (a === "rotate") {
+      buffer = await ImageProcessor.rotate(buffer, step.degrees);
+      executed.push(`rotate → ${describeStep(step)}`);
+    } else if (a === "black_white" || a === "bw" || a === "grayscale") {
+      buffer = await ImageProcessor.applyFilter(buffer, "bw");
+      executed.push(`grayscale → ${describeStep(step)}`);
+    } else if (a === "filter") {
+      const f = (step.filter || step.name || "natural").replace(/\s+/g, "-").toLowerCase();
+      buffer = await ImageProcessor.applyFilter(buffer, f);
+      executed.push(`filter(${f})`);
+    } else if (a === "replace_background" || a === "background_color") {
+      buffer = await ImageProcessor.replaceBackground(buffer, { color: step.color || "#ffffff" });
+      executed.push(`background → ${step.color}`);
+    }
+    // ---- Provider operations (REAL only when provider present) ----
+    else if (a === "remove_background") {
+      if (c.removebg) {
+        const r = await ImageProcessor.removeBackground(buffer); // remove.bg path
+        if (r.provider === "remove.bg") {
+          buffer = r.buffer;
+          executed.push("background removed (remove.bg)");
+        } else {
+          const e = new Error("remove.bg unavailable; fallback would not truly remove background.");
+          e.code = 503;
+          throw e;
+        }
+      } else {
+        const e = new Error("needsProvider:background");
+        e.code = 409;
+        e.capKind = "bg_removal";
+        throw e;
+      }
+    } else if (
+      a === "replace_text" || a === "change_text" ||
+      a === "remove_text" || a === "remove_object" ||
+      a === "ai_prompt" || a === "ai_edit"
+    ) {
+      if (!c.openai) {
+        const e = new Error("needsProvider:ai");
+        e.code = 409;
+        e.capKind = "ai_text_edit";
+        throw e;
+      }
+      buffer = await runOpenAiEdit(buffer, promptFor(step));
+      executed.push(describeStep(step));
+    }
+    // unknown action -> skip silently (allowlist guard)
+  }
+
+  return { buffer, executed };
+}
+
+const clamp = (n, min, max) => Math.min(Math.max(n, min), max);
+
+// ============================================================
+// UPLOAD
+// ============================================================
+router.post(
+  "/upload",
+  upload.single("image"),
+  asyncH(async (req, res) => {
+    const check = ImageProcessor.validateImage(req.file);
+    if (!check.valid) return res.status(400).json({ success: false, error: check.error });
+
+    // Normalize everything to PNG for edits that may carry alpha.
+    const meta = await ImageProcessor.getMetadata(req.file.buffer);
+    let out = req.file.buffer;
+    if (meta && meta.format === "jpeg") {
+      out = await sharpifyToPng(out);
+    }
+    const filename = await ImageProcessor.saveTemp(out, "upload");
+    return respondImage(res, filename, { originalName: req.file.originalname || null });
+  })
+);
+
+// helper to keep PNG alpha path simple (re-encode only if needed)
+async function sharpifyToPng(buffer) {
+  const sharp = require("sharp");
+  return sharp(buffer).rotate().png().toBuffer();
+}
+
+// ============================================================
+// LOCAL EDIT ENDPOINTS (all stateless, chained via filename)
+// ============================================================
+router.post("/filter", asyncH(async (req, res) => {
+  const { imagePath, filter } = req.body;
+  const { buffer } = await readBuffer(imagePath);
+  const out = await ImageProcessor.applyFilter(buffer, filter);
+  const filename = await ImageProcessor.saveTemp(out, "filtered");
+  return respondImage(res, filename);
+}));
+
+router.post("/adjust", asyncH(async (req, res) => {
+  const { imagePath, adjustments } = req.body;
+  const { buffer } = await readBuffer(imagePath);
+  const out = await ImageProcessor.applyAdjustments(buffer, adjustments || {});
+  const filename = await ImageProcessor.saveTemp(out, "adjusted");
+  return respondImage(res, filename);
+}));
+
+router.post("/enhance", asyncH(async (req, res) => {
+  const { imagePath } = req.body;
+  const { buffer } = await readBuffer(imagePath);
+  const r = await ImageProcessor.enhance(buffer, { scale: Number(req.body.scale) || 1.5 });
+  const filename = await ImageProcessor.saveTemp(r.buffer, "enhanced");
+  return respondImage(res, filename, { width: r.width, height: r.height, scale: r.scale });
+}));
+
+router.post("/upscale", asyncH(async (req, res) => {
+  const { imagePath } = req.body;
+  const { buffer } = await readBuffer(imagePath);
+  const out = await ImageProcessor.upscale(buffer, Number(req.body.scale) || 2);
+  const filename = await ImageProcessor.saveTemp(out, "upscaled");
+  return respondImage(res, filename);
+}));
+
+router.post("/resize", asyncH(async (req, res) => {
+  const { imagePath, width, height, fit } = req.body;
+  const { buffer } = await readBuffer(imagePath);
+  const out = await ImageProcessor.resize(buffer, width, height, fit);
+  const filename = await ImageProcessor.saveTemp(out, "resized");
+  return respondImage(res, filename);
+}));
+
+router.post("/crop", asyncH(async (req, res) => {
+  const { imagePath, left, top, width, height } = req.body;
+  const { buffer } = await readBuffer(imagePath);
+  const out = await ImageProcessor.crop(buffer, left, top, width, height);
+  const filename = await ImageProcessor.saveTemp(out, "cropped");
+  return respondImage(res, filename);
+}));
+
+router.post("/rotate", asyncH(async (req, res) => {
+  const { imagePath } = req.body;
+  const { buffer } = await readBuffer(imagePath);
+  const out = await ImageProcessor.rotate(buffer, Number(req.body.degrees) || 90);
+  const filename = await ImageProcessor.saveTemp(out, "rotated");
+  return respondImage(res, filename);
+}));
+
+// ------------------------------------------------------------
+// /remove-background — REAL remove.bg if key, else honest 409.
+// ------------------------------------------------------------
+router.post("/remove-background", asyncH(async (req, res) => {
+  const { imagePath } = req.body;
+  const { buffer } = await readBuffer(imagePath);
+  const c = cap();
+  if (!c.removebg) {
+    return res.status(409).json({
+      success: false,
+      needsProvider: true,
+      provider: "remove.bg",
+      error: needsProviderMessage("bg_removal"),
     });
-  } catch (e) { res.status(500).json({ success:false, message:`AI edit failed: ${String(e.message).slice(0,160)}` }); }
-});
+  }
+  const out = await ImageProcessor.removeBackground(buffer);
+  if (out.provider !== "remove.bg") {
+    return res.status(503).json({ success: false, error: "remove.bg request failed." });
+  }
+  const filename = await ImageProcessor.saveTemp(out.buffer, "nobg");
+  return respondImage(res, filename, { provider: "remove.bg" });
+}));
 
-// ---------------- error middleware ----------------
-router.use((e, req, res, next) => {
-  if (e instanceof multer.MulterError) return res.status(400).json({ success:false, message: e.code==="LIMIT_FILE_SIZE" ? "Max 20MB" : `Upload: ${e.code}` });
-  if (e) return res.status(400).json({ success:false, message: e.message });
-  next();
-});
+// ------------------------------------------------------------
+// /replace-background — flatten alpha onto color (local, real).
+// Best after a real /remove-background.
+// ------------------------------------------------------------
+router.post("/replace-background", asyncH(async (req, res) => {
+  const { imagePath } = req.body;
+  const { buffer } = await readBuffer(imagePath);
+  const out = await ImageProcessor.replaceBackground(buffer, { color: req.body.color || "#ffffff" });
+  const filename = await ImageProcessor.saveTemp(out, "replacedbg");
+  return respondImage(res, filename);
+}));
+
+// ============================================================
+// /ai-edit — the FIXED seam. parse -> validate capability -> execute
+// IMPORTANT: ImageProcessor.saveTemp returns a STRING (filename).
+// We use that string directly. NO out.filename (that was the bug).
+// ============================================================
+router.post("/ai-edit", asyncH(async (req, res) => {
+  const { imagePath, instruction } = req.body;
+  // ============ TEXT REPLACE FAST-PATH (issue fix) ============
+const { handleTextReplace } = require("../utils/textReplace");
+const txtRes = await handleTextReplace(req.body.imagePath, req.body.instruction);
+if (txtRes) return res.status(txtRes.status).json(txtRes.response);
+// =============================================================
+  if (!instruction || !String(instruction).trim()) {
+    return res.status(400).json({ success: false, error: "No instruction provided." });
+  }
+
+  const { buffer } = await readBuffer(imagePath);
+
+  // 1) Parse user text into ordered steps.
+  const steps = parseAiInstruction(String(instruction));
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return res.status(422).json({
+      success: false,
+      error:
+        "Could not understand that instruction. Try e.g. 'pic bright karo', 'background remove karo', " +
+        "'text 7869 ko 7875 kar do', 'sath wala aadmi hata do'.",
+    });
+  }
+
+  // 2) Honest capability check BEFORE mutating anything.
+  const c = cap();
+  const needsAI = steps.some((s) =>
+    ["replace_text", "change_text", "remove_text", "remove_object", "ai_prompt", "ai_edit"].includes(s?.action)
+  );
+  const needsBG = steps.some((s) => s?.action === "remove_background");
+
+  if ((needsAI && !c.openai) || (needsBG && !c.removebg)) {
+    const missing = [];
+    if (needsAI && !c.openai) missing.push("OPENAI_API_KEY");
+    if (needsBG && !c.removebg) missing.push("REMOVE_BG_API_KEY");
+    return res.status(409).json({
+      success: false,
+      needsProvider: true,
+      missingKeys: missing,
+      steps,
+      error: needsProviderMessage(needsAI ? "ai_text_edit" : "bg_removal"),
+    });
+  }
+
+  // 3) Execute in order. Provider edits are REAL calls, never faked.
+  const { buffer: outBuffer, executed } = await executeSteps(buffer, steps, c);
+
+  // 4) saveTemp returns STRING filename — use it directly.
+  const filename = await ImageProcessor.saveTemp(outBuffer, "aiedit");
+
+  // 5) Response matches frontend resolveImageFilename(basename of filename/preview).
+  return respondImage(res, filename, {
+    steps,
+    executed,
+    appliedSteps: executed.length,
+  });
+}));
+
+// ============================================================
+// RESET — stateless reality:
+// The ORIGINAL can only be restored from the client-held upload
+// filename. If imagePath differs, we cannot rebuild the original.
+// We return 409 with a clear hint instead of faking a reset.
+// ============================================================
+router.post("/reset", asyncH(async (req, res) => {
+  const { imagePath } = req.body;
+  const safe = resolveSafeFilename(imagePath);
+  if (!safe) return res.status(400).json({ success: false, error: "Invalid imagePath." });
+  // File may already be gone (expired) — that's fine, frontend holds original.
+  return res.json({ success: true, filename: safe, reset: true });
+}));
+
+// ------------------------------------------------------------
+// COMPARE — returns original (imagePath) + current, no processing.
+// ------------------------------------------------------------
+router.post("/compare", asyncH(async (req, res) => {
+  const { imagePath, editType } = req.body;
+  const safe = resolveSafeFilename(imagePath);
+  if (!safe) return res.status(400).json({ success: false, error: "Invalid imagePath." });
+  return res.json({
+    success: true,
+    editType: editType || "none",
+    original: `/api/image-editor/preview/${encodeURIComponent(safe)}`,
+    current: `/api/image-editor/preview/${encodeURIComponent(safe)}`,
+    filename: safe,
+  });
+}));
+
+// ============================================================
+// PREVIEW + DOWNLOAD (serve from TEMP_DIR, basename only)
+// ============================================================
+router.get("/preview/:name", asyncH(async (req, res) => {
+  const safe = resolveSafeFilename(req.params.name);
+  if (!safe) return res.status(400).json({ success: false, error: "Invalid file name." });
+  const filePath = absFile(safe);
+  try {
+    if (!fs.existsSync(filePath)) throw new Error("missing");
+    const type = safe.endsWith(".png")
+      ? "image/png"
+      : safe.endsWith(".webp")
+      ? "image/webp"
+      : "image/jpeg";
+    res.setHeader("Content-Type", type);
+    res.setHeader("Cache-Control", "no-store");
+    fs.createReadStream(filePath).pipe(res);
+  } catch {
+    return res.status(404).json({ success: false, error: "Source image expired. Re-upload the image." });
+  }
+}));
+
+router.get("/download/:name", asyncH(async (req, res) => {
+  const safe = resolveSafeFilename(req.params.name);
+  if (!safe) return res.status(400).json({ success: false, error: "Invalid file name." });
+  const filePath = absFile(safe);
+  try {
+    if (!fs.existsSync(filePath)) throw new Error("missing");
+    res.setHeader("Content-Disposition", `attachment; filename="${safe}"`);
+    fs.createReadStream(filePath).pipe(res);
+  } catch {
+    return res.status(404).json({ success: false, error: "Source image expired. Re-upload the image." });
+  }
+}));
 
 module.exports = router;
