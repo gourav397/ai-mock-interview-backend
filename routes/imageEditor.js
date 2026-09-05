@@ -1,1833 +1,245 @@
 // ============================================================
-// AI IMAGE EDITOR — Routes
-// Production v7
-// Mounted at: /api/image-editor
+// AI IMAGE EDITOR — Routes (v8 Consistent)
+// Mounted /api/image-editor/*
+// Depends ONLY on: imageProcessor.js (v4) , aiEdit.js (v8), aiEditParser.js (v5), vision.js
 // ============================================================
-
-"use strict";
-
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
-const sharp = require("sharp");
-
-const {
-  ImageProcessor,
-  TEMP_DIR,
-} = require("../utils/imageProcessor");
-
-const aiEdit = require("../utils/aiEdit");
-const vision = require("../utils/vision");
-
-let aiEditParser = null;
-
-try {
-  aiEditParser = require("../utils/aiEditParser");
-} catch (error) {
-  console.warn(
-    "[IMAGE EDITOR] aiEditParser unavailable:",
-    error.message
-  );
-}
+const sharp = require("sharp");                          // FIX: sharp imported
+const { ImageProcessor, TEMP_DIR } = require("../utils/imageProcessor");
+const aiEdit = require("../utils/aiEdit");               // v8: validatePlan, applyPlan, getCapabilities
+const vision = require("../utils/vision");               // analyseImage
+const parser = require("../utils/aiEditParser");         // v5: parseAiInstruction
 
 const router = express.Router();
-
-// ============================================================
-// UPLOAD CONFIG
-// ============================================================
-
 const upload = multer({
   storage: multer.memoryStorage(),
-
-  limits: {
-    fileSize: 20 * 1024 * 1024,
-  },
-
+  limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = [
-      "image/jpeg",
-      "image/png",
-      "image/webp",
-    ];
-
-    if (allowed.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(
-        new Error(
-          `Unsupported file type: ${file.mimetype}. Allowed: JPG, PNG, WebP.`
-        ),
-        false
-      );
-    }
+    ["image/jpeg","image/png","image/webp"].includes(file.mimetype)
+      ? cb(null, true)
+      : cb(new Error(`Unsupported type: ${file.mimetype}`), false);
   },
 });
 
-// ============================================================
-// PATH SAFETY
-// ============================================================
-
+// ---- path safety: basename only, TEMP_DIR scoped ----
 const FILENAME_RE = /^[a-zA-Z0-9._-]+$/;
-
-function resolveTempPath(value) {
-  if (!value || typeof value !== "string") {
-    return null;
-  }
-
-  const filename = path.basename(
-    value.trim()
-  );
-
-  if (
-    !filename ||
-    !FILENAME_RE.test(filename)
-  ) {
-    return null;
-  }
-
-  const fullPath = path.join(
-    TEMP_DIR,
-    filename
-  );
-
-  const tempRoot =
-    path.resolve(TEMP_DIR) + path.sep;
-
-  const resolved =
-    path.resolve(fullPath);
-
-  if (!resolved.startsWith(tempRoot)) {
-    return null;
-  }
-
-  return resolved;
+function resolveTempPath(p) {
+  if (!p || typeof p !== "string") return null;
+  const n = path.basename(p.trim());
+  if (!n || !FILENAME_RE.test(n)) return null;
+  const full = path.join(TEMP_DIR, n);
+  return full.startsWith(TEMP_DIR + path.sep) && fs.existsSync(full) ? full : null;
 }
-
-// ============================================================
-// LOAD IMAGE
-// ============================================================
-
 async function loadImageBuffer(req) {
-  // Fresh multipart upload
-  if (
-    req.file &&
-    Buffer.isBuffer(req.file.buffer)
-  ) {
-    return req.file.buffer;
-  }
-
-  // Existing saved image
-  const imagePath =
-    req.body?.imagePath;
-
-  const resolved =
-    resolveTempPath(imagePath);
-
-  if (
-    resolved &&
-    fs.existsSync(resolved)
-  ) {
-    return fs.promises.readFile(
-      resolved
-    );
-  }
-
-  return null;
+  if (req.file && req.file.buffer) return req.file.buffer;
+  const r = resolveTempPath(req.body?.imagePath);
+  return r ? fs.promises.readFile(r) : null;
 }
-
-// ============================================================
-// IMAGE VALIDATION MIDDLEWARE
-// ============================================================
-
-function validateImage(req, res, next) {
-  const hasUpload =
-    req.file &&
-    Buffer.isBuffer(req.file.buffer);
-
-  const hasPath =
-    typeof req.body?.imagePath ===
-      "string" &&
-    req.body.imagePath.trim();
-
-  if (!hasUpload && !hasPath) {
-    return res.status(400).json({
-      success: false,
-      message:
-        "No image provided. Upload an image first.",
-    });
-  }
-
+const validateImage = (req, res, next) => {
+  if (!req.file && !req.body?.imagePath) return res.status(400).json({ success:false, message:"No image. Upload first." });
   next();
-}
-
-// ============================================================
-// RESPONSE DATA BUILDER
-// ============================================================
-
-function buildImageData(
-  filename,
-  extra = {}
-) {
-  const safeFilename =
-    typeof filename === "string"
-      ? path.basename(filename)
-      : "";
-
+};
+// saveFrom returns a STRING filename
+const saveFrom = (buf, hint) => ImageProcessor.saveTemp(buf, hint);
+function buildImageData(f, e = {}) {
   return {
-    path: safeFilename,
-
-    filename: safeFilename,
-
-    preview:
-      `/api/image-editor/preview/${encodeURIComponent(
-        safeFilename
-      )}`,
-
-    resultUrl:
-      `/api/image-editor/preview/${encodeURIComponent(
-        safeFilename
-      )}`,
-
-    downloadUrl:
-      `/api/image-editor/download/${encodeURIComponent(
-        safeFilename
-      )}`,
-
-    ...extra,
+    path: f, filename: f,
+    preview: `/api/image-editor/preview/${f}`,
+    resultUrl: `/api/image-editor/preview/${f}`,
+    downloadUrl: `/api/image-editor/download/${f}`,
+    ...e,
   };
 }
 
-// ============================================================
-// SAVE HELPER
-// ============================================================
-
-async function saveFrom(
-  buffer,
-  hint
-) {
-  if (!Buffer.isBuffer(buffer)) {
-    throw new Error(
-      "Image output buffer is invalid."
-    );
-  }
-
-  return ImageProcessor.saveTemp(
-    buffer,
-    hint
-  );
-}
-
-// ============================================================
-// NORMALIZE saveTemp RESULT
-// ============================================================
-
-function extractFilename(saved) {
-  if (!saved) {
-    return null;
-  }
-
-  // Most likely current ImageProcessor behavior
-  if (typeof saved === "string") {
-    return path.basename(saved);
-  }
-
-  // Compatibility with object result
-  if (
-    typeof saved === "object"
-  ) {
-    if (
-      typeof saved.filename ===
-      "string"
-    ) {
-      return path.basename(
-        saved.filename
-      );
+// ---------------- STATUS (uses real getCapabilities) ----------------
+router.get("/status", (req, res) => {
+  const c = aiEdit.getCapabilities();
+  res.json({ success:true, data:{
+    version:"8.0.0", supportedFormats:["image/jpeg","image/png","image/webp"],
+    aiEdit: {
+      planner: visionConfigured() ? "gemini-vision" : "deterministic",
+      ...c,
+      honestNote: c.inpainting
+        ? "True AI text/object editing ENABLED"
+        : "Text/object removal needs OPENAI_API_KEY. Sharp ops always work.",
     }
+  }});
+});
+const visionConfigured = () => Boolean(process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY);
 
-    if (
-      typeof saved.path ===
-      "string"
-    ) {
-      return path.basename(
-        saved.path
-      );
-    }
+// ---------------- UPLOAD / PREVIEW / DOWNLOAD ----------------
+router.post("/upload", upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ success:false, message:"Field 'image' required." });
+    const v = ImageProcessor.validateImage(req.file);
+    if (!v.valid) return res.status(400).json({ success:false, message:v.error });
+    const md = await ImageProcessor.getMetadata(req.file.buffer);
+    if (!md) return res.status(400).json({ success:false, message:"Corrupt image." });
+    const name = await saveFrom(req.file.buffer, "orig");
+    res.json({ success:true, message:"Uploaded.", data: buildImageData(name, { ...md, size: req.file.buffer.length }) });
+  } catch (e) { res.status(500).json({ success:false, message:`Upload failed: ${e.message}` }); }
+});
+router.get("/preview/:filename", (req, res) => {
+  const p = resolveTempPath(req.params.filename);
+  if (!p) return res.status(404).json({ success:false, message:"Image expired." });
+  res.setHeader("Cache-Control","private, max-age=300");
+  res.sendFile(p);
+});
+router.get("/download/:filename", (req, res) => {
+  const p = resolveTempPath(req.params.filename);
+  if (!p) return res.status(404).json({ success:false, message:"Image expired." });
+  res.download(p, path.basename(p));
+});
 
-    if (
-      typeof saved.name ===
-      "string"
-    ) {
-      return path.basename(
-        saved.name
-      );
-    }
-  }
+// ---------------- Sharp-only ops (filters / adjust / enhance / upscale / resize / crop / rotate) ----------------
+router.post("/filter", validateImage, async (req,res)=>{ try{
+  const { filter } = req.body||{}; if(!filter) return res.status(400).json({success:false,message:"filter required"});
+  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
+  const n=await saveFrom(await ImageProcessor.applyFilter(b,filter),"filter");
+  res.json({success:true,data:buildImageData(n)});
+}catch(e){res.status(500).json({success:false,message:e.message})}});
 
-  return null;
-}
+router.post("/adjust", validateImage, async (req,res)=>{ try{
+  const a=req.body?.adjustments||req.body?.adjust||{};
+  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
+  const n=await saveFrom(await ImageProcessor.adjust(b,a),"adjust");
+  res.json({success:true,data:buildImageData(n)});
+}catch(e){res.status(500).json({success:false,message:e.message})}});
 
-// ============================================================
-// STATUS
-// ============================================================
+router.post("/enhance", validateImage, async (req,res)=>{ try{
+  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
+  const sc=Math.min(4,Math.max(1,Number(req.body?.scale)||1));
+  const r=await ImageProcessor.enhance(b,{scale:sc,sharpness:Number(req.body?.sharpness)||1.2});
+  const n=await saveFrom(r.buffer,"enhance");
+  res.json({success:true,data:buildImageData(n,{width:r.width,height:r.height,scale:r.scale})});
+}catch(e){res.status(500).json({success:false,message:e.message})}});
 
-router.get(
-  "/status",
-  (req, res) => {
-    let capabilities = {};
+router.post("/upscale", validateImage, async (req,res)=>{ try{
+  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
+  const sc=Math.min(4,Math.max(1,Number(req.body?.scale)||2));
+  const r=await ImageProcessor.enhance(b,{scale:sc,sharpness:0.8});
+  const n=await saveFrom(r.buffer,"upscale");
+  res.json({success:true,data:buildImageData(n,{width:r.width,height:r.height,scale:r.scale})});
+}catch(e){res.status(500).json({success:false,message:e.message})}});
 
-    try {
-      if (
-        typeof aiEdit.getCapabilities ===
-        "function"
-      ) {
-        capabilities =
-          aiEdit.getCapabilities();
+router.post("/resize", validateImage, async (req,res)=>{ try{
+  const { width, height, fit="cover" }=req.body||{};
+  if(!width||!height) return res.status(400).json({success:false,message:"width & height required"});
+  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
+  const n=await saveFrom(await ImageProcessor.resize(b,width,height,fit),"resized");
+  res.json({success:true,data:buildImageData(n,{width:+width,height:+height})});
+}catch(e){res.status(500).json({success:false,message:e.message})}});
+
+router.post("/crop", validateImage, async (req,res)=>{ try{
+  const { left,top,width,height }=req.body||{};
+  if(left===undefined||top===undefined||!width||!height) return res.status(400).json({success:false,message:"left,top,width,height"});
+  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
+  const n=await saveFrom(await ImageProcessor.crop(b,left,top,width,height),"crop");
+  res.json({success:true,data:buildImageData(n)});
+}catch(e){res.status(400).json({success:false,message:e.message})}});
+
+router.post("/rotate", validateImage, async (req,res)=>{ try{
+  const deg=Number(req.body?.degrees)||90;
+  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
+  const n=await saveFrom(await ImageProcessor.rotate(b,deg),"rotated");
+  res.json({success:true,data:buildImageData(n)});
+}catch(e){res.status(500).json({success:false,message:e.message})}});
+
+// ---------------- BACKGROUND (real remove.bg if key; honest fallback) ----------------
+router.post("/remove-background", validateImage, async (req,res)=>{ try{
+  const b=await loadImageBuffer(req); if(!b) return res.status(404).json({success:false,message:"expired"});
+  const r=await ImageProcessor.removeBackground(b);          // {buffer, provider:"remove.bg"|"fallback"}
+  const n=await saveFrom(r.buffer,"nobg");
+  const honest = r.provider==="remove.bg"
+    ? "Background removed via remove.bg."
+    : "Local PNG fallback only (no real segmentation). Set REMOVE_BG_API_KEY/OPENAI_API_KEY for true BG removal.";
+  res.json({success:true, message:honest, data:buildImageData(n,{provider:r.provider})});
+}catch(e){res.status(500).json({success:false,message:e.message})}});
+
+// ---------------- AI-EDIT (order-preserving, honest) ----------------
+// Convert raw AI/parser steps into the schema aiEdit.applyPlan expects.
+const clampNum = (v,min,max,fb)=>{ const n=Number(v); return Number.isFinite(n)?Math.min(max,Math.max(min,n)):fb; };
+function toEngine(rawSteps) {
+  const out=[];
+  for (const s of (rawSteps||[])) {
+    const a=String(s?.action||"").trim().toLowerCase();
+    const t=s||{};
+    switch(a){
+      case "remove_background": out.push({action:"remove_background"}); break;
+      case "replace_background": out.push({action:"replace_background", color:/^#[0-9a-fA-F]{6}$/.test(t.color||"")?t.color:"#ffffff"}); break;
+      case "remove_text":       out.push({action:"remove_text", text:String(t.text??t.target_text??"").slice(0,100)}); break;
+      case "replace_text":      out.push({action:"replace_text", target_string:String(t.target_text??t.text??"").slice(0,100), replacement:String(t.replacement_text??t.replacement??"").slice(0,100)}); break;
+      case "remove_object":     out.push({action:"remove_object", text:String(t.text??t.object??"").slice(0,100)}); break;
+      case "adjust": {
+        const adj=t.adjustments||t.adjust||{};
+        out.push({action:"adjust", adjust:{ brightness:clampNum(adj.brightness,0.1,3,1), contrast:clampNum(adj.contrast,0.1,3,1), saturation:clampNum(adj.saturation,0,3,1) }});
+        break;
       }
-    } catch {
-      capabilities = {};
+      case "filter": out.push({action:"filter", filter:String(t.filter||"cinematic").slice(0,40)}); break;
+      case "enhance": out.push({action:"enhance", scale:clampNum(t.scale,0.5,4,1.2)}); break;
+      case "upscale": out.push({action:"upscale", scale:clampNum(t.scale,0.5,4,2)}); break;
+      case "rotate": { let d=Math.abs(Number(t.degrees)||90)%360; if(d) out.push({action:"rotate", degrees:d}); break; }
+      // resize & crop_percent: resize only when explicit dims present
+      case "resize": { const w=Number(t.width), h=Number(t.height); if(w>0&&h>0) out.push({action:"resize", width:w, height:h}); break; }
+      default: break; // unknown action rejected
+    }
+  }
+  return out.slice(0,6);
+}
+
+router.post("/ai-edit", validateImage, async (req, res) => {
+  try {
+    const instruction = String(req.body?.instruction || "").trim();
+    if (!instruction) return res.json({ success:false, message:"Instruction required." });
+
+    const buf = await loadImageBuffer(req);
+    if (!buf) return res.status(404).json({ success:false, message:"Source expired. Re-upload." });
+
+    let meta={width:0,height:0};
+    try { meta = await sharp(buf).metadata(); } catch { return res.status(400).json({success:false,message:"Corrupted image."}); }
+
+    // LAYER 1: Vision+OCR plan (if Gemini key) -> else v5 regex parser floor
+    let rawSteps=null, regions=[];
+    const vis = await vision.analyseImage(buf, instruction, { imgW:meta.width||1, imgH:meta.height||1 });
+    if (vis?.steps?.length) { rawSteps=vis.steps; regions=vis.regions||[]; }
+    else { const p=parser.parseAiInstruction(instruction); if(p?.ok) rawSteps=p.plan; }
+
+    // LAYER 2: normalize + strict allowlist validation (engine schema)
+    const plan = aiEdit.validatePlan(toEngine(rawSteps));
+    if (!plan.length) {
+      return res.json({ success:false,
+        message:`Instruction samajh nahi aayi / no actionable step. Examples: "photo HD kar do", "background white kar do", "brightness badha do", "2x bada karo".`,
+        data:{ instruction, regions } });
     }
 
-    const geminiConfigured =
-      Boolean(
-        process.env.GEMINI_API_KEYS ||
-        process.env.GEMINI_API_KEY
-      );
+    // LAYER 3: execute in order (Sharp local + real providers via aiEdit)
+    const { buffer: finalBuf, executed, notes } = await aiEdit.applyPlan(buf, plan);
+    const filename = await saveFrom(finalBuf, "ai_edit");     // STRING (FIX)
+    const build = buildImageData(filename);
+    const pending = notes.length>0;
 
     res.json({
-      success: true,
-
-      data: {
-        version: "7.0.0",
-
-        mountedAt:
-          "/api/image-editor",
-
-        supportedFormats: [
-          "image/jpeg",
-          "image/png",
-          "image/webp",
-        ],
-
-        maxUploadMB: 20,
-
-        aiEdit: {
-          planner:
-            geminiConfigured
-              ? "gemini-vision"
-              : "deterministic",
-
-          llmConfigured:
-            geminiConfigured,
-
-          capabilities,
-
-          honestNote:
-            capabilities.inpainting
-              ? "Generative image editing is configured."
-              : "Local Sharp editing works. Generative text/object editing requires OPENAI_API_KEY.",
-        },
+      success:true,
+      message: executed.length
+        ? `Applied: ${executed.join(" → ")}${pending ? " | Remaining need provider: "+notes.join("; ") : ""}`
+        : notes.join("; "),
+      data:{
+        instruction, plan, executed, stepsApplied: executed.length,
+        stepsPending: notes, needsProvider: pending,
+        regions, filename, preview: build.preview, resultUrl: build.resultUrl, downloadUrl: build.downloadUrl,
       },
     });
-  }
-);
-
-// ============================================================
-// UPLOAD
-// ============================================================
-
-router.post(
-  "/upload",
-  upload.single("image"),
-  async (req, res) => {
-    try {
-      const file = req.file;
-
-      if (!file) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "No image uploaded. Field name must be 'image'.",
-        });
-      }
-
-      const validation =
-        ImageProcessor.validateImage(
-          file
-        );
-
-      if (!validation.valid) {
-        return res.status(400).json({
-          success: false,
-          message:
-            validation.error ||
-            "Invalid image.",
-        });
-      }
-
-      const metadata =
-        await ImageProcessor.getMetadata(
-          file.buffer
-        );
-
-      if (!metadata) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Corrupt or unreadable image.",
-        });
-      }
-
-      const saved =
-        await saveFrom(
-          file.buffer,
-          req.user?._id
-            ? String(req.user._id)
-            : "anon"
-        );
-
-      const filename =
-        extractFilename(saved);
-
-      if (!filename) {
-        throw new Error(
-          "Image saved but filename was not returned."
-        );
-      }
-
-      return res.json({
-        success: true,
-
-        message: "Uploaded.",
-
-        data: buildImageData(
-          filename,
-          {
-            ...metadata,
-
-            size:
-              file.buffer.length,
-          }
-        ),
-      });
-    } catch (error) {
-      console.error(
-        "[IMAGE UPLOAD]",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          `Upload failed: ${error.message}`,
-      });
-    }
-  }
-);
-
-// ============================================================
-// PREVIEW
-// ============================================================
-
-router.get(
-  "/preview/:filename",
-  async (req, res) => {
-    try {
-      const filePath =
-        resolveTempPath(
-          req.params.filename
-        );
-
-      if (
-        !filePath ||
-        !fs.existsSync(filePath)
-      ) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Image expired or not found.",
-        });
-      }
-
-      res.setHeader(
-        "Cache-Control",
-        "private, max-age=300"
-      );
-
-      res.setHeader(
-        "Cross-Origin-Resource-Policy",
-        "cross-origin"
-      );
-
-      return res.sendFile(
-        filePath
-      );
-    } catch (error) {
-      console.error(
-        "[IMAGE PREVIEW]",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Unable to preview image.",
-      });
-    }
-  }
-);
-
-// ============================================================
-// DOWNLOAD
-// ============================================================
-
-router.get(
-  "/download/:filename",
-  async (req, res) => {
-    try {
-      const filePath =
-        resolveTempPath(
-          req.params.filename
-        );
-
-      if (
-        !filePath ||
-        !fs.existsSync(filePath)
-      ) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Image expired or not found.",
-        });
-      }
-
-      return res.download(
-        filePath,
-        path.basename(filePath)
-      );
-    } catch (error) {
-      console.error(
-        "[IMAGE DOWNLOAD]",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Unable to download image.",
-      });
-    }
-  }
-);
-
-// ============================================================
-// FILTER
-// ============================================================
-
-router.post(
-  "/filter",
-  validateImage,
-  async (req, res) => {
-    try {
-      const filter =
-        String(
-          req.body?.filter || ""
-        ).trim();
-
-      if (!filter) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "filter is required.",
-        });
-      }
-
-      const buffer =
-        await loadImageBuffer(req);
-
-      if (!buffer) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Image expired. Re-upload the image.",
-        });
-      }
-
-      const output =
-        await ImageProcessor.applyFilter(
-          buffer,
-          filter
-        );
-
-      const saved =
-        await saveFrom(
-          output,
-          "filter"
-        );
-
-      const filename =
-        extractFilename(saved);
-
-      if (!filename) {
-        throw new Error(
-          "Filter output filename missing."
-        );
-      }
-
-      return res.json({
-        success: true,
-
-        message:
-          `Filter '${filter}' applied.`,
-
-        data:
-          buildImageData(
-            filename,
-            { filter }
-          ),
-      });
-    } catch (error) {
-      console.error(
-        "[FILTER]",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          `Filter failed: ${error.message}`,
-      });
-    }
-  }
-);
-
-// ============================================================
-// ADJUST
-// ============================================================
-
-router.post(
-  "/adjust",
-  validateImage,
-  async (req, res) => {
-    try {
-      const buffer =
-        await loadImageBuffer(req);
-
-      if (!buffer) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Image expired. Re-upload the image.",
-        });
-      }
-
-      const adjustments =
-        req.body?.adjustments ||
-        req.body ||
-        {};
-
-      const output =
-        await ImageProcessor.adjust(
-          buffer,
-          adjustments
-        );
-
-      const saved =
-        await saveFrom(
-          output,
-          "adjust"
-        );
-
-      const filename =
-        extractFilename(saved);
-
-      if (!filename) {
-        throw new Error(
-          "Adjustment output filename missing."
-        );
-      }
-
-      return res.json({
-        success: true,
-
-        message:
-          "Adjustments applied.",
-
-        data:
-          buildImageData(
-            filename,
-            { adjustments }
-          ),
-      });
-    } catch (error) {
-      console.error(
-        "[ADJUST]",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          `Adjustment failed: ${error.message}`,
-      });
-    }
-  }
-);
-
-// ============================================================
-// RESIZE
-// ============================================================
-
-router.post(
-  "/resize",
-  validateImage,
-  async (req, res) => {
-    try {
-      const width =
-        Number(req.body?.width);
-
-      const height =
-        Number(req.body?.height);
-
-      const fit =
-        req.body?.fit ||
-        "cover";
-
-      if (
-        !Number.isFinite(width) ||
-        !Number.isFinite(height) ||
-        width <= 0 ||
-        height <= 0
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Valid width and height are required.",
-        });
-      }
-
-      const buffer =
-        await loadImageBuffer(req);
-
-      if (!buffer) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Image expired.",
-        });
-      }
-
-      const output =
-        await ImageProcessor.resize(
-          buffer,
-          width,
-          height,
-          fit
-        );
-
-      const saved =
-        await saveFrom(
-          output,
-          "resize"
-        );
-
-      const filename =
-        extractFilename(saved);
-
-      if (!filename) {
-        throw new Error(
-          "Resize output filename missing."
-        );
-      }
-
-      return res.json({
-        success: true,
-
-        message:
-          "Image resized.",
-
-        data:
-          buildImageData(
-            filename,
-            {
-              width,
-              height,
-              fit,
-            }
-          ),
-      });
-    } catch (error) {
-      console.error(
-        "[RESIZE]",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          `Resize failed: ${error.message}`,
-      });
-    }
-  }
-);
-
-// ============================================================
-// CROP
-// ============================================================
-
-router.post(
-  "/crop",
-  validateImage,
-  async (req, res) => {
-    try {
-      const left =
-        Number(req.body?.left);
-
-      const top =
-        Number(req.body?.top);
-
-      const width =
-        Number(req.body?.width);
-
-      const height =
-        Number(req.body?.height);
-
-      if (
-        !Number.isFinite(left) ||
-        !Number.isFinite(top) ||
-        !Number.isFinite(width) ||
-        !Number.isFinite(height) ||
-        width <= 0 ||
-        height <= 0
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "left, top, width and height must be valid.",
-        });
-      }
-
-      const buffer =
-        await loadImageBuffer(req);
-
-      if (!buffer) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Image expired.",
-        });
-      }
-
-      const output =
-        await ImageProcessor.crop(
-          buffer,
-          left,
-          top,
-          width,
-          height
-        );
-
-      const saved =
-        await saveFrom(
-          output,
-          "crop"
-        );
-
-      const filename =
-        extractFilename(saved);
-
-      if (!filename) {
-        throw new Error(
-          "Crop output filename missing."
-        );
-      }
-
-      return res.json({
-        success: true,
-
-        message:
-          "Image cropped.",
-
-        data:
-          buildImageData(
-            filename,
-            {
-              left,
-              top,
-              width,
-              height,
-            }
-          ),
-      });
-    } catch (error) {
-      console.error(
-        "[CROP]",
-        error
-      );
-
-      return res.status(400).json({
-        success: false,
-        message:
-          error.message ||
-          "Crop failed.",
-      });
-    }
-  }
-);
-
-// ============================================================
-// ROTATE
-// ============================================================
-
-router.post(
-  "/rotate",
-  validateImage,
-  async (req, res) => {
-    try {
-      const degrees =
-        Number(
-          req.body?.degrees
-        ) || 90;
-
-      const buffer =
-        await loadImageBuffer(req);
-
-      if (!buffer) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Image expired.",
-        });
-      }
-
-      const output =
-        await ImageProcessor.rotate(
-          buffer,
-          degrees
-        );
-
-      const saved =
-        await saveFrom(
-          output,
-          "rotate"
-        );
-
-      const filename =
-        extractFilename(saved);
-
-      if (!filename) {
-        throw new Error(
-          "Rotate output filename missing."
-        );
-      }
-
-      return res.json({
-        success: true,
-
-        message:
-          `Image rotated ${degrees}°.`,
-
-        data:
-          buildImageData(
-            filename,
-            { degrees }
-          ),
-      });
-    } catch (error) {
-      console.error(
-        "[ROTATE]",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          `Rotate failed: ${error.message}`,
-      });
-    }
-  }
-);
-
-// ============================================================
-// ENHANCE
-// ============================================================
-
-router.post(
-  "/enhance",
-  validateImage,
-  async (req, res) => {
-    try {
-      const buffer =
-        await loadImageBuffer(req);
-
-      if (!buffer) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Image expired.",
-        });
-      }
-
-      const scale =
-        Math.max(
-          0.5,
-          Math.min(
-            Number(
-              req.body?.scale
-            ) || 1.5,
-            4
-          )
-        );
-
-      const sharpness =
-        Math.max(
-          0,
-          Math.min(
-            Number(
-              req.body?.sharpness
-            ) || 1,
-            3
-          )
-        );
-
-      const result =
-        await ImageProcessor.enhance(
-          buffer,
-          {
-            scale,
-            sharpness,
-          }
-        );
-
-      const output =
-        result?.buffer ||
-        result;
-
-      const saved =
-        await saveFrom(
-          output,
-          "enhance"
-        );
-
-      const filename =
-        extractFilename(saved);
-
-      if (!filename) {
-        throw new Error(
-          "Enhance output filename missing."
-        );
-      }
-
-      return res.json({
-        success: true,
-
-        message:
-          "Image enhanced.",
-
-        data:
-          buildImageData(
-            filename,
-            {
-              scale:
-                result?.scale ||
-                scale,
-
-              width:
-                result?.width,
-
-              height:
-                result?.height,
-            }
-          ),
-      });
-    } catch (error) {
-      console.error(
-        "[ENHANCE]",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          `Enhance failed: ${error.message}`,
-      });
-    }
-  }
-);
-
-// ============================================================
-// UPSCALE
-// ============================================================
-
-router.post(
-  "/upscale",
-  validateImage,
-  async (req, res) => {
-    try {
-      const buffer =
-        await loadImageBuffer(req);
-
-      if (!buffer) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Image expired.",
-        });
-      }
-
-      const scale =
-        Math.max(
-          1,
-          Math.min(
-            Number(
-              req.body?.scale
-            ) || 2,
-            4
-          )
-        );
-
-      const result =
-        await ImageProcessor.enhance(
-          buffer,
-          {
-            scale,
-            sharpness: 0.8,
-          }
-        );
-
-      const output =
-        result?.buffer ||
-        result;
-
-      const saved =
-        await saveFrom(
-          output,
-          "upscale"
-        );
-
-      const filename =
-        extractFilename(saved);
-
-      if (!filename) {
-        throw new Error(
-          "Upscale output filename missing."
-        );
-      }
-
-      return res.json({
-        success: true,
-
-        message:
-          `Image upscaled ${scale}x.`,
-
-        data:
-          buildImageData(
-            filename,
-            {
-              scale:
-                result?.scale ||
-                scale,
-
-              width:
-                result?.width,
-
-              height:
-                result?.height,
-            }
-          ),
-      });
-    } catch (error) {
-      console.error(
-        "[UPSCALE]",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          `Upscale failed: ${error.message}`,
-      });
-    }
-  }
-);
-
-// ============================================================
-// REMOVE BACKGROUND
-// ============================================================
-//
-// Uses the provider-aware aiEdit engine.
-// No fake PNG conversion.
-// ============================================================
-
-router.post(
-  "/remove-background",
-  validateImage,
-  async (req, res) => {
-    try {
-      const buffer =
-        await loadImageBuffer(req);
-
-      if (!buffer) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Image expired.",
-        });
-      }
-
-      const plan = [
-        {
-          action:
-            "remove_background",
-        },
-      ];
-
-      const result =
-        await aiEdit.applyPlan(
-          buffer,
-          plan
-        );
-
-      if (
-        !result.executed.length ||
-        !Buffer.isBuffer(
-          result.buffer
-        )
-      ) {
-        return res.status(503).json({
-          success: false,
-
-          message:
-            result.notes?.join("; ") ||
-            "Background removal provider is not configured.",
-
-          data: {
-            executed:
-              result.executed,
-
-            stepsPending:
-              result.notes,
-
-            needsProvider: true,
-          },
-        });
-      }
-
-      const saved =
-        await saveFrom(
-          result.buffer,
-          "nobg"
-        );
-
-      const filename =
-        extractFilename(saved);
-
-      if (!filename) {
-        throw new Error(
-          "Background removal filename missing."
-        );
-      }
-
-      return res.json({
-        success: true,
-
-        message:
-          result.executed.join(
-            " → "
-          ),
-
-        data:
-          buildImageData(
-            filename,
-            {
-              provider:
-                result.executed[0],
-              executed:
-                result.executed,
-              stepsPending:
-                result.notes,
-            }
-          ),
-      });
-    } catch (error) {
-      console.error(
-        "[REMOVE BG]",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          `Background removal failed: ${error.message}`,
-      });
-    }
-  }
-);
-
-// ============================================================
-// AI EDIT
-// ============================================================
-
-router.post(
-  "/ai-edit",
-  validateImage,
-  async (req, res) => {
-    try {
-      // --------------------------------------------------------
-      // Instruction
-      // --------------------------------------------------------
-
-      const instruction =
-        String(
-          req.body?.instruction ||
-          ""
-        ).trim();
-
-      if (!instruction) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Instruction required.",
-        });
-      }
-
-      if (instruction.length > 500) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Instruction is too long. Maximum 500 characters.",
-        });
-      }
-
-      // --------------------------------------------------------
-      // Load image
-      // --------------------------------------------------------
-
-      const buffer =
-        await loadImageBuffer(req);
-
-      if (!buffer) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Source image expired. Re-upload the image.",
-        });
-      }
-
-      // --------------------------------------------------------
-      // Metadata
-      // --------------------------------------------------------
-
-      let metadata;
-
-      try {
-        metadata =
-          await sharp(buffer)
-            .metadata();
-      } catch {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Corrupted or invalid image.",
-        });
-      }
-
-      const imgW =
-        metadata.width || 1;
-
-      const imgH =
-        metadata.height || 1;
-
-      // --------------------------------------------------------
-      // LAYER 1 — VISION
-      // --------------------------------------------------------
-
-      let visionOut = null;
-
-      try {
-        if (
-          vision &&
-          typeof vision.analyseImage ===
-            "function"
-        ) {
-          visionOut =
-            await vision.analyseImage(
-              buffer,
-              instruction,
-              {
-                imgW,
-                imgH,
-              }
-            );
-        }
-      } catch (visionError) {
-        console.warn(
-          "[AI EDIT] Vision failed:",
-          visionError.message
-        );
-
-        visionOut = null;
-      }
-
-      // --------------------------------------------------------
-      // LAYER 2 — VISION PLAN
-      // --------------------------------------------------------
-
-      let rawSteps = [];
-
-      if (
-        visionOut &&
-        Array.isArray(
-          visionOut.steps
-        ) &&
-        visionOut.steps.length
-      ) {
-        rawSteps =
-          visionOut.steps;
-      }
-
-      // --------------------------------------------------------
-      // LAYER 3 — DETERMINISTIC PARSER FALLBACK
-      // --------------------------------------------------------
-
-      if (!rawSteps.length) {
-        try {
-          if (
-            aiEditParser &&
-            typeof aiEditParser.parseAiInstruction ===
-              "function"
-          ) {
-            const parsed =
-              aiEditParser.parseAiInstruction(
-                instruction
-              );
-
-            if (
-              parsed &&
-              parsed.ok &&
-              Array.isArray(
-                parsed.plan
-              )
-            ) {
-              rawSteps =
-                parsed.plan;
-            }
-          }
-        } catch (parserError) {
-          console.warn(
-            "[AI EDIT] Parser failed:",
-            parserError.message
-          );
-        }
-      }
-
-      // --------------------------------------------------------
-      // LAYER 4 — VALIDATION
-      // --------------------------------------------------------
-
-      const plan =
-        aiEdit.validatePlan(
-          rawSteps
-        );
-
-      if (!plan.length) {
-        return res.status(400).json({
-          success: false,
-
-          message:
-            "Instruction samajh nahi aayi / no actionable step.",
-
-          data: {
-            instruction,
-
-            examples: [
-              "photo HD kar do",
-              "background white kar do",
-              "brightness badha do",
-              "2x upscale",
-              "text hata do",
-              "ABC ko XYZ kar do",
-            ],
-
-            regions:
-              visionOut?.regions ||
-              [],
-          },
-        });
-      }
-
-      // --------------------------------------------------------
-      // LAYER 5 — EXECUTION
-      // --------------------------------------------------------
-
-      const execution =
-        await aiEdit.applyPlan(
-          buffer,
-          plan
-        );
-
-      const finalBuffer =
-        execution.buffer;
-
-      const executed =
-        Array.isArray(
-          execution.executed
-        )
-          ? execution.executed
-          : [];
-
-      const notes =
-        Array.isArray(
-          execution.notes
-        )
-          ? execution.notes
-          : [];
-
-      // --------------------------------------------------------
-      // NOTHING EXECUTED
-      // --------------------------------------------------------
-
-      if (
-        !executed.length ||
-        !Buffer.isBuffer(
-          finalBuffer
-        )
-      ) {
-        return res.status(503).json({
-          success: false,
-
-          message:
-            notes.join("; ") ||
-            "AI edit could not be executed.",
-
-          data: {
-            instruction,
-
-            plan,
-
-            executed,
-
-            stepsApplied: 0,
-
-            stepsPending:
-              notes,
-
-            needsProvider:
-              notes.length > 0,
-
-            regions:
-              visionOut?.regions ||
-              [],
-          },
-        });
-      }
-
-      // --------------------------------------------------------
-      // SAVE RESULT
-      // --------------------------------------------------------
-
-      const saved =
-        await saveFrom(
-          finalBuffer,
-          "ai_edit"
-        );
-
-      // IMPORTANT:
-      // ImageProcessor.saveTemp() may return:
-      //   "filename.jpg"
-      // OR
-      //   { filename: "filename.jpg" }
-      //
-      // We support both.
-      const filename =
-        extractFilename(saved);
-
-      if (!filename) {
-        throw new Error(
-          "Image save failed: filename missing."
-        );
-      }
-
-      // --------------------------------------------------------
-      // BUILD URLS
-      // --------------------------------------------------------
-
-      const imageData =
-        buildImageData(
-          filename,
-          {
-            instruction,
-
-            plan,
-
-            executed,
-
-            stepsApplied:
-              executed.length,
-
-            stepsPending:
-              notes,
-
-            needsProvider:
-              notes.length > 0,
-
-            regions:
-              visionOut?.regions ||
-              [],
-
-            width:
-              metadata.width,
-
-            height:
-              metadata.height,
-          }
-        );
-
-      // --------------------------------------------------------
-      // MESSAGE
-      // --------------------------------------------------------
-
-      let message =
-        `AI applied ${executed.length} step(s): ${executed.join(
-          " → "
-        )}.`;
-
-      if (notes.length) {
-        message +=
-          ` Some steps need a provider: ${notes.join(
-            "; "
-          )}`;
-      }
-
-      // --------------------------------------------------------
-      // FINAL RESPONSE
-      // --------------------------------------------------------
-
-      return res.json({
-        success: true,
-
-        message,
-
-        data: imageData,
-      });
-    } catch (error) {
-      console.error(
-        "[AI EDIT ERROR]",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-
-        message:
-          `AI edit failed: ${String(
-            error.message
-          ).slice(0, 200)}`,
-      });
-    }
-  }
-);
-
-// ============================================================
-// RESET
-// ============================================================
-
-router.post(
-  "/reset",
-  validateImage,
-  async (req, res) => {
-    try {
-      const buffer =
-        await loadImageBuffer(req);
-
-      if (!buffer) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Original image expired.",
-        });
-      }
-
-      const saved =
-        await saveFrom(
-          buffer,
-          "reset"
-        );
-
-      const filename =
-        extractFilename(saved);
-
-      if (!filename) {
-        throw new Error(
-          "Reset filename missing."
-        );
-      }
-
-      return res.json({
-        success: true,
-
-        message:
-          "Image reset.",
-
-        data:
-          buildImageData(
-            filename
-          ),
-      });
-    } catch (error) {
-      console.error(
-        "[RESET]",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          `Reset failed: ${error.message}`,
-      });
-    }
-  }
-);
-
-// ============================================================
-// COMPARE
-// ============================================================
-
-router.post(
-  "/compare",
-  validateImage,
-  async (req, res) => {
-    try {
-      const buffer =
-        await loadImageBuffer(req);
-
-      if (!buffer) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Image expired.",
-        });
-      }
-
-      const editType =
-        String(
-          req.body?.editType ||
-          "enhance"
-        );
-
-      let result;
-
-      if (
-        editType === "enhance"
-      ) {
-        result =
-          await ImageProcessor.enhance(
-            buffer,
-            {
-              scale: 1.5,
-              sharpness: 1.1,
-            }
-          );
-      } else {
-        result = buffer;
-      }
-
-      const output =
-        result?.buffer ||
-        result;
-
-      const saved =
-        await saveFrom(
-          output,
-          "compare"
-        );
-
-      const filename =
-        extractFilename(saved);
-
-      if (!filename) {
-        throw new Error(
-          "Compare filename missing."
-        );
-      }
-
-      return res.json({
-        success: true,
-
-        message:
-          "Comparison result generated.",
-
-        data:
-          buildImageData(
-            filename,
-            {
-              editType,
-            }
-          ),
-      });
-    } catch (error) {
-      console.error(
-        "[COMPARE]",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          `Compare failed: ${error.message}`,
-      });
-    }
-  }
-);
-
-// ============================================================
-// MULTER / GLOBAL ROUTE ERROR HANDLER
-// ============================================================
-
-router.use(
-  (error, req, res, next) => {
-    if (
-      error instanceof
-      multer.MulterError
-    ) {
-      if (
-        error.code ===
-        "LIMIT_FILE_SIZE"
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Maximum image size is 20MB.",
-        });
-      }
-
-      return res.status(400).json({
-        success: false,
-        message:
-          `Upload error: ${error.code}`,
-      });
-    }
-
-    if (error) {
-      console.error(
-        "[IMAGE EDITOR ROUTE ERROR]",
-        error
-      );
-
-      return res.status(400).json({
-        success: false,
-        message:
-          error.message ||
-          "Image editor request failed.",
-      });
-    }
-
-    next();
-  }
-);
-
-// ============================================================
-// EXPORT
-// ============================================================
+  } catch (e) { res.status(500).json({ success:false, message:`AI edit failed: ${String(e.message).slice(0,160)}` }); }
+});
+
+// ---------------- error middleware ----------------
+router.use((e, req, res, next) => {
+  if (e instanceof multer.MulterError) return res.status(400).json({ success:false, message: e.code==="LIMIT_FILE_SIZE" ? "Max 20MB" : `Upload: ${e.code}` });
+  if (e) return res.status(400).json({ success:false, message: e.message });
+  next();
+});
 
 module.exports = router;
