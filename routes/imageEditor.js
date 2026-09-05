@@ -5,6 +5,7 @@
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
+const sharp = require("sharp");
 const fs = require("fs");
 const { ImageProcessor, TEMP_DIR } = require("../utils/imageProcessor");
 const aiEdit = require("../utils/aiEdit");
@@ -195,7 +196,7 @@ router.post("/ai-edit", validateImage, async (req, res) => {
     const instruction = String(req.body?.instruction || "").trim();
     if (!instruction) return res.json({ success:false, message:"Instruction required." });
 
-   const buf = req.file ? req.file.buffer : resolveTempFromBody(req);  // reuse your existing buffer-loader
+    const buf = await loadImageBuffer(req);  // reuse your existing buffer-loader
     if (!buf) return res.status(404).json({ success:false, message:"Source image expired. Re-upload." });
 
     let meta = { width: 0, height: 0 };
