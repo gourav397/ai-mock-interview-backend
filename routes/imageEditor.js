@@ -1,531 +1,1963 @@
 // ============================================================
-// IMAGE EDITOR ROUTES — Production v7.0 (self-consistent)
-// STATELESS: upload returns a SAFE filename; every edit sends that
-// filename back as `imagePath`. All file access is basename-resolved
-// inside TEMP_DIR → path-traversal safe.
-//
-// CONTRACTS (must match frontend api.js + utils/imageProcessor.js):
-//   * ImageProcessor.saveTemp(buffer)  -> STRING filename (NOT an object)
-//   * parseAiInstruction(text)         -> ARRAY of steps (user order kept)
-//   * Every edit response:
-//       { success, filename, preview } where preview =
-//         "/api/image-editor/preview/<filename>"
+// IMAGE EDITOR — PRODUCTION VERSION
 // ============================================================
 
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
-const fsPromises = fs.promises;
+const fsp = fs.promises;
 const crypto = require("crypto");
-
-const {
-  ImageProcessor,
-  TEMP_DIR,
-} = require("../utils/imageProcessor");
-const { parseAiInstruction, describeStep } = require("../utils/aiEditParser");
+const sharp = require("sharp");
 
 const router = express.Router();
 
 // ------------------------------------------------------------
-// Upload memory storage (buffer validated + written to TEMP_DIR)
+// CONFIG
 // ------------------------------------------------------------
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024, files: 1 },
-});
 
-// ============================================================
-// SAFE FILENAME RESOLUTION — the single guard for every file op.
-// Never lets ".." or absolute paths escape TEMP_DIR.
-// ============================================================
-function resolveSafeFilename(value) {
+const TEMP_DIR = path.join(__dirname, "..", "temp", "processed");
+
+if (!fs.existsSync(TEMP_DIR)) {
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
+
+const MAX_DIM = 8192;
+const MAX_MB = 20 * 1024 * 1024;
+
+const EXT = {
+  jpeg: "jpg",
+  jpg: "jpg",
+  png: "png",
+  webp: "webp",
+};
+
+// ------------------------------------------------------------
+// HELPERS
+// ------------------------------------------------------------
+
+function safeName(value) {
   if (typeof value !== "string" || !value) return null;
-  const name = value.split("\\").pop().split("/").pop();
-  if (!/^[a-zA-Z0-9._-]+$/.test(name)) return null; // blocks traversal
+
+  const name = value
+    .split("\\")
+    .pop()
+    .split("/")
+    .pop();
+
+  if (!/^[a-zA-Z0-9._-]+$/.test(name)) return null;
   if (!name.includes(".")) return null;
+
   return name;
 }
 
-function absFile(filename) {
+function abs(filename) {
   return path.join(TEMP_DIR, filename);
 }
 
-async function readBuffer(filename) {
-  const safe = resolveSafeFilename(filename);
+function clamp(value, min, max) {
+  return Math.min(
+    Math.max(Number(value), min),
+    max
+  );
+}
+
+function hasKey(name) {
+  return Boolean(
+    process.env[name] &&
+    process.env[name].length > 8
+  );
+}
+
+function editModel() {
+  return process.env.OPENAI_EDIT_MODEL || "gpt-image-1";
+}
+
+async function loadBuf(filename) {
+  const safe = safeName(filename);
+
   if (!safe) {
-    const e = new Error("Invalid image filename.");
-    e.code = 400;
-    throw e;
+    const error = new Error("Invalid image filename.");
+    error.code = 400;
+    throw error;
   }
-  const filePath = absFile(safe);
+
+  const filePath = abs(safe);
+
+  if (!fs.existsSync(filePath)) {
+    const error = new Error(
+      "Source image expired. Re-upload the image."
+    );
+    error.code = 404;
+    throw error;
+  }
+
+  return {
+    buffer: await fsp.readFile(filePath),
+    name: safe,
+  };
+}
+
+async function metaOf(buffer) {
   try {
-    const stat = await fsPromises.stat(filePath);
-    if (!stat.isFile()) throw new Error("not-a-file");
+    const metadata = await sharp(buffer).metadata();
+
+    return {
+      width: metadata.width || null,
+      height: metadata.height || null,
+      format: EXT[metadata.format] || "jpeg",
+      size: buffer.length,
+    };
   } catch {
-    const e = new Error("Source image not found. It may have expired — please re-upload.");
-    e.code = 404;
-    throw e;
+    return {
+      width: null,
+      height: null,
+      format: "jpeg",
+      size: buffer.length,
+    };
   }
-  const buf = await fsPromises.readFile(filePath);
-  if (!buf || buf.length === 0) {
-    const e = new Error("Source image is empty.");
-    e.code = 500;
-    throw e;
-  }
-  return { buffer: buf, filename: safe };
 }
 
-function respondImage(res, filename, extra = {}) {
-  const preview = `/api/image-editor/preview/${encodeURIComponent(filename)}`;
-  res.json({ success: true, filename, preview, ...extra });
+async function saveBuf(buffer, hint = "img") {
+  let ext = "jpg";
+
+  try {
+    const metadata = await sharp(buffer).metadata();
+    ext = EXT[metadata.format] || "jpg";
+  } catch {
+    ext = "jpg";
+  }
+
+  const filename =
+    `${hint}_${crypto.randomUUID()}.${ext}`;
+
+  await fsp.writeFile(abs(filename), buffer);
+
+  return filename;
 }
 
-function asyncH(fn) {
+function previewOf(filename) {
+  return `/api/image-editor/preview/${encodeURIComponent(filename)}`;
+}
+
+function downloadOf(filename) {
+  return `/api/image-editor/download/${encodeURIComponent(filename)}`;
+}
+
+async function okRes(res, filename, extra = {}) {
+  const buffer = await fsp.readFile(abs(filename));
+  const metadata = await metaOf(buffer);
+
+  return res.json({
+    success: true,
+    message: "Done.",
+    filename,
+    preview: previewOf(filename),
+    download: downloadOf(filename),
+
+    data: {
+      filename,
+      preview: previewOf(filename),
+      download: downloadOf(filename),
+      ...metadata,
+      ...extra,
+    },
+  });
+}
+
+function errRes(res, status, message, data = {}) {
+  return res.status(status).json({
+    success: false,
+    message,
+    error: message,
+    data,
+  });
+}
+
+function wrap(handler) {
   return (req, res) => {
-    Promise.resolve(fn(req, res)).catch((err) => {
-      const status = Number(err.code) >= 400 ? err.code : 500;
-      const msg =
-        (err && err.message) || "Unexpected server error.";
-      console.error(`[imageEditor] ${status}:`, msg);
-      res.status(status).json({ success: false, error: msg });
+    Promise.resolve(handler(req, res)).catch((error) => {
+      console.error("[IMAGE EDITOR ERROR]", error);
+
+      const status =
+        Number(error.code) >= 400
+          ? Number(error.code)
+          : 500;
+
+      return errRes(
+        res,
+        status,
+        error.message || "Server error."
+      );
     });
   };
 }
 
-// ------------------------------------------------------------
-// CAPABILITIES — HONEST. No key => needsProvider:true, never fake.
-// ------------------------------------------------------------
-const cap = () => {
-  const openai = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 8);
-  const removebg = !!(process.env.REMOVE_BG_API_KEY && process.env.REMOVE_BG_API_KEY.length > 8);
-  return { openai, removebg };
-};
-
-function needsProviderMessage(kind) {
-  const m = {
-    ai_text_edit:
-      "Real text change/removal and object removal need the AI provider (OpenAI gpt-image). " +
-      "Add OPENAI_API_KEY to your .env, then retry. Local tools can't rewrite text/pixels honestly.",
-    bg_removal:
-      "True subject background removal needs the remove.bg or OpenAI provider. " +
-      "Add REMOVE_BG_API_KEY or OPENAI_API_KEY. Without it we only do a local flat-color flatten.",
-  };
-  return m[kind] || "This edit needs an external AI provider key.";
-}
-
 // ============================================================
-// AI STEP EXECUTOR — sequential, user order preserved.
-// Returns final buffer (provider edits are real, not faked).
+// OPENAI AI IMAGE EDIT
 // ============================================================
 
-// --- OpenAI /v1/images/edits (gpt-image-*). Returns Buffer. ---
-async function runOpenAiEdit(inputBuffer, prompt) {
-  const key = process.env.OPENAI_API_KEY;
-  const model = process.env.OPENAI_EDIT_MODEL || "gpt-image-2";
+async function openAiEdit(inputBuffer, prompt) {
+  if (!hasKey("OPENAI_API_KEY")) {
+    const error = new Error(
+      "OPENAI_API_KEY missing in environment variables."
+    );
+
+    error.code = 409;
+    throw error;
+  }
+
   const form = new FormData();
-  form.append("model", model);
+
+  form.append("model", editModel());
+
   form.append(
     "image",
-    new Blob([inputBuffer], { type: "image/png" }),
+    new Blob([inputBuffer], {
+      type: "image/png",
+    }),
     "input.png"
   );
-  form.append("prompt", prompt);
-  // GPT-image models ALWAYS return b64_json; do NOT send response_format.
 
-  const resp = await fetch("https://api.openai.com/v1/images/edits", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${key}` },
-    body: form,
-  });
-  const json = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    const detail = json?.error?.message || JSON.stringify(json).slice(0, 300);
-    const e = new Error(`OpenAI edit failed (${resp.status}): ${detail}`);
-    e.code = 502;
-    throw e;
+  form.append("prompt", prompt);
+
+  const response = await fetch(
+    "https://api.openai.com/v1/images/edits",
+    {
+      method: "POST",
+
+      headers: {
+        Authorization:
+          `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+
+      body: form,
+    }
+  );
+
+  const json = await response
+    .json()
+    .catch(() => ({}));
+
+  if (!response.ok) {
+    console.error(
+      "[OPENAI IMAGE ERROR]",
+      json
+    );
+
+    const message =
+      json?.error?.message ||
+      `OpenAI request failed (${response.status})`;
+
+    const error = new Error(message);
+    error.code = 502;
+
+    throw error;
   }
-  const b64 = json?.data?.[0]?.b64_json;
-  if (!b64) {
-    const e = new Error("OpenAI returned no image payload.");
-    e.code = 502;
-    throw e;
+
+  const base64 =
+    json?.data?.[0]?.b64_json;
+
+  if (!base64) {
+    const error = new Error(
+      "OpenAI returned no image."
+    );
+
+    error.code = 502;
+    throw error;
   }
-  return Buffer.from(b64, "base64");
+
+  return Buffer.from(base64, "base64");
 }
 
-// Prompt builders for specific high-value goals.
-const promptFor = (step) => {
-  switch (step.action) {
-    case "replace_text":
-    case "change_text":
-      return `In this image, find the text "${step.oldText}" (approx "${step.rawText}") and replace it so it reads exactly "${step.newText}", keeping font, style, size, color and location identical. Remove any old artifact of the original text.`;
-    case "remove_text": {
-      const t = step.text || step.rawText || "";
-      return `Remove the text${t ? ` "${t}"` : ""} from this image and inpaint the area naturally so it looks like that text was never there, reconstructing the background behind it.`;
-    }
-    case "remove_object": {
-      const o = step.object || step.target || "the object";
-      return `Remove ${o} from this image and inpaint the area so the surrounding scene looks completely natural and continuous, as if it was never present.`;
-    }
-    case "ai_prompt":
-    case "ai_edit":
-      return step.prompt || step.instruction || "Improve this image realistically.";
-    default:
-      return step.prompt || step.instruction || "Improve this image realistically.";
-  }
+// ============================================================
+// NLP
+// ============================================================
+
+function normalize(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[“”]/g, '"')
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const REPLACEMENTS = [
+  [/\bhataa?\b/g, "hata"],
+  [/\bhta\b/g, "hata"],
+  [/\bhtado\b/g, "hata do"],
+  [/\bkrdo\b/g, "kar do"],
+  [/\bkardo\b/g, "kar do"],
+  [/\bkro\b/g, "karo"],
+  [/\bkr\b/g, "kar"],
+  [/\bkrna\b/g, "karna"],
+  [/\bbnao\b/g, "bana do"],
+  [/\bbanao\b/g, "bana do"],
+  [/\bbdhao\b/g, "badha do"],
+  [/\bpiche\b/g, "peeche"],
+  [/\bpeechhe\b/g, "peeche"],
+  [/\bpeechha\b/g, "peeche"],
+];
+
+const COLORS = {
+  white: "#ffffff",
+  safed: "#ffffff",
+  safaid: "#ffffff",
+
+  black: "#000000",
+  kala: "#000000",
+  kaala: "#000000",
+
+  blue: "#0000ff",
+  neela: "#0000ff",
+
+  red: "#ff0000",
+  laal: "#ff0000",
+
+  green: "#00cc66",
+  hara: "#00cc66",
+
+  gray: "#808080",
+  grey: "#808080",
+
+  yellow: "#ffff00",
+  peela: "#ffff00",
+
+  pink: "#ffc0cb",
+  gulabi: "#ffc0cb",
+
+  orange: "#ffa500",
+  narangi: "#ffa500",
+
+  purple: "#800080",
 };
 
-async function executeSteps(inputBuffer, steps, c) {
-  let buffer = inputBuffer;
-  const executed = [];
+function hasNumberPair(text) {
+  const numbers =
+    text.match(/\d{2,12}/g) || [];
 
-  for (const step of steps) {
-    if (!step || typeof step.action !== "string") continue;
-    const a = step.action;
-
-    // ---- Local Sharp operations (no provider needed) ----
-    if (a === "brightness" || a === "adjust") {
-      const amount = step.amount != null ? step.amount : step.value;
-      buffer = await ImageProcessor.applyAdjustments(buffer, {
-        brightness:
-          typeof amount === "number"
-            ? 1 + amount * (step.intensity === "reduce" ? -1 : 1)
-            : undefined,
-      });
-      executed.push(`brightness → ${describeStep(step)}`);
-    } else if (a === "saturation") {
-      const amount = step.amount != null ? step.amount : 0.4;
-      buffer = await ImageProcessor.applyAdjustments(buffer, { saturation: 1 + amount });
-      executed.push(`saturation → ${describeStep(step)}`);
-    } else if (a === "contrast") {
-      const amount = step.amount != null ? step.amount : 0.2;
-      buffer = await ImageProcessor.applyAdjustments(buffer, { contrast: 1 + amount });
-      executed.push(`contrast → ${describeStep(step)}`);
-    } else if (a === "enhance") {
-      const r = await ImageProcessor.enhance(buffer, { scale: step.scale || 1 });
-      buffer = r.buffer;
-      executed.push(`enhance → ${describeStep(step)}`);
-    } else if (a === "upscale") {
-      buffer = await ImageProcessor.upscale(buffer, step.scale || 2);
-      executed.push(`upscale → ${describeStep(step)}`);
-    } else if (a === "resize") {
-      buffer = await ImageProcessor.resize(buffer, step.width, step.height, step.fit);
-      executed.push(`resize → ${describeStep(step)}`);
-    } else if (a === "crop") {
-      buffer = await ImageProcessor.crop(buffer, step.left, step.top, step.width, step.height);
-      executed.push(`crop → ${describeStep(step)}`);
-    } else if (a === "crop_percent") {
-      // center crop to % of original
-      const pct = clamp(Number(step.percent) || 1, 0.1, 1);
-      const meta = await ImageProcessor.getMetadata(buffer);
-      const w = Math.round((meta.width || 0) * pct);
-      const h = Math.round((meta.height || 0) * pct);
-      const left = Math.max(0, Math.round(((meta.width || 0) - w) / 2));
-      const top = Math.max(0, Math.round(((meta.height || 0) - h) / 2));
-      buffer = await ImageProcessor.crop(buffer, left, top, w, h);
-      executed.push(`crop → ${describeStep(step)}`);
-    } else if (a === "rotate") {
-      buffer = await ImageProcessor.rotate(buffer, step.degrees);
-      executed.push(`rotate → ${describeStep(step)}`);
-    } else if (a === "black_white" || a === "bw" || a === "grayscale") {
-      buffer = await ImageProcessor.applyFilter(buffer, "bw");
-      executed.push(`grayscale → ${describeStep(step)}`);
-    } else if (a === "filter") {
-      const f = (step.filter || step.name || "natural").replace(/\s+/g, "-").toLowerCase();
-      buffer = await ImageProcessor.applyFilter(buffer, f);
-      executed.push(`filter(${f})`);
-    } else if (a === "replace_background" || a === "background_color") {
-      buffer = await ImageProcessor.replaceBackground(buffer, { color: step.color || "#ffffff" });
-      executed.push(`background → ${step.color}`);
-    }
-    // ---- Provider operations (REAL only when provider present) ----
-    else if (a === "remove_background") {
-      if (c.removebg) {
-        const r = await ImageProcessor.removeBackground(buffer); // remove.bg path
-        if (r.provider === "remove.bg") {
-          buffer = r.buffer;
-          executed.push("background removed (remove.bg)");
-        } else {
-          const e = new Error("remove.bg unavailable; fallback would not truly remove background.");
-          e.code = 503;
-          throw e;
-        }
-      } else {
-        const e = new Error("needsProvider:background");
-        e.code = 409;
-        e.capKind = "bg_removal";
-        throw e;
-      }
-    } else if (
-      a === "replace_text" || a === "change_text" ||
-      a === "remove_text" || a === "remove_object" ||
-      a === "ai_prompt" || a === "ai_edit"
-    ) {
-      if (!c.openai) {
-        const e = new Error("needsProvider:ai");
-        e.code = 409;
-        e.capKind = "ai_text_edit";
-        throw e;
-      }
-      buffer = await runOpenAiEdit(buffer, promptFor(step));
-      executed.push(describeStep(step));
-    }
-    // unknown action -> skip silently (allowlist guard)
+  if (numbers.length < 2) {
+    return null;
   }
 
-  return { buffer, executed };
+  const intent =
+    /(replace|change|badal|swap|with|by|ko\s+(kar|karo|kr|bana|badal)|ke?\s+sath|k\s+sath|->|→)/i
+      .test(text);
+
+  if (intent) {
+    return {
+      oldText: numbers[0],
+      newText: numbers[1],
+    };
+  }
+
+  return null;
 }
 
-const clamp = (n, min, max) => Math.min(Math.max(n, min), max);
+function parseSteps(rawInstruction) {
+  const original = String(rawInstruction || "");
+  let text = normalize(original);
+
+  for (const [regex, replacement] of REPLACEMENTS) {
+    text = text.replace(regex, replacement);
+  }
+
+  const plan = [];
+
+  // ----------------------------------------------------------
+  // TEXT / NUMBER REPLACE
+  // ----------------------------------------------------------
+
+  const pair = hasNumberPair(text);
+
+  if (pair) {
+    plan.push({
+      action: "ai_replace_text",
+      oldText: pair.oldText,
+      newText: pair.newText,
+    });
+  }
+
+  // ----------------------------------------------------------
+  // TEXT REMOVE
+  // ----------------------------------------------------------
+
+  if (
+    !pair &&
+    /(text|word|watermark|writing|likha|number|digit).*(hata|remove|delete|nikal|mita|erase)/i
+      .test(text)
+  ) {
+    plan.push({
+      action: "ai_remove_text",
+    });
+  }
+
+  // ----------------------------------------------------------
+  // OBJECT / PERSON REMOVE
+  // ----------------------------------------------------------
+
+  if (
+    !pair &&
+    /(object|aadmi|person|insaan|banda|cheez|sath wala).*(hata|remove|delete|nikal|mita|erase)/i
+      .test(text)
+  ) {
+    plan.push({
+      action: "ai_remove_object",
+    });
+  }
+
+  // ----------------------------------------------------------
+  // BACKGROUND REMOVE
+  // ----------------------------------------------------------
+
+  const backgroundRemove =
+    /(background|bg|peeche)/i.test(text) &&
+    /(hata|remove|nikal|delete|clear|saaf)/i.test(text);
+
+  if (!pair && backgroundRemove) {
+    plan.push({
+      action: "remove_background",
+    });
+  }
+
+  // ----------------------------------------------------------
+  // BACKGROUND COLOR
+  // ----------------------------------------------------------
+
+  let backgroundColor = null;
+
+  const hex =
+    text.match(/#([0-9a-f]{3}|[0-9a-f]{6})\b/i);
+
+  if (hex) {
+    backgroundColor = hex[0];
+  } else {
+    for (const [word, value] of Object.entries(COLORS)) {
+      const regex = new RegExp(
+        `\\b${word}\\b`,
+        "i"
+      );
+
+      if (regex.test(text)) {
+        backgroundColor = value;
+        break;
+      }
+    }
+  }
+
+  if (
+    backgroundColor &&
+    /(background|bg|peeche)/i.test(text) &&
+    !plan.some(
+      (step) =>
+        step.action === "remove_background"
+    )
+  ) {
+    plan.push({
+      action: "replace_background",
+      color: backgroundColor,
+    });
+  }
+
+  // ----------------------------------------------------------
+  // BLACK & WHITE
+  // ----------------------------------------------------------
+
+  if (
+    /(black\s*(and|&)?\s*white|grayscale|monochrome|b\s*w|kala\s*safed)/i
+      .test(text)
+  ) {
+    plan.push({
+      action: "filter",
+      filter: "black-white",
+    });
+  }
+
+  // ----------------------------------------------------------
+  // ENHANCE
+  // ----------------------------------------------------------
+
+  if (
+    /\b(hd|h\.d|enhance|sharpen|clear|clarity|quality|professional|behtar|better|accha|acchi)\b/i
+      .test(text) &&
+    !/(remove|hata)/i.test(text)
+  ) {
+    plan.push({
+      action: "enhance",
+    });
+  }
+
+  // ----------------------------------------------------------
+  // UPSCALE
+  // ----------------------------------------------------------
+
+  const upscaleMatch =
+    text.match(/\b([2-4])\s*x\b/i);
+
+  if (
+    upscaleMatch ||
+    /\b(upscale|bada kar|bada do|badao|size badha|large|2x)\b/i
+      .test(text)
+  ) {
+    plan.push({
+      action: "upscale",
+      scale: upscaleMatch
+        ? Number(upscaleMatch[1])
+        : 2,
+    });
+  }
+
+  // ----------------------------------------------------------
+  // BRIGHTNESS
+  // ----------------------------------------------------------
+
+  if (
+    /\b(bright|brightness|ujala|roshan|lighten|light|chamak|roshni)\b/i
+      .test(text) &&
+    !/dark/i.test(text)
+  ) {
+    plan.push({
+      action: "adjust",
+      adjustments: {
+        brightness:
+          /(kam|less|decrease|thodi kam)/i.test(text)
+            ? 0.75
+            : 1.3,
+      },
+    });
+  }
+
+  // ----------------------------------------------------------
+  // DARKNESS
+  // ----------------------------------------------------------
+
+  if (
+    /\b(dark|andhera|dim|andhere|darken)\b/i
+      .test(text)
+  ) {
+    plan.push({
+      action: "adjust",
+      adjustments: {
+        brightness: 0.72,
+      },
+    });
+  }
+
+  // ----------------------------------------------------------
+  // CONTRAST
+  // ----------------------------------------------------------
+
+  if (/\bcontrast\b/i.test(text)) {
+    plan.push({
+      action: "adjust",
+      adjustments: {
+        contrast:
+          /(kam|less)/i.test(text)
+            ? 0.7
+            : 1.5,
+      },
+    });
+  }
+
+  // ----------------------------------------------------------
+  // SATURATION
+  // ----------------------------------------------------------
+
+  if (
+    /\b(saturat|vibrant|vivid|colour|color|rang)\b/i
+      .test(text) &&
+    !/\bb\s*w\b/i.test(text)
+  ) {
+    plan.push({
+      action: "adjust",
+      adjustments: {
+        saturation: 1.5,
+      },
+    });
+  }
+
+  // ----------------------------------------------------------
+  // FILTERS
+  // ----------------------------------------------------------
+
+  const FILTERS = {
+    warm: /warm|garam/i,
+    cool: /cool|thanda/i,
+    vintage: /vintage|retro|old/i,
+    cinematic: /cinema|film|movie/i,
+    soft: /\bsoft\b|naram/i,
+    dramatic: /dramatic/i,
+    portrait: /portrait|selfie/i,
+    sepia: /sepia/i,
+  };
+
+  for (const [name, regex] of Object.entries(FILTERS)) {
+    if (regex.test(text)) {
+      plan.push({
+        action: "filter",
+        filter: name,
+      });
+    }
+  }
+
+  // ----------------------------------------------------------
+  // RESIZE
+  // ----------------------------------------------------------
+
+  const resizeMatch =
+    text.match(
+      /(\d{2,5})\s*[xX×]\s*(\d{2,5})/
+    );
+
+  if (resizeMatch && !pair) {
+    plan.push({
+      action: "resize",
+      width: Number(resizeMatch[1]),
+      height: Number(resizeMatch[2]),
+    });
+  }
+
+  // ----------------------------------------------------------
+  // CROP
+  // ----------------------------------------------------------
+
+  if (/crop|trim|kaat|cut/i.test(text)) {
+    const cropMatch =
+      text.match(/crop\s*(\d{1,2})\s*%/i);
+
+    plan.push({
+      action: "crop_percent",
+      percent: cropMatch
+        ? clamp(
+            Number(cropMatch[1]),
+            10,
+            90
+          ) / 100
+        : 0.8,
+    });
+  }
+
+  // ----------------------------------------------------------
+  // ROTATE
+  // ----------------------------------------------------------
+
+  if (
+    /rotate|ghuma|ghumao|turn|ghtao/i.test(text)
+  ) {
+    const rotateMatch =
+      text.match(/(90|180|270)\s*(degree|deg|°)?/i);
+
+    plan.push({
+      action: "rotate",
+      degrees:
+        /ulta|upside/i.test(text)
+          ? 180
+          : rotateMatch
+          ? Number(rotateMatch[1])
+          : 90,
+    });
+  }
+
+  // ----------------------------------------------------------
+  // FREE FORM AI
+  // ----------------------------------------------------------
+
+  if (plan.length === 0) {
+    if (text.length >= 4) {
+      plan.push({
+        action: "ai_prompt",
+        prompt: original,
+      });
+    }
+  }
+
+  // ----------------------------------------------------------
+  // DEDUPE
+  // ----------------------------------------------------------
+
+  const seen = new Set();
+  const output = [];
+
+  for (const step of plan) {
+    const key = JSON.stringify(step);
+
+    if (!seen.has(key)) {
+      seen.add(key);
+      output.push(step);
+    }
+  }
+
+  return output.slice(0, 6);
+}
+
+// ============================================================
+// EXECUTE PLAN
+// ============================================================
+
+async function execPlan(buffer, steps) {
+  let current = buffer;
+
+  const applied = [];
+
+  for (const step of steps) {
+    const action = step.action;
+
+    // --------------------------------------------------------
+    // OPENAI AI OPERATIONS
+    // --------------------------------------------------------
+
+    if (
+      action === "ai_replace_text" ||
+      action === "ai_remove_text" ||
+      action === "ai_remove_object" ||
+      action === "ai_prompt"
+    ) {
+      let prompt;
+
+      if (action === "ai_replace_text") {
+        prompt =
+          `In this image, find the visible text "${step.oldText}" ` +
+          `and change ONLY that text so it reads exactly ` +
+          `"${step.newText}". Keep the same font, size, color, ` +
+          `style and position. Do not change anything else.`;
+      } else if (action === "ai_remove_text") {
+        prompt =
+          "Remove the requested text, writing or watermark " +
+          "from the image. Naturally reconstruct the area " +
+          "behind it. Do not change anything else.";
+      } else if (action === "ai_remove_object") {
+        prompt =
+          "Remove the requested object or person from the image. " +
+          "Naturally reconstruct the background behind it. " +
+          "Do not change anything else.";
+      } else {
+        prompt = String(step.prompt || "");
+      }
+
+      current = await openAiEdit(
+        current,
+        prompt
+      );
+
+      applied.push(action);
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // BACKGROUND REMOVE
+    // --------------------------------------------------------
+
+    if (action === "remove_background") {
+      if (hasKey("REMOVE_BG_API_KEY")) {
+        const form = new FormData();
+
+        form.append(
+          "image_file",
+          new Blob([current], {
+            type: "image/png",
+          }),
+          "image.png"
+        );
+
+        form.append("size", "auto");
+
+        const response = await fetch(
+          "https://api.remove.bg/v1.0/removebg",
+          {
+            method: "POST",
+
+            headers: {
+              "X-Api-Key":
+                process.env.REMOVE_BG_API_KEY,
+            },
+
+            body: form,
+          }
+        );
+
+        if (response.ok) {
+          current = Buffer.from(
+            await response.arrayBuffer()
+          );
+
+          applied.push(
+            "background removed"
+          );
+
+          continue;
+        }
+      }
+
+      if (hasKey("OPENAI_API_KEY")) {
+        current = await openAiEdit(
+          current,
+          "Remove the background from the main subject. " +
+            "Keep the subject intact and make the background " +
+            "transparent or cleanly isolated."
+        );
+
+        applied.push(
+          "background removed"
+        );
+
+        continue;
+      }
+
+      const error = new Error(
+        "Background removal ke liye REMOVE_BG_API_KEY ya OPENAI_API_KEY chahiye."
+      );
+
+      error.code = 409;
+      throw error;
+    }
+
+    // --------------------------------------------------------
+    // BACKGROUND COLOR
+    // --------------------------------------------------------
+
+    if (action === "replace_background") {
+      current = await sharp(current)
+        .rotate()
+        .flatten({
+          background:
+            step.color || "#ffffff",
+        })
+        .jpeg({
+          quality: 92,
+        })
+        .toBuffer();
+
+      applied.push(
+        "background color"
+      );
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // FILTER
+    // --------------------------------------------------------
+
+    if (action === "filter") {
+      const filter = step.filter;
+
+      let image = sharp(current).rotate();
+
+      if (filter === "black-white") {
+        image = image
+          .grayscale();
+      } else if (filter === "warm") {
+        image = image
+          .tint({
+            r: 255,
+            g: 200,
+            b: 150,
+          })
+          .modulate({
+            saturation: 1.1,
+          });
+      } else if (filter === "cool") {
+        image = image.tint({
+          r: 150,
+          g: 200,
+          b: 255,
+        });
+      } else if (filter === "vintage") {
+        image = image
+          .tint({
+            r: 235,
+            g: 200,
+            b: 160,
+          })
+          .modulate({
+            saturation: 0.6,
+            brightness: 0.9,
+          })
+          .gamma(1.2);
+      } else if (filter === "cinematic") {
+        image = image
+          .modulate({
+            saturation: 0.4,
+            brightness: 0.9,
+          })
+          .linear(1.3, -32);
+      } else if (filter === "soft") {
+        image = image
+          .modulate({
+            brightness: 1.05,
+          })
+          .blur(0.5);
+      } else if (filter === "dramatic") {
+        image = image
+          .modulate({
+            brightness: 0.8,
+            saturation: 1.4,
+          })
+          .linear(1.8, -64);
+      } else if (filter === "portrait") {
+        image = image
+          .modulate({
+            brightness: 1.1,
+            saturation: 0.9,
+          })
+          .sharpen({
+            sigma: 1.2,
+          });
+      } else if (filter === "sepia") {
+        image = image.tint({
+          r: 255,
+          g: 200,
+          b: 150,
+        });
+      } else if (
+        filter === "brighten"
+      ) {
+        image = image.modulate({
+          brightness: 1.3,
+        });
+      } else if (
+        filter === "darken"
+      ) {
+        image = image.modulate({
+          brightness: 0.72,
+        });
+      } else if (
+        filter === "saturate"
+      ) {
+        image = image.modulate({
+          saturation: 1.5,
+        });
+      } else if (
+        filter === "desaturate"
+      ) {
+        image = image.modulate({
+          saturation: 0,
+        });
+      } else if (
+        filter === "contrast"
+      ) {
+        image = image.linear(
+          1.5,
+          128 * (1 - 1.5)
+        );
+      } else if (
+        filter === "vivid"
+      ) {
+        image = image.modulate({
+          saturation: 1.7,
+          brightness: 1.05,
+        });
+      }
+
+      current = await image
+        .jpeg({
+          quality: 92,
+        })
+        .toBuffer();
+
+      applied.push(
+        `filter:${filter}`
+      );
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // ADJUST
+    // --------------------------------------------------------
+
+    if (action === "adjust") {
+      const adjustments =
+        step.adjustments || {};
+
+      let image =
+        sharp(current).rotate();
+
+      const modulate = {};
+
+      if (
+        adjustments.brightness != null
+      ) {
+        modulate.brightness =
+          clamp(
+            adjustments.brightness,
+            0.1,
+            3
+          );
+      }
+
+      if (
+        adjustments.saturation != null
+      ) {
+        modulate.saturation =
+          clamp(
+            adjustments.saturation,
+            0,
+            3
+          );
+      }
+
+      if (
+        Object.keys(modulate).length
+      ) {
+        image =
+          image.modulate(modulate);
+      }
+
+      if (
+        adjustments.contrast != null
+      ) {
+        const contrast =
+          clamp(
+            adjustments.contrast,
+            0.1,
+            3
+          );
+
+        image = image.linear(
+          contrast,
+          128 * (1 - contrast)
+        );
+      }
+
+      current = await image
+        .jpeg({
+          quality: 92,
+        })
+        .toBuffer();
+
+      applied.push("adjust");
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // ENHANCE
+    // --------------------------------------------------------
+
+    if (action === "enhance") {
+      current = await sharp(current)
+        .rotate()
+        .modulate({
+          brightness: 1.05,
+          saturation: 1.1,
+        })
+        .sharpen({
+          sigma: 1.2,
+        })
+        .gamma(1.05)
+        .jpeg({
+          quality: 95,
+        })
+        .toBuffer();
+
+      applied.push("enhance");
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // UPSCALE
+    // --------------------------------------------------------
+
+    if (action === "upscale") {
+      const metadata =
+        await sharp(current).metadata();
+
+      const scale = clamp(
+        step.scale || 2,
+        1,
+        4
+      );
+
+      const width = Math.min(
+        Math.round(
+          (metadata.width || 1000) *
+            scale
+        ),
+        MAX_DIM
+      );
+
+      const height = Math.min(
+        Math.round(
+          (metadata.height || 1000) *
+            scale
+        ),
+        MAX_DIM
+      );
+
+      current = await sharp(current)
+        .rotate()
+        .resize(
+          width,
+          height,
+          {
+            kernel: "lanczos3",
+            fit: "fill",
+          }
+        )
+        .sharpen({
+          sigma: 0.8,
+        })
+        .jpeg({
+          quality: 95,
+        })
+        .toBuffer();
+
+      applied.push(
+        `upscale:${scale}x`
+      );
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // RESIZE
+    // --------------------------------------------------------
+
+    if (action === "resize") {
+      const width = clamp(
+        step.width,
+        1,
+        MAX_DIM
+      );
+
+      const height = clamp(
+        step.height,
+        1,
+        MAX_DIM
+      );
+
+      current = await sharp(current)
+        .rotate()
+        .resize(
+          width,
+          height,
+          {
+            fit: "cover",
+          }
+        )
+        .jpeg({
+          quality: 92,
+        })
+        .toBuffer();
+
+      applied.push("resize");
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // CROP
+    // --------------------------------------------------------
+
+    if (action === "crop_percent") {
+      const metadata =
+        await sharp(current).metadata();
+
+      const originalWidth =
+        metadata.width || 1;
+
+      const originalHeight =
+        metadata.height || 1;
+
+      const width = Math.max(
+        1,
+        Math.round(
+          originalWidth *
+            step.percent
+        )
+      );
+
+      const height = Math.max(
+        1,
+        Math.round(
+          originalHeight *
+            step.percent
+        )
+      );
+
+      const left = Math.max(
+        0,
+        Math.round(
+          (originalWidth - width) / 2
+        )
+      );
+
+      const top = Math.max(
+        0,
+        Math.round(
+          (originalHeight - height) / 2
+        )
+      );
+
+      current = await sharp(current)
+        .rotate()
+        .extract({
+          left,
+          top,
+          width,
+          height,
+        })
+        .jpeg({
+          quality: 92,
+        })
+        .toBuffer();
+
+      applied.push("crop");
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // ROTATE
+    // --------------------------------------------------------
+
+    if (action === "rotate") {
+      current = await sharp(current)
+        .rotate(
+          Number(step.degrees) || 90,
+          {
+            background: {
+              r: 255,
+              g: 255,
+              b: 255,
+              alpha: 1,
+            },
+          }
+        )
+        .jpeg({
+          quality: 92,
+        })
+        .toBuffer();
+
+      applied.push(
+        `rotate:${step.degrees}`
+      );
+    }
+  }
+
+  return {
+    buffer: current,
+    applied,
+  };
+}
 
 // ============================================================
 // UPLOAD
 // ============================================================
+
+function magicOk(buffer) {
+  const jpeg =
+    buffer[0] === 0xff &&
+    buffer[1] === 0xd8 &&
+    buffer[2] === 0xff;
+
+  const png =
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47;
+
+  const webp =
+    buffer.slice(0, 4).toString("ascii") ===
+      "RIFF" &&
+    buffer.slice(8, 12).toString("ascii") ===
+      "WEBP";
+
+  return jpeg || png || webp;
+}
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+
+  limits: {
+    fileSize: MAX_MB,
+    files: 1,
+  },
+});
+
 router.post(
   "/upload",
   upload.single("image"),
-  asyncH(async (req, res) => {
-    const check = ImageProcessor.validateImage(req.file);
-    if (!check.valid) return res.status(400).json({ success: false, error: check.error });
+  wrap(async (req, res) => {
+    const file = req.file;
 
-    // Normalize everything to PNG for edits that may carry alpha.
-    const meta = await ImageProcessor.getMetadata(req.file.buffer);
-    let out = req.file.buffer;
-    if (meta && meta.format === "jpeg") {
-      out = await sharpifyToPng(out);
+    if (!file || !file.buffer) {
+      return errRes(
+        res,
+        400,
+        "No image received."
+      );
     }
-    const filename = await ImageProcessor.saveTemp(out, "upload");
-    return respondImage(res, filename, { originalName: req.file.originalname || null });
+
+    if (file.size > MAX_MB) {
+      return errRes(
+        res,
+        400,
+        "File too large. Maximum 20MB."
+      );
+    }
+
+    if (!magicOk(file.buffer)) {
+      return errRes(
+        res,
+        400,
+        "File is not a valid JPG, PNG or WebP image."
+      );
+    }
+
+    const png = await sharp(file.buffer)
+      .rotate()
+      .png()
+      .toBuffer();
+
+    const filename =
+      await saveBuf(png, "upload");
+
+    return okRes(
+      res,
+      filename,
+      {
+        originalName:
+          file.originalname || null,
+      }
+    );
   })
 );
 
-// helper to keep PNG alpha path simple (re-encode only if needed)
-async function sharpifyToPng(buffer) {
-  const sharp = require("sharp");
-  return sharp(buffer).rotate().png().toBuffer();
+// ============================================================
+// SIMPLE EDIT HELPER
+// ============================================================
+
+async function loadThenExec(
+  req,
+  res,
+  steps,
+  hint
+) {
+  const filename =
+    req.body.imagePath ||
+    req.body.path;
+
+  const { buffer } =
+    await loadBuf(filename);
+
+  const result =
+    await execPlan(buffer, steps);
+
+  const output =
+    await saveBuf(
+      result.buffer,
+      hint
+    );
+
+  return okRes(res, output, {
+    appliedSteps:
+      result.applied,
+  });
 }
 
 // ============================================================
-// LOCAL EDIT ENDPOINTS (all stateless, chained via filename)
+// FILTER
 // ============================================================
-router.post("/filter", asyncH(async (req, res) => {
-  const { imagePath, filter } = req.body;
-  const { buffer } = await readBuffer(imagePath);
-  const out = await ImageProcessor.applyFilter(buffer, filter);
-  const filename = await ImageProcessor.saveTemp(out, "filtered");
-  return respondImage(res, filename);
-}));
 
-router.post("/adjust", asyncH(async (req, res) => {
-  const { imagePath, adjustments } = req.body;
-  const { buffer } = await readBuffer(imagePath);
-  const out = await ImageProcessor.applyAdjustments(buffer, adjustments || {});
-  const filename = await ImageProcessor.saveTemp(out, "adjusted");
-  return respondImage(res, filename);
-}));
+router.post(
+  "/filter",
+  wrap(async (req, res) => {
+    const known = [
+      "natural",
+      "brighten",
+      "darken",
+      "contrast",
+      "saturate",
+      "desaturate",
+      "warm",
+      "cool",
+      "vintage",
+      "black-white",
+      "grayscale",
+      "cinematic",
+      "portrait",
+      "soft",
+      "vivid",
+      "dramatic",
+    ];
 
-router.post("/enhance", asyncH(async (req, res) => {
-  const { imagePath } = req.body;
-  const { buffer } = await readBuffer(imagePath);
-  const r = await ImageProcessor.enhance(buffer, { scale: Number(req.body.scale) || 1.5 });
-  const filename = await ImageProcessor.saveTemp(r.buffer, "enhanced");
-  return respondImage(res, filename, { width: r.width, height: r.height, scale: r.scale });
-}));
+    if (!known.includes(req.body.filter)) {
+      return errRes(
+        res,
+        400,
+        `Unknown filter: ${req.body.filter}`
+      );
+    }
 
-router.post("/upscale", asyncH(async (req, res) => {
-  const { imagePath } = req.body;
-  const { buffer } = await readBuffer(imagePath);
-  const out = await ImageProcessor.upscale(buffer, Number(req.body.scale) || 2);
-  const filename = await ImageProcessor.saveTemp(out, "upscaled");
-  return respondImage(res, filename);
-}));
+    return loadThenExec(
+      req,
+      res,
+      [
+        {
+          action: "filter",
+          filter:
+            req.body.filter ===
+            "grayscale"
+              ? "black-white"
+              : req.body.filter,
+        },
+      ],
+      "filtered"
+    );
+  })
+);
 
-router.post("/resize", asyncH(async (req, res) => {
-  const { imagePath, width, height, fit } = req.body;
-  const { buffer } = await readBuffer(imagePath);
-  const out = await ImageProcessor.resize(buffer, width, height, fit);
-  const filename = await ImageProcessor.saveTemp(out, "resized");
-  return respondImage(res, filename);
-}));
+// ============================================================
+// ADJUST
+// ============================================================
 
-router.post("/crop", asyncH(async (req, res) => {
-  const { imagePath, left, top, width, height } = req.body;
-  const { buffer } = await readBuffer(imagePath);
-  const out = await ImageProcessor.crop(buffer, left, top, width, height);
-  const filename = await ImageProcessor.saveTemp(out, "cropped");
-  return respondImage(res, filename);
-}));
+router.post(
+  "/adjust",
+  wrap(async (req, res) =>
+    loadThenExec(
+      req,
+      res,
+      [
+        {
+          action: "adjust",
+          adjustments:
+            req.body.adjustments || {},
+        },
+      ],
+      "adjusted"
+    )
+  )
+);
 
-router.post("/rotate", asyncH(async (req, res) => {
-  const { imagePath } = req.body;
-  const { buffer } = await readBuffer(imagePath);
-  const out = await ImageProcessor.rotate(buffer, Number(req.body.degrees) || 90);
-  const filename = await ImageProcessor.saveTemp(out, "rotated");
-  return respondImage(res, filename);
-}));
+// ============================================================
+// ENHANCE
+// ============================================================
 
-// ------------------------------------------------------------
-// /remove-background — REAL remove.bg if key, else honest 409.
-// ------------------------------------------------------------
-router.post("/remove-background", asyncH(async (req, res) => {
-  const { imagePath } = req.body;
-  const { buffer } = await readBuffer(imagePath);
-  const c = cap();
-  if (!c.removebg) {
-    return res.status(409).json({
-      success: false,
-      needsProvider: true,
-      provider: "remove.bg",
-      error: needsProviderMessage("bg_removal"),
+router.post(
+  "/enhance",
+  wrap(async (req, res) =>
+    loadThenExec(
+      req,
+      res,
+      [{ action: "enhance" }],
+      "enhanced"
+    )
+  )
+);
+
+// ============================================================
+// UPSCALE
+// ============================================================
+
+router.post(
+  "/upscale",
+  wrap(async (req, res) =>
+    loadThenExec(
+      req,
+      res,
+      [
+        {
+          action: "upscale",
+          scale:
+            Number(req.body.scale) || 2,
+        },
+      ],
+      "upscaled"
+    )
+  )
+);
+
+// ============================================================
+// RESIZE
+// ============================================================
+
+router.post(
+  "/resize",
+  wrap(async (req, res) =>
+    loadThenExec(
+      req,
+      res,
+      [
+        {
+          action: "resize",
+          width:
+            Number(req.body.width),
+          height:
+            Number(req.body.height),
+        },
+      ],
+      "resized"
+    )
+  )
+);
+
+// ============================================================
+// ROTATE
+// ============================================================
+
+router.post(
+  "/rotate",
+  wrap(async (req, res) =>
+    loadThenExec(
+      req,
+      res,
+      [
+        {
+          action: "rotate",
+          degrees:
+            Number(req.body.degrees) ||
+            90,
+        },
+      ],
+      "rotated"
+    )
+  )
+);
+
+// ============================================================
+// CROP
+// ============================================================
+
+router.post(
+  "/crop",
+  wrap(async (req, res) => {
+    const filename =
+      req.body.imagePath ||
+      req.body.path;
+
+    const { buffer } =
+      await loadBuf(filename);
+
+    const metadata =
+      await sharp(buffer).metadata();
+
+    const originalWidth =
+      metadata.width || 100;
+
+    const originalHeight =
+      metadata.height || 100;
+
+    const width = Math.min(
+      Number(req.body.width) ||
+        originalWidth,
+      originalWidth
+    );
+
+    const height = Math.min(
+      Number(req.body.height) ||
+        originalHeight,
+      originalHeight
+    );
+
+    const left = Math.max(
+      0,
+      Math.min(
+        Number(req.body.left) || 0,
+        originalWidth - width
+      )
+    );
+
+    const top = Math.max(
+      0,
+      Math.min(
+        Number(req.body.top) || 0,
+        originalHeight - height
+      )
+    );
+
+    const output =
+      await sharp(buffer)
+        .rotate()
+        .extract({
+          left,
+          top,
+          width,
+          height,
+        })
+        .jpeg({
+          quality: 92,
+        })
+        .toBuffer();
+
+    const result =
+      await saveBuf(
+        output,
+        "cropped"
+      );
+
+    return okRes(
+      res,
+      result
+    );
+  })
+);
+
+// ============================================================
+// REMOVE BACKGROUND
+// ============================================================
+
+router.post(
+  "/remove-background",
+  wrap(async (req, res) => {
+    const filename =
+      req.body.imagePath ||
+      req.body.path;
+
+    const { buffer } =
+      await loadBuf(filename);
+
+    const result =
+      await execPlan(
+        buffer,
+        [
+          {
+            action:
+              "remove_background",
+          },
+        ]
+      );
+
+    const output =
+      await saveBuf(
+        result.buffer,
+        "nobg"
+      );
+
+    return okRes(
+      res,
+      output,
+      {
+        provider: hasKey(
+          "REMOVE_BG_API_KEY"
+        )
+          ? "remove.bg"
+          : "openai",
+      }
+    );
+  })
+);
+
+// ============================================================
+// REPLACE BACKGROUND
+// ============================================================
+
+router.post(
+  "/replace-background",
+  wrap(async (req, res) => {
+    const filename =
+      req.body.imagePath ||
+      req.body.path;
+
+    const { buffer } =
+      await loadBuf(filename);
+
+    let color =
+      String(
+        req.body.color ||
+          "#ffffff"
+      );
+
+    if (
+      !/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/
+        .test(color)
+    ) {
+      color = "#ffffff";
+    }
+
+    const output =
+      await sharp(buffer)
+        .rotate()
+        .flatten({
+          background: color,
+        })
+        .jpeg({
+          quality: 92,
+        })
+        .toBuffer();
+
+    const result =
+      await saveBuf(
+        output,
+        "bg"
+      );
+
+    return okRes(
+      res,
+      result,
+      { color }
+    );
+  })
+);
+
+// ============================================================
+// AI EDIT
+// ============================================================
+
+router.post(
+  "/ai-edit",
+  wrap(async (req, res) => {
+    const instruction =
+      String(
+        req.body.instruction || ""
+      ).trim();
+
+    if (!instruction) {
+      return errRes(
+        res,
+        400,
+        "No instruction provided."
+      );
+    }
+
+    const filename =
+      req.body.imagePath ||
+      req.body.path;
+
+    const { buffer } =
+      await loadBuf(filename);
+
+    const steps =
+      parseSteps(instruction);
+
+    if (!steps.length) {
+      return errRes(
+        res,
+        422,
+        "Instruction samajh nahi aayi.",
+        {
+          instruction,
+        }
+      );
+    }
+
+    const aiActions = [
+      "ai_replace_text",
+      "ai_remove_text",
+      "ai_remove_object",
+      "ai_prompt",
+    ];
+
+    const needsAI =
+      steps.some((step) =>
+        aiActions.includes(
+          step.action
+        )
+      );
+
+    if (
+      needsAI &&
+      !hasKey("OPENAI_API_KEY")
+    ) {
+      return errRes(
+        res,
+        409,
+        "Iss AI edit ke liye OPENAI_API_KEY chahiye. Environment variable add karke redeploy karo.",
+        {
+          instruction,
+          needsProvider: true,
+          missingKeys: [
+            "OPENAI_API_KEY",
+          ],
+        }
+      );
+    }
+
+    const result =
+      await execPlan(
+        buffer,
+        steps
+      );
+
+    const output =
+      await saveBuf(
+        result.buffer,
+        "ai_edit"
+      );
+
+    return okRes(
+      res,
+      output,
+      {
+        instruction,
+        appliedSteps:
+          result.applied,
+        aiModel:
+          needsAI
+            ? editModel()
+            : null,
+      }
+    );
+  })
+);
+
+// ============================================================
+// RESET
+// ============================================================
+
+router.post(
+  "/reset",
+  wrap(async (req, res) => {
+    const filename = safeName(
+      req.body.imagePath ||
+        req.body.path
+    );
+
+    if (!filename) {
+      return errRes(
+        res,
+        400,
+        "Invalid imagePath."
+      );
+    }
+
+    return res.json({
+      success: true,
+      filename,
+      message:
+        "Reset to original upload.",
     });
-  }
-  const out = await ImageProcessor.removeBackground(buffer);
-  if (out.provider !== "remove.bg") {
-    return res.status(503).json({ success: false, error: "remove.bg request failed." });
-  }
-  const filename = await ImageProcessor.saveTemp(out.buffer, "nobg");
-  return respondImage(res, filename, { provider: "remove.bg" });
-}));
-
-// ------------------------------------------------------------
-// /replace-background — flatten alpha onto color (local, real).
-// Best after a real /remove-background.
-// ------------------------------------------------------------
-router.post("/replace-background", asyncH(async (req, res) => {
-  const { imagePath } = req.body;
-  const { buffer } = await readBuffer(imagePath);
-  const out = await ImageProcessor.replaceBackground(buffer, { color: req.body.color || "#ffffff" });
-  const filename = await ImageProcessor.saveTemp(out, "replacedbg");
-  return respondImage(res, filename);
-}));
+  })
+);
 
 // ============================================================
-// /ai-edit — the FIXED seam. parse -> validate capability -> execute
-// IMPORTANT: ImageProcessor.saveTemp returns a STRING (filename).
-// We use that string directly. NO out.filename (that was the bug).
+// COMPARE
 // ============================================================
-router.post("/ai-edit", asyncH(async (req, res) => {
-  const { imagePath, instruction } = req.body;
-  // ============ TEXT REPLACE FAST-PATH (issue fix) ============
-const { handleTextReplace } = require("../utils/textReplace");
-const txtRes = await handleTextReplace(req.body.imagePath, req.body.instruction);
-if (txtRes) return res.status(txtRes.status).json(txtRes.response);
-// =============================================================
-  if (!instruction || !String(instruction).trim()) {
-    return res.status(400).json({ success: false, error: "No instruction provided." });
-  }
 
-  const { buffer } = await readBuffer(imagePath);
+router.post(
+  "/compare",
+  wrap(async (req, res) => {
+    const filename = safeName(
+      req.body.imagePath ||
+        req.body.path
+    );
 
-  // 1) Parse user text into ordered steps.
-  const steps = parseAiInstruction(String(instruction));
-  if (!Array.isArray(steps) || steps.length === 0) {
-    return res.status(422).json({
-      success: false,
-      error:
-        "Could not understand that instruction. Try e.g. 'pic bright karo', 'background remove karo', " +
-        "'text 7869 ko 7875 kar do', 'sath wala aadmi hata do'.",
+    if (!filename) {
+      return errRes(
+        res,
+        400,
+        "Invalid imagePath."
+      );
+    }
+
+    return res.json({
+      success: true,
+      filename,
+      preview:
+        previewOf(filename),
+
+      data: {
+        filename,
+        preview:
+          previewOf(filename),
+      },
     });
-  }
-
-  // 2) Honest capability check BEFORE mutating anything.
-  const c = cap();
-  const needsAI = steps.some((s) =>
-    ["replace_text", "change_text", "remove_text", "remove_object", "ai_prompt", "ai_edit"].includes(s?.action)
-  );
-  const needsBG = steps.some((s) => s?.action === "remove_background");
-
-  if ((needsAI && !c.openai) || (needsBG && !c.removebg)) {
-    const missing = [];
-    if (needsAI && !c.openai) missing.push("OPENAI_API_KEY");
-    if (needsBG && !c.removebg) missing.push("REMOVE_BG_API_KEY");
-    return res.status(409).json({
-      success: false,
-      needsProvider: true,
-      missingKeys: missing,
-      steps,
-      error: needsProviderMessage(needsAI ? "ai_text_edit" : "bg_removal"),
-    });
-  }
-
-  // 3) Execute in order. Provider edits are REAL calls, never faked.
-  const { buffer: outBuffer, executed } = await executeSteps(buffer, steps, c);
-
-  // 4) saveTemp returns STRING filename — use it directly.
-  const filename = await ImageProcessor.saveTemp(outBuffer, "aiedit");
-
-  // 5) Response matches frontend resolveImageFilename(basename of filename/preview).
-  return respondImage(res, filename, {
-    steps,
-    executed,
-    appliedSteps: executed.length,
-  });
-}));
+  })
+);
 
 // ============================================================
-// RESET — stateless reality:
-// The ORIGINAL can only be restored from the client-held upload
-// filename. If imagePath differs, we cannot rebuild the original.
-// We return 409 with a clear hint instead of faking a reset.
+// PREVIEW
 // ============================================================
-router.post("/reset", asyncH(async (req, res) => {
-  const { imagePath } = req.body;
-  const safe = resolveSafeFilename(imagePath);
-  if (!safe) return res.status(400).json({ success: false, error: "Invalid imagePath." });
-  // File may already be gone (expired) — that's fine, frontend holds original.
-  return res.json({ success: true, filename: safe, reset: true });
-}));
 
-// ------------------------------------------------------------
-// COMPARE — returns original (imagePath) + current, no processing.
-// ------------------------------------------------------------
-router.post("/compare", asyncH(async (req, res) => {
-  const { imagePath, editType } = req.body;
-  const safe = resolveSafeFilename(imagePath);
-  if (!safe) return res.status(400).json({ success: false, error: "Invalid imagePath." });
-  return res.json({
-    success: true,
-    editType: editType || "none",
-    original: `/api/image-editor/preview/${encodeURIComponent(safe)}`,
-    current: `/api/image-editor/preview/${encodeURIComponent(safe)}`,
-    filename: safe,
-  });
-}));
+router.get(
+  "/preview/:name",
+  wrap(async (req, res) => {
+    const filename =
+      safeName(req.params.name);
+
+    if (!filename) {
+      return errRes(
+        res,
+        400,
+        "Invalid file name."
+      );
+    }
+
+    const filePath =
+      abs(filename);
+
+    if (!fs.existsSync(filePath)) {
+      return errRes(
+        res,
+        404,
+        "Source image expired. Re-upload the image."
+      );
+    }
+
+    let type =
+      "image/jpeg";
+
+    if (
+      filename.endsWith(".png")
+    ) {
+      type = "image/png";
+    } else if (
+      filename.endsWith(".webp")
+    ) {
+      type = "image/webp";
+    }
+
+    res.setHeader(
+      "Content-Type",
+      type
+    );
+
+    res.setHeader(
+      "Cache-Control",
+      "no-store"
+    );
+
+    return fs
+      .createReadStream(filePath)
+      .pipe(res);
+  })
+);
 
 // ============================================================
-// PREVIEW + DOWNLOAD (serve from TEMP_DIR, basename only)
+// DOWNLOAD
 // ============================================================
-router.get("/preview/:name", asyncH(async (req, res) => {
-  const safe = resolveSafeFilename(req.params.name);
-  if (!safe) return res.status(400).json({ success: false, error: "Invalid file name." });
-  const filePath = absFile(safe);
-  try {
-    if (!fs.existsSync(filePath)) throw new Error("missing");
-    const type = safe.endsWith(".png")
-      ? "image/png"
-      : safe.endsWith(".webp")
-      ? "image/webp"
-      : "image/jpeg";
-    res.setHeader("Content-Type", type);
-    res.setHeader("Cache-Control", "no-store");
-    fs.createReadStream(filePath).pipe(res);
-  } catch {
-    return res.status(404).json({ success: false, error: "Source image expired. Re-upload the image." });
-  }
-}));
 
-router.get("/download/:name", asyncH(async (req, res) => {
-  const safe = resolveSafeFilename(req.params.name);
-  if (!safe) return res.status(400).json({ success: false, error: "Invalid file name." });
-  const filePath = absFile(safe);
-  try {
-    if (!fs.existsSync(filePath)) throw new Error("missing");
-    res.setHeader("Content-Disposition", `attachment; filename="${safe}"`);
-    fs.createReadStream(filePath).pipe(res);
-  } catch {
-    return res.status(404).json({ success: false, error: "Source image expired. Re-upload the image." });
-  }
-}));
+router.get(
+  "/download/:name",
+  wrap(async (req, res) => {
+    const filename =
+      safeName(req.params.name);
+
+    if (!filename) {
+      return errRes(
+        res,
+        400,
+        "Invalid file name."
+      );
+    }
+
+    const filePath =
+      abs(filename);
+
+    if (!fs.existsSync(filePath)) {
+      return errRes(
+        res,
+        404,
+        "Source image expired. Re-upload the image."
+      );
+    }
+
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${filename}"`
+    );
+
+    return fs
+      .createReadStream(filePath)
+      .pipe(res);
+  })
+);
+
+// ============================================================
+// EXPORT
+// ============================================================
 
 module.exports = router;
