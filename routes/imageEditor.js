@@ -26,9 +26,9 @@ const {
   removeBackground,
   generatePreview,
   getMetadata,
-} = require("../services/imageProcessor");
+  backgroundBlurWithFallback,
+} = require("../utils/imageProcessor");
 
-const { backgroundBlurWithFallback } = require("../services/imageProcessor");
 const { parseTextInstruction, editText } = require("../services/aiTextEdit");
 
 const router = express.Router();
