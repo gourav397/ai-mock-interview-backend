@@ -1,33 +1,36 @@
 // ============================================================
 // config/geminiClient.js
-// Ek hi reliable Gemini HTTP caller — key rotation, cooldown,
-// 429 fallback, 403/404 invalidation, 5xx retry, timeout handling.
-// SECURITY: kabhi full API key log/return nahi hoti.
+// Reliable Gemini HTTP caller — key rotation, cooldown, 429,
+// 401/403/404 invalidation, 5xx retry, timeout handling.
 // ============================================================
+
+require("dotenv").config();
 
 const { keyManager } = require("./geminiKeys");
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 const BASE_URL = "https://generativelanguage.googleapis.com";
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 async function geminiGenerate(prompt, options = {}) {
   const opts = {
-    model: process.env.GEMINI_MODEL || "gemini-3.5-flash",
+    model: process.env.GEMINI_MODEL || "gemini-2.0-flash",
     temperature: 0.7,
     topP: 0.95,
-    maxOutputTokens: 4096,
-    responseMimeType: null, // e.g. "application/json"
+    maxOutputTokens: 8192,
+    responseMimeType: null,
     systemInstruction: null,
     timeoutMs: 60000,
-    maxRounds: 10, // hard retry limit — infinite loop kabhi nahi
+    maxRounds: 10,
     maxPromptChars: 15000,
     ...options,
   };
 
   if (!keyManager.count) {
     const e = new Error(
-      "GEMINI_API_KEYS is missing — Render Dashboard → Environment me 'GEMINI_API_KEYS' add karo (comma separated)"
+      "GEMINI_API_KEYS missing — Render Dashboard → Environment me 'GEMINI_API_KEYS' add karo (comma separated)"
     );
     e.code = "GEMINI_KEYS_MISSING";
     throw e;
@@ -59,9 +62,7 @@ async function geminiGenerate(prompt, options = {}) {
         throw e;
       }
       const s = Math.min(waitMs, 60000);
-      console.log(
-        `⏳ [GEMINI] Saari keys busy/cooldown — ${Math.round(s / 1000)}s wait (round ${round}/${opts.maxRounds})`
-      );
+      console.log(`⏳ [GEMINI] Saari keys busy/cooldown — ${Math.round(s / 1000)}s wait (round ${round}/${opts.maxRounds})`);
       await sleep(s);
       continue;
     }
@@ -105,9 +106,7 @@ async function geminiGenerate(prompt, options = {}) {
           keyManager.markTimeout(slot.index, 5000);
           continue;
         }
-        console.log(
-          `✅ [GEMINI] Key #${slot.index + 1} OK (${keyManager.calls[slot.index]} calls) — model: ${opts.model}`
-        );
+        console.log(`✅ [GEMINI] Key #${slot.index + 1} OK (${keyManager.calls[slot.index]} calls) — model: ${opts.model}`);
         return { text, keyIndex: slot.index, model: opts.model };
       }
 
@@ -126,18 +125,18 @@ async function geminiGenerate(prompt, options = {}) {
           isDaily,
           waitMs: isDaily ? null : Math.max(waitHint * 1000, keyManager.cooldownMs),
         });
-        lastError = new Error(`Gemini key #${slot.index + 1} rate-limited (429) — trying another available key`);
+        lastError = new Error(`Gemini key #${slot.index + 1} rate-limited (429)`);
         continue;
       }
 
-      // ---------- 401/403/404: key ya model invalid ----------
+      // ---------- 401/403/404 ----------
       if (res.status === 401 || res.status === 403 || res.status === 404) {
         keyManager.markInvalid(slot.index, `HTTP ${res.status}`);
-        lastError = new Error(`Gemini key #${slot.index + 1} failed (HTTP ${res.status}); trying another available key`);
+        lastError = new Error(`Gemini key #${slot.index + 1} failed (HTTP ${res.status})`);
         continue;
       }
 
-      // ---------- 5xx: server busy ----------
+      // ---------- 5xx ----------
       if (res.status >= 500) {
         lastError = new Error(`Gemini HTTP ${res.status}: ${bodyText.slice(0, 200)}`);
         keyManager.markTimeout(slot.index, 15000);
@@ -145,7 +144,7 @@ async function geminiGenerate(prompt, options = {}) {
         continue;
       }
 
-      // ---------- other 4xx: retry pointless ----------
+      // ---------- other 4xx ----------
       keyManager.markInvalid(slot.index, `HTTP ${res.status}`);
       throw new Error(`Gemini HTTP ${res.status}: ${bodyText.slice(0, 500)}`);
     } catch (err) {
@@ -157,7 +156,6 @@ async function geminiGenerate(prompt, options = {}) {
         keyManager.markTimeout(slot.index, 10000);
         continue;
       }
-      // Network error — short cooldown, next key
       if (!err.code || !["QUOTA_EXHAUSTED", "GEMINI_KEYS_MISSING"].includes(err.code)) {
         keyManager.markTimeout(slot.index, keyManager.cooldownMs);
         continue;
@@ -208,7 +206,6 @@ async function geminiJSON(prompt, options = {}) {
   const { text } = await geminiGenerate(prompt, {
     responseMimeType: "application/json",
     ...options,
-    systemInstruction: options.systemInstruction || "Reply ONLY with valid JSON. No markdown, no extra text.",
   });
   const parsed = extractJSON(text);
   if (!parsed) {

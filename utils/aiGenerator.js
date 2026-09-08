@@ -1,7 +1,7 @@
 // ============================================================
 // aiGenerator.js — Bilingual Exam Question Generator
-// FIXED: shared key pool (config/geminiKeys) — Render-safe ✅
-// Sab functionality preserved: cache, batching, dedupe, top-up.
+// FIXED: corrupt normalizers, partial-success generation,
+// dedupe pool shared across batches & top-ups.
 // ============================================================
 
 require("dotenv").config();
@@ -10,8 +10,8 @@ const fs = require("fs");
 const path = require("path");
 const { keyManager, envStatus } = require("../config/geminiKeys");
 const { geminiGenerate } = require("../config/geminiClient");
-// Requirement: env config ko respect karo — sirf absent hone par default
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+
+const MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -66,7 +66,7 @@ function clearCache(category, difficulty) {
   } catch {}
 }
 
-// ================= GEMINI CALL (shared client) =================
+// ================= GEMINI CALL =================
 async function callGemini(prompt, timeoutMs = 60000) {
   const { text } = await geminiGenerate(prompt, {
     model: MODEL,
@@ -76,7 +76,7 @@ async function callGemini(prompt, timeoutMs = 60000) {
     responseMimeType: "application/json",
     timeoutMs,
     maxRounds: 10,
-    maxPromptChars: 10000, // original 10k truncation preserve
+    maxPromptChars: 10000,
   });
   return text;
 }
@@ -129,13 +129,19 @@ function qKey(q) {
 
 function normalizeOptions(rawOptions) {
   if (!rawOptions) return [];
-  if (!Array.isArray(rawOptions)) rawOptions = Object.values(rawOptions);
+  if (!Array.isArray(rawOptions)) {
+    if (typeof rawOptions === "object") rawOptions = Object.values(rawOptions);
+    else return [];
+  }
   return rawOptions
     .map((o) => {
       if (typeof o === "string") return { text: o.trim(), explanation: "" };
       if (o && typeof o === "object") {
-        const text = combine(o.text_en, o.text_hi) || o.text || o.option || o.value || o.label || o.answer || "";
-        const explanation = combine(o.explanation_en, o.explanation_hi) || o.explanation || o.reason || o.description || o.why || "";
+        const text =
+          combine(o.text_en, o.text_hi) || o.text || o.option || o.value || o.label || o.answer || "";
+        const explanation =
+          combine(o.explanation_en, o.explanation_hi) ||
+          o.explanation || o.reason || o.description || o.why || "";
         return { text: String(text).trim(), explanation: String(explanation).trim() };
       }
       return { text: String(o).trim(), explanation: "" };
@@ -144,8 +150,11 @@ function normalizeOptions(rawOptions) {
 }
 
 function normalizeCorrectAnswer(ca, options) {
+  if (ca === null || ca === undefined) return "";
   if (typeof ca === "number") ca = String(ca);
-  ca = (ca || "").trim();
+  if (typeof ca !== "string") return "";
+  ca = ca.trim();
+  if (!ca) return "";
   const letterIdx = ["A", "B", "C", "D"].indexOf(ca.toUpperCase());
   if (letterIdx !== -1 && options[letterIdx]) return options[letterIdx].text;
   if (/^[0-3]$/.test(ca) && options[parseInt(ca, 10)]) return options[parseInt(ca, 10)].text;
@@ -159,11 +168,16 @@ function normalizeCorrectAnswer(ca, options) {
   return ca;
 }
 
+// ✅ FIXED — corrupt tha
 function normalizeQuestion(raw) {
   if (!raw || typeof raw !== "object") return null;
-  if (!raw.question && !raw.Question && !raw.q && !raw.question_en && !raw.question_hi) return null;
-  const question = combine(raw.question_en, raw.question_hi) || String(raw.question || raw.Question || raw.q || "");
+
+  const question =
+    combine(raw.question_en, raw.question_hi) ||
+    String(raw.question || raw.q || "").trim();
+
   const options = normalizeOptions(raw.options || raw.choices || raw.answers || raw.answerOptions);
+
   return {
     question: String(question).trim(),
     type: raw.type || "technical",
@@ -171,14 +185,15 @@ function normalizeQuestion(raw) {
     page: raw.page || 1,
     difficulty: raw.difficulty || "Medium",
     options,
-    correctAnswer: normalizeCorrectAnswer(raw.correctAnswer || raw.answer, options)
+    correctAnswer: normalizeCorrectAnswer(raw.correctAnswer || raw.answer, options),
   };
 }
 
 function isBilingualQuestion(q) {
   if (!q || !q.question) return false;
   if (!hasHindi(q.question) || !hasEnglish(q.question)) return false;
-  if (!q.options || q.options.length < 2) return false;
+  if (!q.options || q.options.length !== 4) return false;
+  if (!q.correctAnswer) return false;
   const hiOpts = q.options.filter((o) => hasHindi(o.text));
   return hiOpts.length >= 2;
 }
@@ -224,6 +239,106 @@ JSON FORMAT:
 `;
 }
 
+// ---------- CORE: bank generate with partial success ----------
+// Returns: { questions: [...], stats: { requested, generated, valid, duplicates } }
+async function generateBankInternal(category, difficulty, targetSize) {
+  const BATCH_SIZE = 8;
+  const CONCURRENCY = 1;
+  const seen = new Set(); // shared dedupe pool across all batches + top-ups
+  const all = [];
+
+  const batchCounts = [];
+  let remaining = targetSize;
+  while (remaining > 0) {
+    batchCounts.push(Math.min(BATCH_SIZE, remaining));
+    remaining -= BATCH_SIZE;
+  }
+  const totalBatches = batchCounts.length;
+
+  async function runBatch(batchNo, batchCount, tryNo = 1) {
+    const extraHint = tryNo > 1 ? "⚠️ PREVIOUS ATTEMPT WAS REJECTED." : "";
+    const prompt = buildPrompt(category, difficulty, batchCount, batchNo, totalBatches, extraHint);
+    const text = await callGemini(prompt, 60000);
+    const arr = parseJsonArray(text);
+    if (!Array.isArray(arr)) return [];
+    const normalized = arr.map(normalizeQuestion).filter(Boolean);
+    const bilingual = normalized.filter(isBilingualQuestion);
+    // sirf fresh (non-duplicate) add karo — shared pool
+    const fresh = bilingual.filter((q) => {
+      const key = qKey(q);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    // content invalid tha to EK controlled retry (max 1), unlimited nahi
+    if (fresh.length < batchCount && tryNo < 2) {
+      const more = await runBatch(batchNo, batchCount - fresh.length, 2);
+      fresh.push(...more);
+    }
+    return fresh;
+  }
+
+  let index = 0;
+  while (index < totalBatches) {
+    if (isQuotaExhausted()) break;
+    const slice = batchCounts.slice(index, index + CONCURRENCY);
+    const settled = await Promise.allSettled(slice.map((c, i) => runBatch(index + i + 1, c)));
+    settled.forEach((s, i) => {
+      if (s.status === "fulfilled") all.push(...s.value);
+      else console.log(`❌ Batch ${index + i + 1} fail: ${s.reason?.message || s.reason}`);
+    });
+    index += CONCURRENCY;
+    if (index < totalBatches && !isQuotaExhausted()) await sleep(5000);
+  }
+
+  // ---------- CONTROLLED TOP-UP: max 2 rounds ----------
+  let topUpRounds = 0;
+  while (all.length < targetSize && topUpRounds < 2 && !isQuotaExhausted()) {
+    topUpRounds++;
+    const missing = targetSize - all.length;
+    const hint = "⚠️ These questions MUST be NEW and DIFFERENT.";
+    const prompt = buildPrompt(category, difficulty, Math.min(missing, 8), 99, 99, hint);
+    try {
+      const text = await callGemini(prompt, 60000);
+      const arr = parseJsonArray(text);
+      if (Array.isArray(arr)) {
+        const fresh = arr
+          .map(normalizeQuestion)
+          .filter(Boolean)
+          .filter(isBilingualQuestion)
+          .filter((q) => {
+            const key = qKey(q);
+            if (!key || seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+        all.push(...fresh.slice(0, missing));
+      }
+    } catch (e) {
+      console.log("Top-up fail:", e.message);
+    }
+    if (!isQuotaExhausted()) await sleep(3000);
+  }
+
+  return {
+    questions: all,
+    stats: {
+      requested: targetSize,
+      generated: totalBatches * BATCH_SIZE,
+      valid: all.length,
+      duplicates: seen.size - all.length,
+    },
+  };
+}
+
+// Public API — plain array return (backward compatible)
+async function generateBank(category, difficulty = "Medium", targetSize = 100) {
+  const { questions } = await generateBankInternal(category, difficulty, targetSize);
+  console.log(`🎉 Bank ready: ${questions.length}/${targetSize} unique bilingual questions`);
+  return questions;
+}
+
+// ---------- generateQuestions (exam flow) ----------
 async function generateQuestions(category, difficulty = "Medium", count = 50, useCache = false) {
   if (useCache) {
     const cached = getCached(category, difficulty);
@@ -233,68 +348,15 @@ async function generateQuestions(category, difficulty = "Medium", count = 50, us
     }
   }
   clearCache(category, difficulty);
-  const BATCH_SIZE = 8;
-  const CONCURRENCY = 1;
-  const batchCounts = [];
-  let remainingCount = count;
-  while (remainingCount > 0) {
-    batchCounts.push(Math.min(BATCH_SIZE, remainingCount));
-    remainingCount -= BATCH_SIZE;
-  }
-  const totalBatches = batchCounts.length;
-  console.log(`🔨 ${totalBatches} batches (${CONCURRENCY} parallel) for ${category}`);
-  const all = [];
-  async function runBatch(batchNo, batchCount, tryNo = 1) {
-    const extraHint = tryNo > 1 ? "⚠️ PREVIOUS ATTEMPT WAS REJECTED because Hindi was missing." : "";
-    const prompt = buildPrompt(category, difficulty, batchCount, batchNo, totalBatches, extraHint);
-    const text = await callGemini(prompt, 60000);
-    const arr = parseJsonArray(text);
-    if (!Array.isArray(arr)) { console.log(`❌ Batch ${batchNo}: invalid JSON`); return []; }
-    const normalized = arr.map(normalizeQuestion).filter(Boolean);
-    const withFour = normalized.filter((q) => q.options.length === 4);
-    const pool = withFour.length >= 2 ? withFour : normalized.filter((q) => q.options.length >= 2);
-    const bilingual = pool.filter(isBilingualQuestion);
-    if (bilingual.length < pool.length) console.log(`⚠️ Batch ${batchNo}: ${pool.length - bilingual.length} English-only reject kiye`);
-    if (bilingual.length < batchCount && tryNo < 2) return runBatch(batchNo, batchCount, 2);
-    console.log(`✅ Batch ${batchNo}: ${bilingual.length} bilingual questions`);
-    return bilingual.slice(0, batchCount);
-  }
-  let index = 0;
-  while (index < totalBatches) {
-    const slice = batchCounts.slice(index, index + CONCURRENCY);
-    const settled = await Promise.allSettled(slice.map((c, i) => runBatch(index + i + 1, c)));
-    settled.forEach((s, i) => { if (s.status === "fulfilled") all.push(...s.value); else console.log(`❌ Batch ${index + i + 1} fail: ${s.reason?.message || s.reason}`); });
-    index += CONCURRENCY;
-    if (isQuotaExhausted()) break;
-    if (index < totalBatches) await new Promise((r) => setTimeout(r, 5000));
-  }
-  const seen = new Set();
-  const deduped = all.filter((q) => { const key = q.question.split(" / ")[0].trim().toLowerCase(); if (seen.has(key)) return false; seen.add(key); return true; });
-  let result = deduped.slice(0, count);
-  let topUpRounds = 0;
-  while (result.length < count && topUpRounds < 2 && !isQuotaExhausted()) {
-    topUpRounds++;
-    const missing = count - result.length;
-    const hint = "⚠️ These questions MUST be NEW.";
-    const prompt = buildPrompt(category, difficulty, missing, 1, 1, hint);
-    const text = await callGemini(prompt, 60000);
-    const arr = parseJsonArray(text);
-    if (Array.isArray(arr)) {
-      const normalized = arr.map(normalizeQuestion).filter(Boolean);
-      const pool = normalized.filter((q) => q.options.length === 4);
-      const bilingual = pool.filter(isBilingualQuestion);
-      const existing = new Set(result.map((q) => q.question.split(" / ")[0].trim().toLowerCase()));
-      const freshOnes = bilingual.filter((q) => !existing.has(q.question.split(" / ")[0].trim().toLowerCase()));
-      result.push(...freshOnes.slice(0, missing));
-    }
-    if (topUpRounds < 2 && !isQuotaExhausted()) await new Promise((r) => setTimeout(r, 3000));
-  }
+  const { questions } = await generateBankInternal(category, difficulty, count);
+  const result = questions.slice(0, count);
   if (!result.length) throw new Error("AI ne bilingual questions nahi diye");
   saveCache(category, difficulty, result);
   console.log(`🎉 TOTAL: ${result.length} bilingual questions`);
   return result;
 }
 
+// ---------- Resume interview flow ----------
 async function generateResumeQuestions(resumeText, count = 50) {
   const BATCH_SIZE = 8;
   const all = [];
@@ -304,98 +366,73 @@ async function generateResumeQuestions(resumeText, count = 50) {
     const prompt = `You are an expert AI mock interviewer.\nAnalyze this resume:\n${resumeText}\n\nGenerate ${BATCH_SIZE} interview questions.\nRules:\n1. Each question has exactly 4 options.\n2. Each option has a SHORT explanation.\n3. correctAnswer must match one option text.\n4. Return ONLY valid JSON array.\n\nJSON FORMAT: [{"question":"...","type":"technical","options":[{"text":"...","explanation":"..."}],"correctAnswer":"...","difficulty":"Medium"}]`;
     const text = await callGemini(prompt);
     const arr = parseJsonArray(text);
-    if (Array.isArray(arr)) { all.push(...arr.map(normalizeQuestion).filter(Boolean)); console.log(`Batch ${b}: ${arr.length} questions`); }
+    if (Array.isArray(arr)) {
+      all.push(...arr.map(normalizeQuestion).filter(Boolean));
+      console.log(`Batch ${b}: ${arr.length} questions`);
+    }
     if (all.length >= count) break;
-    if (b < batches) await new Promise((r) => setTimeout(r, 3000));
+    if (b < batches) await sleep(3000);
   }
   return all.slice(0, count);
 }
 
-async function generateBank(category, difficulty = "Medium", targetSize = 100) {
-  const BATCH_SIZE = 8;
-  const CONCURRENCY = 1;
-  const all = [];
-  const seen = new Set();
-  const batchCounts = [];
-  let remaining = targetSize;
-  while (remaining > 0) { batchCounts.push(Math.min(BATCH_SIZE, remaining)); remaining -= BATCH_SIZE; }
-  const totalBatches = batchCounts.length;
-  async function runBatch(batchNo, batchCount, tryNo = 1) {
-    const extraHint = tryNo > 1 ? "⚠️ PREVIOUS ATTEMPT WAS REJECTED." : "";
-    const prompt = buildPrompt(category, difficulty, batchCount, batchNo, totalBatches, extraHint);
-    const text = await callGemini(prompt, 60000);
-    const arr = parseJsonArray(text);
-    if (!Array.isArray(arr)) return [];
-    const normalized = arr.map(normalizeQuestion).filter(Boolean);
-    const pool = normalized.filter((q) => q.options.length === 4);
-    const bilingual = pool.filter(isBilingualQuestion);
-    if (bilingual.length < batchCount && tryNo < 2) return runBatch(batchNo, batchCount, 2);
-    return bilingual;
-  }
-  let index = 0;
-  while (index < totalBatches) {
-    const slice = batchCounts.slice(index, index + CONCURRENCY);
-    const settled = await Promise.allSettled(slice.map((c, i) => runBatch(index + i + 1, c)));
-    settled.forEach((s) => { if (s.status === "fulfilled") all.push(...s.value); });
-    index += CONCURRENCY;
-    if (isQuotaExhausted()) break;
-    if (index < totalBatches) await new Promise((r) => setTimeout(r, 5000));
-  }
-  const deduped = all.filter((q) => { const key = q.question.split(" / ")[0].trim().toLowerCase(); if (seen.has(key)) return false; seen.add(key); return true; });
-  let rounds = 0;
-  while (deduped.length < targetSize && rounds < 3 && !isQuotaExhausted()) {
-    rounds++;
-    const missing = targetSize - deduped.length;
-    const hint = "⚠️ NEW questions only.";
-    const prompt = buildPrompt(category, difficulty, Math.min(missing, 8), 99, 99, hint);
-    try {
-      const text = await callGemini(prompt, 60000);
-      const arr = parseJsonArray(text);
-      if (Array.isArray(arr)) {
-        const fresh = arr.map(normalizeQuestion).filter(Boolean).filter((q) => q.options.length === 4).filter(isBilingualQuestion).filter((q) => !seen.has(q.question.split(" / ")[0].trim().toLowerCase()));
-        fresh.forEach((q) => seen.add(q.question.split(" / ")[0].trim().toLowerCase()));
-        deduped.push(...fresh);
-      }
-    } catch (e) { console.log("Top-up fail:", e.message); }
-    if (!isQuotaExhausted()) await new Promise((r) => setTimeout(r, 3000));
-  }
-  console.log(`🎉 Bank ready: ${deduped.length} unique bilingual questions`);
-  return deduped;
-}
-
+// ---------- Interview flow (fast path) ----------
 async function generateInterviewQuestions(category, difficulty = "Medium", count = 30, extraHint = "") {
   const BATCH_SIZE = 8;
   const MAX_CONCURRENCY = 3;
-  const PER_CALL_TIMEOUT = 15000;
-  const OVERALL_TIMEOUT = 15000;
+  const PER_CALL_TIMEOUT = 30000;
+  const OVERALL_TIMEOUT = 120000;
   const startTime = Date.now();
   const all = [];
   const seen = new Set();
   const batchCounts = [];
   let remaining = count;
-  while (remaining > 0) { batchCounts.push(Math.min(BATCH_SIZE, remaining)); remaining -= BATCH_SIZE; }
+  while (remaining > 0) {
+    batchCounts.push(Math.min(BATCH_SIZE, remaining));
+    remaining -= BATCH_SIZE;
+  }
   const totalBatches = batchCounts.length;
   let index = 0;
   while (index < totalBatches) {
     if (Date.now() - startTime > OVERALL_TIMEOUT) break;
     const slice = batchCounts.slice(index, Math.min(index + MAX_CONCURRENCY, totalBatches));
     if (slice.length === 0) break;
-    const results = await Promise.allSettled(slice.map((c, i) => {
-      const batchNo = index + i + 1;
-      const prompt = buildPrompt(category, difficulty, c, batchNo, totalBatches, extraHint);
-      return callGemini(prompt, PER_CALL_TIMEOUT).then(text => {
-        if (!text) return [];
-        const arr = parseJsonArray(text);
-        if (!Array.isArray(arr)) return [];
-        return arr.map(normalizeQuestion).filter(Boolean).filter(q => q.options.length === 4).filter(isBilingualQuestion);
-      }).catch(err => { console.log(`⚡ Batch ${batchNo} failed: ${err.message.slice(0, 80)}`); return []; });
-    }));
-    results.forEach(s => { if (s.status === "fulfilled") all.push(...s.value); });
+    const results = await Promise.allSettled(
+      slice.map((c, i) => {
+        const batchNo = index + i + 1;
+        const prompt = buildPrompt(category, difficulty, c, batchNo, totalBatches, extraHint);
+        return callGemini(prompt, PER_CALL_TIMEOUT)
+          .then((text) => {
+            if (!text) return [];
+            const arr = parseJsonArray(text);
+            if (!Array.isArray(arr)) return [];
+            return arr.map(normalizeQuestion).filter(Boolean).filter(isBilingualQuestion);
+          })
+          .catch((err) => {
+            console.log(`⚡ Batch ${batchNo} failed: ${String(err.message || err).slice(0, 80)}`);
+            return [];
+          });
+      })
+    );
+    results.forEach((s) => {
+      if (s.status === "fulfilled") all.push(...s.value);
+    });
     index += MAX_CONCURRENCY;
     if (isQuotaExhausted()) break;
   }
-  const deduped = all.filter(q => { const key = qKey(q); if (!key || seen.has(key)) return false; seen.add(key); return true; });
+  const deduped = all.filter((q) => {
+    const key = qKey(q);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
   return deduped.slice(0, count);
 }
 
-module.exports = { generateQuestions, generateResumeQuestions, generateBank, generateInterviewQuestions, isQuotaExhausted };
+module.exports = {
+  generateQuestions,
+  generateResumeQuestions,
+  generateBank,
+  generateInterviewQuestions,
+  isQuotaExhausted,
+};

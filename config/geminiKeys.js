@@ -1,20 +1,17 @@
 // ============================================================
 // config/geminiKeys.js
 // SINGLE SOURCE OF TRUTH for Gemini API keys + rotation state.
-// Used by: aiGenerator, ALEX client, lite client, server diagnostics.
 // SECURITY: kabhi bhi full key print/return nahi hota — sirf masked.
 // ============================================================
 
-require("dotenv").config(); // safe: local dev ke liye; Render env ko kabhi override nahi karta
+require("dotenv").config();
 
 // ---------- PARSING ----------
 function parseKeys(raw) {
   if (!raw || typeof raw !== "string") return [];
   return raw
-    // comma + accidental newline/semicolon paste handle karega (Render me common)
     .split(/[,\n;]+/)
     .map((k) => k.trim())
-    // accidental wrapping quotes hatao: "KEY1,KEY2"
     .map((k) => {
       if (
         k.length >= 2 &&
@@ -24,11 +21,10 @@ function parseKeys(raw) {
       }
       return k;
     })
-    .filter((k) => k.length > 0); // empty entries , , ignore
+    .filter((k) => k.length > 0);
 }
 
 // ---------- FALLBACK CHAIN ----------
-// GEMINI_API_KEYS preferred; legacy names still supported
 const SOURCE_VAR =
   process.env.GEMINI_API_KEYS ? "GEMINI_API_KEYS"
   : process.env.GEMINI_API_KEY ? "GEMINI_API_KEY"
@@ -37,7 +33,6 @@ const SOURCE_VAR =
   : null;
 
 const RAW_VALUE = SOURCE_VAR ? process.env[SOURCE_VAR] : "";
-
 const API_KEYS = parseKeys(RAW_VALUE);
 
 // ---------- SAFE MASKING ----------
@@ -47,7 +42,6 @@ function maskKey(key) {
   return `${key.slice(0, 6)}...${key.slice(-4)}`;
 }
 
-// ---------- STARTUP DIAGNOSTIC ----------
 const envStatus = {
   present: !!SOURCE_VAR,
   source: SOURCE_VAR,
@@ -55,17 +49,17 @@ const envStatus = {
   summary: API_KEYS.length
     ? `FOUND (${API_KEYS.length} keys via ${SOURCE_VAR})`
     : "MISSING (checked GEMINI_API_KEYS, GEMINI_API_KEY, GOOGLE_API_KEY, AI_KEY)",
-  maskedKeys: API_KEYS.map(maskKey), // safe for logs
+  maskedKeys: API_KEYS.map(maskKey),
 };
 
-// ---------- KEY MANAGER (rotation, cooldown, quota) ----------
+// ---------- KEY MANAGER ----------
 class KeyManager {
   constructor(keys, { rpdPerKey = 1000, cooldownMs = 45000 } = {}) {
     this.keys = keys || [];
     this.calls = this.keys.map(() => 0);
-    this.exhausted = this.keys.map(() => false); // daily quota khatam
-    this.invalid = this.keys.map(() => false);   // 403/404 — key/model blocked
-    this.cooldownUntil = this.keys.map(() => 0); // 429 per-minute / timeout
+    this.exhausted = this.keys.map(() => false);
+    this.invalid = this.keys.map(() => false);
+    this.cooldownUntil = this.keys.map(() => 0);
     this.idx = 0;
     this.rpdPerKey = rpdPerKey;
     this.cooldownMs = cooldownMs;
@@ -86,7 +80,6 @@ class KeyManager {
     ).length;
   }
 
-  // Round-robin — next usable key ya null
   nextKey() {
     const now = Date.now();
     const n = this.keys.length;
@@ -111,12 +104,10 @@ class KeyManager {
   markRateLimited(i, { waitMs = null, isDaily = false } = {}) {
     if (isDaily) {
       this.exhausted[i] = true;
-      console.log(`🚫 [KEYS] Key #${i + 1}: daily quota khatam — permanently off aaj ke liye`);
+      console.log(`🚫 [KEYS] Key #${i + 1}: daily quota khatam — aaj ke liye off`);
     } else {
       this.cooldownUntil[i] = Date.now() + (waitMs || this.cooldownMs);
-      console.log(
-        `⏳ [KEYS] Key #${i + 1}: 429 cooldown ${Math.round((waitMs || this.cooldownMs) / 1000)}s`
-      );
+      console.log(`⏳ [KEYS] Key #${i + 1}: 429 cooldown ${Math.round((waitMs || this.cooldownMs) / 1000)}s`);
     }
   }
 
@@ -136,7 +127,6 @@ class KeyManager {
     );
   }
 
-  // Sab keys cooldown par hain to kitna wait karna hai (null = sab dead)
   minWaitMs() {
     const now = Date.now();
     const waits = this.keys.map((_, i) =>
@@ -152,7 +142,6 @@ class KeyManager {
     this.cooldownUntil = this.keys.map(() => 0);
   }
 
-  // Safe stats — health endpoints ke liye (koi key value nahi jaati)
   stats() {
     return {
       totalKeys: this.count,
@@ -166,12 +155,4 @@ class KeyManager {
 
 const keyManager = new KeyManager(API_KEYS, { rpdPerKey: 1000, cooldownMs: 45000 });
 
-module.exports = {
-  API_KEYS,
-  SOURCE_VAR,
-  envStatus,
-  parseKeys,
-  KeyManager,
-  keyManager,
-  maskKey,
-};
+module.exports = { API_KEYS, SOURCE_VAR, envStatus, parseKeys, KeyManager, keyManager, maskKey };
