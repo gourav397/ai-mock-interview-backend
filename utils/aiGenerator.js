@@ -1,7 +1,7 @@
 // ============================================================
 // aiGenerator.js — Bilingual Exam Question Generator
-// FIXED: corrupt normalizers, partial-success generation,
-// dedupe pool shared across batches & top-ups.
+// FIXED: resume flow (empty-array root cause), partial success,
+// shared dedupe pool across batches & top-ups.
 // ============================================================
 
 require("dotenv").config();
@@ -168,7 +168,6 @@ function normalizeCorrectAnswer(ca, options) {
   return ca;
 }
 
-// ✅ FIXED — corrupt tha
 function normalizeQuestion(raw) {
   if (!raw || typeof raw !== "object") return null;
 
@@ -240,11 +239,10 @@ JSON FORMAT:
 }
 
 // ---------- CORE: bank generate with partial success ----------
-// Returns: { questions: [...], stats: { requested, generated, valid, duplicates } }
 async function generateBankInternal(category, difficulty, targetSize) {
   const BATCH_SIZE = 8;
   const CONCURRENCY = 1;
-  const seen = new Set(); // shared dedupe pool across all batches + top-ups
+  const seen = new Set();
   const all = [];
 
   const batchCounts = [];
@@ -263,14 +261,12 @@ async function generateBankInternal(category, difficulty, targetSize) {
     if (!Array.isArray(arr)) return [];
     const normalized = arr.map(normalizeQuestion).filter(Boolean);
     const bilingual = normalized.filter(isBilingualQuestion);
-    // sirf fresh (non-duplicate) add karo — shared pool
     const fresh = bilingual.filter((q) => {
       const key = qKey(q);
       if (!key || seen.has(key)) return false;
       seen.add(key);
       return true;
     });
-    // content invalid tha to EK controlled retry (max 1), unlimited nahi
     if (fresh.length < batchCount && tryNo < 2) {
       const more = await runBatch(batchNo, batchCount - fresh.length, 2);
       fresh.push(...more);
@@ -291,7 +287,6 @@ async function generateBankInternal(category, difficulty, targetSize) {
     if (index < totalBatches && !isQuotaExhausted()) await sleep(5000);
   }
 
-  // ---------- CONTROLLED TOP-UP: max 2 rounds ----------
   let topUpRounds = 0;
   while (all.length < targetSize && topUpRounds < 2 && !isQuotaExhausted()) {
     topUpRounds++;
@@ -331,14 +326,12 @@ async function generateBankInternal(category, difficulty, targetSize) {
   };
 }
 
-// Public API — plain array return (backward compatible)
 async function generateBank(category, difficulty = "Medium", targetSize = 100) {
   const { questions } = await generateBankInternal(category, difficulty, targetSize);
   console.log(`🎉 Bank ready: ${questions.length}/${targetSize} unique bilingual questions`);
   return questions;
 }
 
-// ---------- generateQuestions (exam flow) ----------
 async function generateQuestions(category, difficulty = "Medium", count = 50, useCache = false) {
   if (useCache) {
     const cached = getCached(category, difficulty);
@@ -356,22 +349,123 @@ async function generateQuestions(category, difficulty = "Medium", count = 50, us
   return result;
 }
 
-// ---------- Resume interview flow ----------
-async function generateResumeQuestions(resumeText, count = 50) {
-  const BATCH_SIZE = 8;
-  const all = [];
-  const batches = Math.ceil(count / BATCH_SIZE);
-  for (let b = 1; b <= batches; b++) {
-    if (isQuotaExhausted()) break;
-    const prompt = `You are an expert AI mock interviewer.\nAnalyze this resume:\n${resumeText}\n\nGenerate ${BATCH_SIZE} interview questions.\nRules:\n1. Each question has exactly 4 options.\n2. Each option has a SHORT explanation.\n3. correctAnswer must match one option text.\n4. Return ONLY valid JSON array.\n\nJSON FORMAT: [{"question":"...","type":"technical","options":[{"text":"...","explanation":"..."}],"correctAnswer":"...","difficulty":"Medium"}]`;
-    const text = await callGemini(prompt);
-    const arr = parseJsonArray(text);
-    if (Array.isArray(arr)) {
-      all.push(...arr.map(normalizeQuestion).filter(Boolean));
-      console.log(`Batch ${b}: ${arr.length} questions`);
+// ============================================================
+// RESUME FLOW — FIXED (empty array root cause)
+// Strategy: resume text se topics digest karo → topics par
+// bilingual MCQ banao. 2 attempts + fallback. Kabhi silently
+// empty array return nahi karega — throw karega to route ko
+// clear error mile.
+// ============================================================
+
+// Step 1: resume text se interview topics nikalo (chhota JSON call)
+async function extractResumeTopics(resumeText) {
+  const trimmed = String(resumeText || "").slice(0, 6000);
+  const prompt = `Analyze this resume and extract the TOP 8 technical/skill topics for an interview quiz.
+Return ONLY a valid JSON object: {"topics": ["topic1", "topic2", ...]}
+Topics should be short (1-4 words), e.g. "Network Security", "Python".
+
+RESUME:
+${trimmed}`;
+
+  try {
+    const text = await callGemini(prompt, 45000);
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start !== -1 && end > start) {
+      const parsed = JSON.parse(text.slice(start, end + 1));
+      if (Array.isArray(parsed.topics) && parsed.topics.length) {
+        return parsed.topics.filter((t) => typeof t === "string").slice(0, 8);
+      }
     }
-    if (all.length >= count) break;
-    if (b < batches) await sleep(3000);
+  } catch (e) {
+    console.log("⚠️ Topic extraction fail:", e.message);
+  }
+  // fallback topics — generic tech
+  return ["Technical Skills", "Problem Solving", "Core Concepts"];
+}
+
+// Resume-based bilingual MCQs — topics ke through (robust path)
+async function generateResumeQuestions(resumeText, count = 50) {
+  if (!resumeText || !String(resumeText).trim()) {
+    throw new Error("Resume text empty hai — questions generate nahi ho sakte");
+  }
+
+  const topics = await extractResumeTopics(resumeText);
+  console.log(`📄 [RESUME] Topics: ${topics.join(", ")}`);
+
+  const BATCH_SIZE = 8;
+  const seen = new Set();
+  const all = [];
+  let topicIdx = 0;
+  let rounds = 0;
+  const maxRounds = Math.ceil(count / BATCH_SIZE) + 4; // hard cap — infinite loop nahi
+
+  while (all.length < count && rounds < maxRounds && !isQuotaExhausted()) {
+    rounds++;
+    const topic = topics[topicIdx % topics.length];
+    topicIdx++;
+    const batchCount = Math.min(BATCH_SIZE, count - all.length);
+
+    const prompt = `You are an expert technical interviewer.
+Generate ${batchCount} multiple choice interview questions about "${topic}" — relevant to this candidate's resume.
+
+🔤 LANGUAGE RULE (STRICT): Every question and option MUST be in BOTH English AND Hindi (Devanagari).
+Fields: question_en, question_hi, text_en, text_hi, explanation_en, explanation_hi. Empty Hindi = INVALID.
+
+Rules:
+1. Exactly 4 options per question.
+2. SHORT explanation per option (max 12 words each language).
+3. correctAnswer must EXACTLY equal one option's text_en.
+4. Return ONLY valid JSON array. No markdown.
+
+JSON FORMAT:
+[
+ {
+  "question_en": "What does Tor primarily provide?",
+  "question_hi": "Tor मुख्य रूप से क्या प्रदान करता है?",
+  "options": [
+    { "text_en": "Anonymity", "text_hi": "गुमनामी", "explanation_en": "Tor routes traffic anonymously.", "explanation_hi": "Tor ट्रैफिक को गुमनाम रूट करता है।" },
+    { "text_en": "Speed", "text_hi": "गति", "explanation_en": "Tor is actually slower.", "explanation_hi": "Tor असल में धीमा है।" },
+    { "text_en": "Encryption keys", "text_hi": "एन्क्रिप्शन कुंजियाँ", "explanation_en": "Keys are not its purpose.", "explanation_hi": "यह इसका उद्देश्य नहीं है।" },
+    { "text_en": "Firewall", "text_hi": "फ़ायरवॉल", "explanation_en": "Tor is not a firewall.", "explanation_hi": "Tor फ़ायरवॉल नहीं है।" }
+  ],
+  "correctAnswer": "Anonymity",
+  "type": "technical",
+  "topic": "${topic}",
+  "difficulty": "Medium"
+ }
+]`;
+
+    try {
+      const text = await callGemini(prompt, 60000);
+      const arr = parseJsonArray(text);
+      if (Array.isArray(arr)) {
+        const fresh = arr
+          .map(normalizeQuestion)
+          .filter(Boolean)
+          .filter(isBilingualQuestion)
+          .filter((q) => {
+            const key = qKey(q);
+            if (!key || seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+        all.push(...fresh.slice(0, batchCount));
+        console.log(`📄 [RESUME] Round ${rounds} (${topic}): +${fresh.length} → total ${all.length}`);
+      } else {
+        console.log(`📄 [RESUME] Round ${rounds}: invalid JSON — skip`);
+      }
+    } catch (e) {
+      console.log(`📄 [RESUME] Round ${rounds} fail: ${e.message}`);
+    }
+
+    if (all.length < count && !isQuotaExhausted()) await sleep(3000);
+  }
+
+  console.log(`📄 [RESUME] Final: ${all.length}/${count} bilingual questions`);
+
+  if (!all.length) {
+    throw new Error("AI ne resume-based questions generate nahi kiye (quota ya JSON issue) — thodi der baad try karo");
   }
   return all.slice(0, count);
 }
