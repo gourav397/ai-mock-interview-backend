@@ -45,6 +45,7 @@ const connectDB = require("./config/db");
 const bulkUploader = require("./utils/bulkUploader");
 const classExamRoutes = require("./routes/classExam");
 
+
 // Existing routes
 const authRoutes = require("./routes/auth");
 const questionRoutes = require("./routes/questions");
@@ -58,6 +59,7 @@ const interviewSessionRoutes = require("./routes/aiInterviewSession");
 const practiceRoutes = require("./routes/practice");
 const resumeRoutes = require("./routes/resume");
 const adminRoutes = require("./routes/admin");
+const questionBankRoutes = require("./routes/questionBankRoutes");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -138,6 +140,7 @@ app.use("/api/practice", practiceRoutes);
 app.use("/api/resume", resumeRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/image-editor", imageEditorRoutes);
+app.use("/api/question-banks", questionBankRoutes);
 
 // ============================================================
 // 🤖 ALEX CHAT ROUTES — MOUNTED FIRST (BEFORE dashboard)
