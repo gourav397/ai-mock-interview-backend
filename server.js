@@ -141,6 +141,7 @@ app.use("/api/resume", resumeRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/image-editor", imageEditorRoutes);
 app.use("/api/question-banks", questionBankRoutes);
+app.get("/api/ai-status", (req, res) => res.json(keyManager.stats()));
 
 // ============================================================
 // 🤖 ALEX CHAT ROUTES — MOUNTED FIRST (BEFORE dashboard)

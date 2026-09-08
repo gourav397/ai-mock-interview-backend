@@ -1,7 +1,9 @@
 // ============================================================
 // config/geminiClient.js
 // Reliable Gemini HTTP caller — key rotation, cooldown, 429,
-// 401/403/404 invalidation, 5xx retry, timeout handling.
+// 401/403 invalidation, model-404 auto-fallback, 5xx retry,
+// timeout handling.
+// SECURITY: kabhi bhi full API key log/return nahi hoti.
 // ============================================================
 
 require("dotenv").config();
@@ -10,13 +12,34 @@ const { keyManager } = require("./geminiKeys");
 
 const BASE_URL = "https://generativelanguage.googleapis.com";
 
+// ---------- MODEL FALLBACK CHAIN ----------
+// Agar model retire/404 ho jaye to agla model try hota hai —
+// keys invalid NAHI hoti (404 model ka error hai, key ka nahi).
+const MODEL_FALLBACKS = [
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+  "gemini-2.5-flash",
+  "gemini-flash-latest",
+];
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// Yeh model-specific 404 hai (key ki galti nahi)?
+function isModelNotFound(bodyText) {
+  return (
+    /no longer available/i.test(bodyText) ||
+    /models\/[\w.\-]+ is not found/i.test(bodyText) ||
+    /model not found/i.test(bodyText) ||
+    /is not supported/i.test(bodyText) ||
+    /not found for API version/i.test(bodyText)
+  );
+}
+
 async function geminiGenerate(prompt, options = {}) {
   const opts = {
-    model: process.env.GEMINI_MODEL || "gemini-2.0-flash",
+    model: process.env.GEMINI_MODEL || "gemini-3.6-flash",
     temperature: 0.7,
     topP: 0.95,
     maxOutputTokens: 8192,
@@ -41,7 +64,21 @@ async function geminiGenerate(prompt, options = {}) {
       ? prompt.slice(0, opts.maxPromptChars) + "\n...[text truncated]"
       : prompt;
 
-  const url = `${BASE_URL}/v1beta/models/${encodeURIComponent(opts.model)}:generateContent`;
+  // ---------- MODEL RESOLUTION (with fallback) ----------
+  let model = opts.model;
+  const triedModels = new Set();
+
+  // Agar env/config model pehle hi fail ho chuka hai to fallback chain se
+  // pehla untried model uthao
+  function pickNextModel() {
+    for (const m of MODEL_FALLBACKS) {
+      if (!triedModels.has(m)) {
+        triedModels.add(m);
+        return m;
+      }
+    }
+    return null;
+  }
 
   let lastError = null;
 
@@ -66,6 +103,8 @@ async function geminiGenerate(prompt, options = {}) {
       await sleep(s);
       continue;
     }
+
+    const url = `${BASE_URL}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
@@ -106,12 +145,24 @@ async function geminiGenerate(prompt, options = {}) {
           keyManager.markTimeout(slot.index, 5000);
           continue;
         }
-        console.log(`✅ [GEMINI] Key #${slot.index + 1} OK (${keyManager.calls[slot.index]} calls) — model: ${opts.model}`);
-        return { text, keyIndex: slot.index, model: opts.model };
+        console.log(`✅ [GEMINI] Key #${slot.index + 1} OK (${keyManager.calls[slot.index]} calls) — model: ${model}`);
+        return { text, keyIndex: slot.index, model };
       }
 
       const bodyText = await res.text().catch(() => "");
-      console.log(`🔴 [GEMINI] Key #${slot.index + 1} HTTP ${res.status}: ${bodyText.slice(0, 200)}`);
+      console.log(`🔴 [GEMINI] Key #${slot.index + 1} HTTP ${res.status} (model: ${model}): ${bodyText.slice(0, 200)}`);
+
+      // ---------- 404 MODEL NOT FOUND: model switch, key ko mat maro ----------
+      if (res.status === 404 && isModelNotFound(bodyText)) {
+        console.log(`🔄 [GEMINI] Model "${model}" available nahi hai — fallback try kar rahe hain (key #${slot.index + 1} theek hai)`);
+        const next = pickNextModel();
+        if (next) {
+          model = next;
+          continue; // same key, next model
+        }
+        lastError = new Error(`Koi working Gemini model nahi mila (tried: ${[...triedModels].join(", ")})`);
+        continue;
+      }
 
       // ---------- 429: rate limit ----------
       if (res.status === 429) {
@@ -129,14 +180,21 @@ async function geminiGenerate(prompt, options = {}) {
         continue;
       }
 
-      // ---------- 401/403/404 ----------
-      if (res.status === 401 || res.status === 403 || res.status === 404) {
+      // ---------- 401/403: key genuinely invalid ----------
+      if (res.status === 401 || res.status === 403) {
         keyManager.markInvalid(slot.index, `HTTP ${res.status}`);
         lastError = new Error(`Gemini key #${slot.index + 1} failed (HTTP ${res.status})`);
         continue;
       }
 
-      // ---------- 5xx ----------
+      // ---------- 404 (non-model): key/project issue ----------
+      if (res.status === 404) {
+        keyManager.markInvalid(slot.index, `HTTP 404 (non-model)`);
+        lastError = new Error(`Gemini key #${slot.index + 1} failed (HTTP 404)`);
+        continue;
+      }
+
+      // ---------- 5xx: server busy ----------
       if (res.status >= 500) {
         lastError = new Error(`Gemini HTTP ${res.status}: ${bodyText.slice(0, 200)}`);
         keyManager.markTimeout(slot.index, 15000);
@@ -144,7 +202,7 @@ async function geminiGenerate(prompt, options = {}) {
         continue;
       }
 
-      // ---------- other 4xx ----------
+      // ---------- other 4xx: retry pointless ----------
       keyManager.markInvalid(slot.index, `HTTP ${res.status}`);
       throw new Error(`Gemini HTTP ${res.status}: ${bodyText.slice(0, 500)}`);
     } catch (err) {
