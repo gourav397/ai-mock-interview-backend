@@ -1,15 +1,14 @@
+// routes/uploadRoutes.js
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const extractText = require("../utils/extractText");
-
 const Resume = require("../models/Resume");
-const { generateResumeQuestions } = require("../utils/aiGenerator");
+const { generateResumeQuestionsFast } = require("../utils/aiGenerator");
 
 const router = express.Router();
 
-// uploads/ folder ensure (Render par disk ephemeral hai — folder missing ho sakta hai)
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -17,43 +16,34 @@ const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname)),
 });
-
-const upload = multer({ storage });
+const upload = multer({ storage, limits: { fileSize: 15 * 1024 * 1024 } });
 
 router.post("/resume", upload.single("resume"), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ message: "No file uploaded" });
-    }
+    if (!req.file) return res.status(400).json({ message: "No file uploaded" });
 
     const extractedText = await extractText(req.file.path);
-    console.log("RESUME TEXT:", extractedText.substring(0, 200));
+    console.log("RESUME TEXT:", extractedText.substring(0, 150));
 
     if (!extractedText || extractedText.trim().length < 50) {
+      try { fs.unlinkSync(req.file.path); } catch {}
       return res.status(400).json({
-        message: "Resume se text extract nahi hua — PDF text-based honi chahiye (scanned image PDF support nahi)",
+        message: "रिज़्यूमे से टेक्स्ट एक्सट्रैक्ट नहीं हुआ — टेक्स्ट-आधारित PDF अपलोड करो (स्कैन्ड इमेज PDF सपोर्टेड नहीं)",
       });
     }
 
-    // ---------- AI GENERATION with RETRY (max 2 attempts) ----------
+    // ---------- FAST GENERATION (एक प्रयास, ~60-90 सेकंड) ----------
     let questions = [];
-    let lastError = null;
-
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        questions = await generateResumeQuestions(extractedText, 50);
-        if (questions.length) break;
-      } catch (err) {
-        lastError = err;
-        console.log(`❌ [UPLOAD] Attempt ${attempt} fail: ${err.message}`);
-        if (attempt < 2) await new Promise((r) => setTimeout(r, 5000));
-      }
+    let genError = null;
+    try {
+      questions = await generateResumeQuestionsFast(extractedText, 30);
+    } catch (err) {
+      genError = err;
+      console.log("❌ [UPLOAD] Generation fail:", err.message);
     }
 
-    // Clean up uploaded file (Render disk chhota hai — temp files mat jodo)
     try { fs.unlinkSync(req.file.path); } catch {}
 
-    // ---------- GUARD: saaf array of objects ----------
     const safeQuestions = (Array.isArray(questions) ? questions : [])
       .filter((q) => q && q.question)
       .map((q) => ({
@@ -63,26 +53,18 @@ router.post("/resume", upload.single("resume"), async (req, res) => {
         page: q.page || 1,
         difficulty: q.difficulty || "Medium",
         options: Array.isArray(q.options)
-          ? q.options.map((op) => ({
-              text: op.text || "",
-              explanation: op.explanation || "",
-            }))
+          ? q.options.map((op) => ({ text: op.text || "", explanation: op.explanation || "" }))
           : [],
         correctAnswer: q.correctAnswer || "",
       }))
       .filter((q) => q.options.length >= 2 && q.correctAnswer);
 
-    console.log(`✅ [UPLOAD] TOTAL QUESTIONS: ${safeQuestions.length}`);
-    console.log(`✅ [UPLOAD] FIRST Q OPTIONS: ${safeQuestions[0]?.options?.length || 0}`);
+    console.log(`✅ [UPLOAD] QUESTIONS: ${safeQuestions.length}`);
 
-    // ---------- EMPTY = ERROR (chup-chaap success nahi) ----------
     if (!safeQuestions.length) {
-      const msg =
-        lastError?.message ||
-        "AI service abhi questions generate nahi kar payi — thodi der baad dobara try karo";
       return res.status(503).json({
         success: false,
-        message: msg,
+        message: genError?.message || "AI अभी क्यू जनरेट नहीं कर पाया — 2 मिनट बाद दोबारा ट्राई करो",
         questions: [],
       });
     }

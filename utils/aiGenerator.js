@@ -523,6 +523,91 @@ async function generateInterviewQuestions(category, difficulty = "Medium", count
   return deduped.slice(0, count);
 }
 
+// ---------- RESUME FAST FLOW ----------
+// सीधे रिज़्यूमे स्निपेट प्रॉम्प्ट में (टॉपिक-एक्सट्रैक्शन कॉल नहीं) —
+// 4 बैच x 8 = 32 क्यू का लक्ष्य, 1 राउंड। ~60-90 सेकंड में रिस्पॉन्स।
+async function generateResumeQuestionsFast(resumeText, count = 30) {
+  if (!resumeText || !String(resumeText).trim()) {
+    throw new Error("रिज़्यूमे टेक्स्ट खाली है");
+  }
+
+  // रिज़्यूमे का सबसे रिलेवेंट हिस्सा — शुरुआत + बीच का टेक्स्ट
+  const snippet = String(resumeText).slice(0, 4000);
+
+  const BATCH_SIZE = 8;
+  const seen = new Set();
+  const all = [];
+  const totalBatches = Math.ceil(count / BATCH_SIZE);
+
+  for (let b = 1; b <= totalBatches; b++) {
+    if (isQuotaExhausted()) break;
+
+    const prompt = `You are an expert technical interviewer.
+This candidate's resume:
+"""
+${snippet}
+"""
+
+Generate ${BATCH_SIZE} multiple choice interview questions based on the skills/topics in this resume (batch ${b} of ${totalBatches} — make questions DIFFERENT from other batches).
+
+🔤 LANGUAGE RULE (STRICT): Every question and option MUST be in BOTH English AND Hindi (Devanagari).
+Fields: question_en, question_hi, text_en, text_hi, explanation_en, explanation_hi. Empty Hindi = INVALID.
+
+Rules:
+1. Exactly 4 options per question.
+2. SHORT explanation per option (max 12 words each language).
+3. correctAnswer must EXACTLY equal one option's text_en.
+4. Return ONLY valid JSON array. No markdown.
+
+JSON FORMAT:
+[
+ {
+  "question_en": "What does Tor primarily provide?",
+  "question_hi": "Tor मुख्य रूप से क्या प्रदान करता है?",
+  "options": [
+    { "text_en": "Anonymity", "text_hi": "गुमनामी", "explanation_en": "Tor routes traffic anonymously.", "explanation_hi": "Tor ट्रैफिक को गुमनाम रूट करता है।" },
+    { "text_en": "Speed", "text_hi": "गति", "explanation_en": "Tor is slower.", "explanation_hi": "Tor धीमा है।" },
+    { "text_en": "Encryption keys", "text_hi": "एन्क्रिप्शन कुंजियाँ", "explanation_en": "Not its purpose.", "explanation_hi": "यह इसका उद्देश्य नहीं है।" },
+    { "text_en": "Firewall", "text_hi": "फ़ायरवॉल", "explanation_en": "Tor is not a firewall.", "explanation_hi": "Tor फ़ायरवॉल नहीं है।" }
+  ],
+  "correctAnswer": "Anonymity",
+  "type": "technical",
+  "difficulty": "Medium"
+ }
+]`;
+
+    try {
+      const text = await callGemini(prompt, 60000);
+      const arr = parseJsonArray(text);
+      if (Array.isArray(arr)) {
+        const fresh = arr
+          .map(normalizeQuestion)
+          .filter(Boolean)
+          .filter(isBilingualQuestion)
+          .filter((q) => {
+            const key = qKey(q);
+            if (!key || seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+        all.push(...fresh);
+        console.log(`📄 [RESUME-FAST] Batch ${b}: +${fresh.length} → ${all.length}`);
+      }
+    } catch (e) {
+      console.log(`📄 [RESUME-FAST] Batch ${b} fail: ${e.message}`);
+      // 429/कोटा (quota) हो तो आगे के बैचेस (batches) भी फेल होंगे — ब्रेक
+      if (isQuotaExhausted()) break;
+    }
+
+    if (b < totalBatches) await sleep(2000);
+  }
+
+  if (!all.length) {
+    throw new Error("AI से क्यू नहीं बने (quota/model issue) — 2 मिनट बाद ट्राई करो");
+  }
+  return all.slice(0, count);
+}
+
 module.exports = {
   generateQuestions,
   generateResumeQuestions,
