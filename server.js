@@ -60,6 +60,7 @@ const practiceRoutes = require("./routes/practice");
 const resumeRoutes = require("./routes/resume");
 const adminRoutes = require("./routes/admin");
 const questionBankRoutes = require("./routes/questionBankRoutes");
+const { keyManager } = require("./config/geminiKeys");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -142,6 +143,8 @@ app.use("/api/admin", adminRoutes);
 app.use("/api/image-editor", imageEditorRoutes);
 app.use("/api/question-banks", questionBankRoutes);
 app.get("/api/ai-status", (req, res) => res.json(keyManager.stats()));
+app.use("/api/question-banks", questionBankRoutes);
+app.use("/api/bank-status", questionBankRoutes);
 
 // ============================================================
 // 🤖 ALEX CHAT ROUTES — MOUNTED FIRST (BEFORE dashboard)
