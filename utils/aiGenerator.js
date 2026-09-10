@@ -3,11 +3,18 @@
 // Complete file: bank + resume-fast + interview + resume flows.
 //
 // FIXES (is version mein):
+//  - ✅ OPTION SHUFFLE: Gemini correct answer pehli position par likhta
+//    hai. normalizeQuestion() ab correctAnswer resolve karne ke baad
+//    options ko Fisher-Yates se shuffle karta hai — correct answer ki
+//    position random ho jati hai (persist hone se pehle).
+//  - ✅ CORRECT-ANSWER VALIDITY: agar correctAnswer kisi option ke text
+//    se match nahi karta to pehli option ko correct set karta hai
+//    (warna user har answer par wrong dikhta hai).
 //  - parseJsonArray: TRUNCATED-JSON repair (MAX_TOKENS cut arrays ab
-//    partially recover hote hain — last complete question bach jaata hai)
+//    partially recover hote hain)
 //  - generateBankInternal: stats fix, 3 top-up rounds
-//  - generateResumeQuestionsFast: per-batch retry, 45s timeout, top-up
-//    rounds — partial success preserve, real failure par hi throw
+//  - generateResumeQuestionsFast: per-batch retry, top-up rounds,
+//    partial success preserve
 // ============================================================
 
 require("dotenv").config();
@@ -171,6 +178,15 @@ function qKey(q) {
   return (q?.question || "").split(" / ")[0].trim().toLowerCase();
 }
 
+// ✅ Fisher-Yates shuffle — correct answer ki position random karne ke liye
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
 function normalizeOptions(rawOptions) {
   if (!rawOptions) return [];
   if (!Array.isArray(rawOptions)) {
@@ -219,7 +235,23 @@ function normalizeQuestion(raw) {
     combine(raw.question_en, raw.question_hi) ||
     String(raw.question || raw.q || "").trim();
 
-  const options = normalizeOptions(raw.options || raw.choices || raw.answers || raw.answerOptions);
+  let options = normalizeOptions(raw.options || raw.choices || raw.answers || raw.answerOptions);
+
+  let correctAnswer = normalizeCorrectAnswer(raw.correctAnswer || raw.answer, options);
+
+  // ✅ VALIDITY GUARD: agar correctAnswer kisi option se match nahi hota,
+  // to pehli option ko correct maano (warna question har answer par wrong dikhega)
+  if (options.length === 4 && !options.some((o) => o.text === correctAnswer)) {
+    correctAnswer = options[0].text;
+  }
+
+  // ✅ OPTION SHUFFLE (FIX): Gemini correct answer pehli position par likhta
+  // hai — options persist hone se PEHLE shuffle karo taaki correct answer ki
+  // position random ho. correctAnswer text-based hai, isliye shuffle ke baad
+  // bhi sahi option text hi "correct" rahega.
+  if (options.length === 4) {
+    options = shuffleArray(options);
+  }
 
   return {
     question: String(question).trim(),
@@ -228,7 +260,7 @@ function normalizeQuestion(raw) {
     page: raw.page || 1,
     difficulty: raw.difficulty || "Medium",
     options,
-    correctAnswer: normalizeCorrectAnswer(raw.correctAnswer || raw.answer, options),
+    correctAnswer,
   };
 }
 
@@ -237,6 +269,8 @@ function isBilingualQuestion(q) {
   if (!hasHindi(q.question) || !hasEnglish(q.question)) return false;
   if (!q.options || q.options.length !== 4) return false;
   if (!q.correctAnswer) return false;
+  // ✅ SHUFFLE KE BAAD: correctAnswer valid option se match hona zaroori hai
+  if (!q.options.some((o) => o.text === q.correctAnswer)) return false;
   const hiOpts = q.options.filter((o) => hasHindi(o.text));
   return hiOpts.length >= 2;
 }
