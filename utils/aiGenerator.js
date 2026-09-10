@@ -1,6 +1,13 @@
 // ============================================================
 // aiGenerator.js — Bilingual Exam Question Generator
 // Complete file: bank + resume-fast + interview + resume flows.
+//
+// FIXES (is version mein):
+//  - parseJsonArray: TRUNCATED-JSON repair (MAX_TOKENS cut arrays ab
+//    partially recover hote hain — last complete question bach jaata hai)
+//  - generateBankInternal: stats fix, 3 top-up rounds
+//  - generateResumeQuestionsFast: per-batch retry, 45s timeout, top-up
+//    rounds — partial success preserve, real failure par hi throw
 // ============================================================
 
 require("dotenv").config();
@@ -67,16 +74,7 @@ function clearCache(category, difficulty) {
 
 // ================= GEMINI CALL =================
 async function callGemini(prompt, timeoutMs = 60000) {
-  const { text } = await geminiGenerate(prompt, {
-    model: MODEL,
-    temperature: 0.9,
-    topP: 0.95,
-    maxOutputTokens: 8192,
-    responseMimeType: "application/json",
-    timeoutMs,
-    maxRounds: 10,
-    maxPromptChars: 10000,
-  });
+  const text = await geminiGenerate(prompt, timeoutMs);
   return text;
 }
 
@@ -86,12 +84,51 @@ try {
   ({ jsonrepair } = require("jsonrepair"));
 } catch (e) {}
 
+// Truncated JSON repair — string-aware bracket balance.
+// MAX_TOKENS par kata hua array isse close ho jaata hai.
+function repairTruncatedJson(text) {
+  try {
+    let inStr = false;
+    let esc = false;
+    const stack = [];
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === "\\") esc = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') { inStr = true; continue; }
+      if (c === "[" || c === "{") stack.push(c === "[" ? "]" : "}");
+      else if (c === "]" || c === "}") {
+        if (stack.length && stack[stack.length - 1] === c) stack.pop();
+        else return null; // already unbalanced — repair se kuch nahi hoga
+      }
+    }
+    let out = text;
+    if (inStr) out += '"';
+    out = out.replace(/,\s*$/, "");
+    while (stack.length) out += stack.pop();
+    return out;
+  } catch {
+    return null;
+  }
+}
+
 function parseJsonArray(text) {
   if (!text) return null;
   let start = text.indexOf("[");
   let end = text.lastIndexOf("]");
-  if (start === -1 || end <= start) return null;
-  text = text.slice(start, end + 1);
+  if (start === -1 || end <= start) {
+    // Truncated output ho sakta hai — sirf opening bracket se shuru karo
+    start = text.indexOf("[");
+    if (start === -1) return null;
+    text = text.slice(start);
+    end = -1;
+  } else {
+    text = text.slice(start, end + 1);
+  }
   try {
     return JSON.parse(text);
   } catch (e) {}
@@ -100,6 +137,14 @@ function parseJsonArray(text) {
       return JSON.parse(jsonrepair(text));
     } catch (e) {}
   }
+  // Truncation repair
+  try {
+    const repaired = repairTruncatedJson(text);
+    if (repaired) {
+      const parsed = JSON.parse(repaired);
+      if (Array.isArray(parsed) && parsed.length) return parsed;
+    }
+  } catch (e) {}
   try {
     const fixed = text
       .replace(/:\s*'([^']*)'/g, ': "$1"')
@@ -107,7 +152,7 @@ function parseJsonArray(text) {
       .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:/g, '$1"$2":');
     return JSON.parse(fixed);
   } catch (e) {}
-  console.error("JSON PARSE FAIL:", text.slice(0, 300));
+  console.error("JSON PARSE FAIL:", String(text).slice(0, 300));
   return null;
 }
 
@@ -241,6 +286,7 @@ JSON FORMAT:
 async function generateBankInternal(category, difficulty, targetSize) {
   const BATCH_SIZE = 8;
   const CONCURRENCY = 1;
+  const TOP_UP_ROUNDS = 3;
   const seen = new Set();
   const all = [];
 
@@ -253,9 +299,10 @@ async function generateBankInternal(category, difficulty, targetSize) {
   const totalBatches = batchCounts.length;
 
   async function runBatch(batchNo, batchCount, tryNo = 1) {
+    if (batchCount <= 0) return [];
     const extraHint = tryNo > 1 ? "⚠️ PREVIOUS ATTEMPT WAS REJECTED." : "";
     const prompt = buildPrompt(category, difficulty, batchCount, batchNo, totalBatches, extraHint);
-    const text = await callGemini(prompt, 60000);
+    const text = await callGemini(prompt, 30000);
     const arr = parseJsonArray(text);
     if (!Array.isArray(arr)) return [];
     const normalized = arr.map(normalizeQuestion).filter(Boolean);
@@ -266,7 +313,7 @@ async function generateBankInternal(category, difficulty, targetSize) {
       seen.add(key);
       return true;
     });
-    if (fresh.length < batchCount && tryNo < 2) {
+    if (fresh.length < batchCount && tryNo < 2 && !isQuotaExhausted()) {
       const more = await runBatch(batchNo, batchCount - fresh.length, 2);
       fresh.push(...more);
     }
@@ -287,13 +334,13 @@ async function generateBankInternal(category, difficulty, targetSize) {
   }
 
   let topUpRounds = 0;
-  while (all.length < targetSize && topUpRounds < 2 && !isQuotaExhausted()) {
+  while (all.length < targetSize && topUpRounds < TOP_UP_ROUNDS && !isQuotaExhausted()) {
     topUpRounds++;
     const missing = targetSize - all.length;
     const hint = "⚠️ These questions MUST be NEW and DIFFERENT.";
     const prompt = buildPrompt(category, difficulty, Math.min(missing, 8), 99, 99, hint);
     try {
-      const text = await callGemini(prompt, 60000);
+      const text = await callGemini(prompt, 30000);
       const arr = parseJsonArray(text);
       if (Array.isArray(arr)) {
         const fresh = arr
@@ -318,9 +365,10 @@ async function generateBankInternal(category, difficulty, targetSize) {
     questions: all,
     stats: {
       requested: targetSize,
-      generated: totalBatches * BATCH_SIZE,
+      generated: batchCounts.reduce((a, b) => a + b, 0),
       valid: all.length,
       duplicates: seen.size - all.length,
+      topUpRounds,
     },
   };
 }
@@ -350,31 +398,23 @@ async function generateQuestions(category, difficulty = "Medium", count = 50, us
 
 // ============================================================
 // RESUME FAST FLOW — resume snippet seedha prompt me
-// (topic-extraction call nahi) — ~60-90 sec response
+// (topic-extraction call nahi)
+// FIX: per-batch retry + top-up + partial preserve
 // ============================================================
-async function generateResumeQuestionsFast(resumeText, count = 30) {
-  if (!resumeText || !String(resumeText).trim()) {
-    throw new Error("Resume text empty hai");
-  }
 
-  const snippet = String(resumeText).slice(0, 4000);
+const RESUME_BATCH_SIZE = 8;
+const RESUME_TOP_UP_ROUNDS = 3;
+const RESUME_TIMEOUT_MS = 45000;
 
-  const BATCH_SIZE = 8;
-  const seen = new Set();
-  const all = [];
-  const totalBatches = Math.ceil(count / BATCH_SIZE);
-
-  for (let b = 1; b <= totalBatches; b++) {
-    if (isQuotaExhausted()) break;
-
-    const prompt = `You are an expert technical interviewer.
+function resumeBatchPrompt(snippet, batchCount, batchNo, totalBatches, extraHint = "") {
+  return `You are an expert technical interviewer.
 This candidate's resume:
 """
 ${snippet}
 """
 
-Generate ${BATCH_SIZE} multiple choice interview questions based on the skills/topics in this resume (batch ${b} of ${totalBatches} — make questions DIFFERENT from other batches).
-
+Generate ${batchCount} multiple choice interview questions based on the skills/topics in this resume (batch ${batchNo} of ${totalBatches} — make questions DIFFERENT from other batches).
+${extraHint}
 🔤 LANGUAGE RULE (STRICT): Every question and option MUST be in BOTH English AND Hindi (Devanagari).
 Fields: question_en, question_hi, text_en, text_hi, explanation_en, explanation_hi. Empty Hindi = INVALID.
 
@@ -400,33 +440,85 @@ JSON FORMAT:
   "difficulty": "Medium"
  }
 ]`;
+}
 
-    try {
-      const text = await callGemini(prompt, 60000);
-      const arr = parseJsonArray(text);
-      if (Array.isArray(arr)) {
-        const fresh = arr
-          .map(normalizeQuestion)
-          .filter(Boolean)
-          .filter(isBilingualQuestion)
-          .filter((q) => {
-            const key = qKey(q);
-            if (!key || seen.has(key)) return false;
-            seen.add(key);
-            return true;
-          });
-        all.push(...fresh);
-        console.log(`📄 [RESUME-FAST] Batch ${b}: +${fresh.length} → ${all.length}`);
+// Ek resume batch ko run + normalize + dedupe karo; empty par ek retry
+async function runResumeBatch(snippet, batchNo, totalBatches, seen, tryNo = 1) {
+  const extraHint =
+    tryNo > 1
+      ? "⚠️ PREVIOUS ATTEMPT WAS EMPTY/INVALID — output MUST be a non-empty valid JSON array."
+      : "";
+  const prompt = resumeBatchPrompt(snippet, RESUME_BATCH_SIZE, batchNo, totalBatches, extraHint);
+
+  try {
+    const text = await callGemini(prompt, RESUME_TIMEOUT_MS);
+    const arr = parseJsonArray(text);
+    if (!Array.isArray(arr)) {
+      if (tryNo < 2 && !isQuotaExhausted()) {
+        console.log(`📄 [RESUME-FAST] Batch ${batchNo} empty/invalid — retry (${tryNo + 1})`);
+        return await runResumeBatch(snippet, batchNo, totalBatches, seen, tryNo + 1);
       }
-    } catch (e) {
-      console.log(`📄 [RESUME-FAST] Batch ${b} fail: ${e.message}`);
-      if (isQuotaExhausted()) break;
+      return [];
     }
+    const fresh = arr
+      .map(normalizeQuestion)
+      .filter(Boolean)
+      .filter(isBilingualQuestion)
+      .filter((q) => {
+        const key = qKey(q);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    return fresh;
+  } catch (e) {
+    console.log(`📄 [RESUME-FAST] Batch ${batchNo} fail: ${e.message}`);
+    if (tryNo < 2 && !isQuotaExhausted()) {
+      return await runResumeBatch(snippet, batchNo, totalBatches, seen, tryNo + 1);
+    }
+    return [];
+  }
+}
 
-    if (b < totalBatches) await sleep(2000);
+async function generateResumeQuestionsFast(resumeText, count = 30) {
+  if (!resumeText || !String(resumeText).trim()) {
+    throw new Error("Resume text empty hai");
+  }
+
+  const snippet = String(resumeText).slice(0, 4000);
+  const seen = new Set();
+  const all = [];
+  const totalBatches = Math.ceil(count / RESUME_BATCH_SIZE);
+
+  for (let b = 1; b <= totalBatches; b++) {
+    if (isQuotaExhausted()) break;
+
+    const fresh = await runResumeBatch(snippet, b, totalBatches, seen);
+    all.push(...fresh);
+    console.log(`📄 [RESUME-FAST] Batch ${b}: +${fresh.length} → ${all.length}`);
+
+    if (b < totalBatches && !isQuotaExhausted()) await sleep(2000);
+  }
+
+  // TOP-UP — partial success preserve karte hue missing fill karo
+  let topUpRounds = 0;
+  while (all.length < count && topUpRounds < RESUME_TOP_UP_ROUNDS && !isQuotaExhausted()) {
+    topUpRounds++;
+    const missing = count - all.length;
+    const fresh = await runResumeBatch(
+      snippet,
+      99 + topUpRounds,
+      99 + topUpRounds,
+      seen,
+      2
+    );
+    all.push(...fresh.slice(0, missing));
+    console.log(`📄 [RESUME-FAST] Top-up ${topUpRounds}: → ${all.length}`);
+    if (!isQuotaExhausted()) await sleep(2000);
   }
 
   if (!all.length) {
+    // REAL unrecoverable failure — abhi bhi throw, message shape same
     throw new Error("AI se questions nahi bane (quota/model issue) — 2 min baad try karo");
   }
   return all.slice(0, count);
@@ -493,7 +585,7 @@ Rules:
 Return valid JSON array with fields: question_en, question_hi, options[{text_en,text_hi,explanation_en,explanation_hi}], correctAnswer, type, topic, difficulty.`;
 
     try {
-      const text = await callGemini(prompt, 60000);
+      const text = await callGemini(prompt, 30000);
       const arr = parseJsonArray(text);
       if (Array.isArray(arr)) {
         const fresh = arr

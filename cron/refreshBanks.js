@@ -1,8 +1,21 @@
 // ============================================================
 // cron/refreshBanks.js
-// Daily 3 AM IST bank refresh — per-bank isolation, atomic
-// $push save (no lost updates), partial success, resume,
-// detailed run summary.
+// Daily 3 AM IST bank refresh — PRIORITY-ORDERED:
+//   1) missing banks (auto-create)  2) 0-question banks
+//   3) low-question banks           4) normal banks
+// Per-bank isolation, atomic $push save (no lost updates),
+// partial success, resume, detailed run summary.
+//
+// FIXES (is version mein):
+//  - buildPriorityBanks(): MongoDB question-count ke against sab banks
+//    ascending priority mein sort — missing/0 banks PEHLE process hote hain
+//  - ADD_PER_RUN ab CALL-TIME par read hota hai — --test override ab kaam karta hai
+//  - SKIP_TODAY_DONE ab minimum-question threshold check karta hai
+//    (env MIN_SKIP_QUESTIONS, default 25) — 0/low banks aaj skip NAHI honge
+//  - findOneAndUpdate returnDocument: "after" (modern Mongoose)
+//  - Quota genuinely exhausted → run safely stop, fake success nahi
+//  - Ek bank fail → remaining banks process hote rahenge
+//  - Schedule preserved: 0 3 * * * Asia/Kolkata
 // ============================================================
 
 require("dotenv").config();
@@ -53,14 +66,25 @@ const CLASS_CATEGORIES = [
 const ALL_CATEGORIES = [...new Set([...CATEGORIES, ...CLASS_CATEGORIES])];
 const DIFFICULTIES = ["Easy", "Medium", "Hard"];
 
-const ADD_PER_RUN = parseInt(process.env.ADD_PER_RUN || "50", 10);
-const GAP_MS = parseInt(process.env.GAP_MS || "30000", 10);
+const GAP_MS = parseInt(process.env.GAP_MS || "20000", 10);
 const CRON_SCHEDULE = process.env.CRON_SCHEDULE || "0 3 * * *";
 const CRON_TZ = process.env.CRON_TZ || "Asia/Kolkata";
 
 // resume support: agar bank aaj already successfully refresh ho chuka
 // hai to next run me skip karo (quota/restart ke baad useful)
 const SKIP_TODAY_DONE = process.env.SKIP_TODAY_DONE !== "false";
+
+// Skip threshold: bank aaj skip tabhi hoga jab itne ya zyada questions hon
+const MIN_SKIP_QUESTIONS = () => {
+  const t = parseInt(process.env.MIN_SKIP_QUESTIONS || "25", 10);
+  return Number.isFinite(t) && t >= 0 ? t : 25;
+};
+
+// Call-time read — --test mode ka override ab kaam karta hai
+function addPerRun() {
+  const t = parseInt(process.env.ADD_PER_RUN || "50", 10);
+  return Number.isFinite(t) && t > 0 ? t : 50;
+}
 
 let running = false;
 
@@ -84,19 +108,72 @@ function isSameISTDay(date) {
 }
 
 // =====================================================
+// PRIORITY LIST — missing/0 banks sabse pehle
+// =====================================================
+
+async function buildPriorityBanks() {
+  const requested = addPerRun();
+
+  const banks = await QuestionBank.find({}, { category: 1, difficulty: 1, questions: 1, lastRefreshAt: 1 });
+  const countMap = new Map();
+  for (const b of banks) {
+    countMap.set(`${b.category}|${b.difficulty}`, {
+      count: Array.isArray(b.questions) ? b.questions.length : 0,
+      lastRefreshAt: b.lastRefreshAt || null,
+    });
+  }
+
+  const entries = [];
+  for (const category of ALL_CATEGORIES) {
+    for (const difficulty of DIFFICULTIES) {
+      const info = countMap.get(`${category}|${difficulty}`);
+      entries.push({
+        category,
+        difficulty,
+        // missing bank = -1 (sabse pehle), phir 0, phir ascending count
+        effectiveCount: info ? info.count : -1,
+        lastRefreshAt: info ? info.lastRefreshAt : null,
+      });
+    }
+  }
+
+  // ascending effectiveCount — missing(-1) → 0 → low → populated
+  entries.sort((a, b) => a.effectiveCount - b.effectiveCount);
+
+  console.log("");
+  console.log("📊 PRIORITY QUEUE (missing/low banks first):");
+  const missing = entries.filter((e) => e.effectiveCount === -1);
+  const zero = entries.filter((e) => e.effectiveCount === 0);
+  const low = entries.filter((e) => e.effectiveCount > 0 && e.effectiveCount < requested);
+  console.log(`   🆕 Missing banks (auto-create): ${missing.length}`);
+  if (missing.length) {
+    missing.slice(0, 10).forEach((e) => console.log(`      - ${e.category} | ${e.difficulty}`));
+    if (missing.length > 10) console.log(`      ... aur ${missing.length - 10}`);
+  }
+  console.log(`   🕳️ Zero-question banks: ${zero.length}`);
+  console.log(`   📉 Low-question banks (<${requested}): ${low.length}`);
+  console.log("");
+
+  return entries;
+}
+
+// =====================================================
 // ADD QUESTIONS (per-bank, fail-safe)
 // =====================================================
 
 async function addQuestions(category, difficulty) {
+  const requested = addPerRun();
+
   const result = {
     category,
     difficulty,
-    requested: ADD_PER_RUN,
+    requested,
     generated: 0,
     valid: 0,
     duplicates: 0,
     saved: 0,
     failed: false,
+    skipped: false,
     error: null,
   };
 
@@ -109,8 +186,15 @@ async function addQuestions(category, difficulty) {
     const bank = await QuestionBank.findOne({ category, difficulty });
     const oldQuestions = bank?.questions || [];
 
-    // Resume support: aaj already successful refresh ho gaya to skip
-    if (SKIP_TODAY_DONE && bank?.lastRefreshAt && isSameISTDay(bank.lastRefreshAt)) {
+    // Resume support: aaj already successful refresh ho gaya to skip.
+    // FIX: skip tabhi jab bank me kaafi questions hon (MIN_SKIP_QUESTIONS).
+    // Missing / 0 / low-question banks kabhi aaj-skip nahi honge.
+    if (
+      SKIP_TODAY_DONE &&
+      bank?.lastRefreshAt &&
+      isSameISTDay(bank.lastRefreshAt) &&
+      oldQuestions.length >= MIN_SKIP_QUESTIONS()
+    ) {
       console.log(`⏭️ Aaj already refreshed (${oldQuestions.length} questions) — skip`);
       result.skipped = true;
       result.saved = 0;
@@ -118,11 +202,11 @@ async function addQuestions(category, difficulty) {
     }
 
     console.log(`📦 Existing questions: ${oldQuestions.length}`);
-    console.log(`🌱 Generating up to ${ADD_PER_RUN} new questions...`);
+    console.log(`🌱 Generating up to ${requested} new questions...`);
 
     let fresh = [];
     try {
-      fresh = await withGenLock(() => generateBank(category, difficulty, ADD_PER_RUN));
+      fresh = await withGenLock(() => generateBank(category, difficulty, requested));
     } catch (error) {
       console.log(`❌ Generation failed: ${error.message}`);
       result.failed = true;
@@ -160,20 +244,40 @@ async function addQuestions(category, difficulty) {
       return result;
     }
 
-    // ✅ ATOMIC SAVE — $push $each: purane questions kabhi overwrite/delete nahi honge
-    // NOTE: agar doc 16MB limit ke paas ho to $push fail karega — catch niche handle karta hai
-    const updated = await QuestionBank.findOneAndUpdate(
-      { category, difficulty },
-      {
-        $push: { questions: { $each: uniqueFresh } },
-        $set: { updatedAt: new Date(), lastRefreshAt: new Date() },
-      },
-      { upsert: true, new: true }
-    );
+    // ✅ ATOMIC SAVE — $push $each: purane questions kabhi overwrite/delete nahi honge.
+    // Missing bank ka doc upsert se AUTOMATICALLY create ho jayega.
+    // returnDocument: "after" — modern Mongoose/driver option.
+    let updated = null;
+    try {
+      updated = await QuestionBank.findOneAndUpdate(
+        { category, difficulty },
+        {
+          $push: { questions: { $each: uniqueFresh } },
+          $set: { updatedAt: new Date(), lastRefreshAt: new Date() },
+        },
+        { upsert: true, returnDocument: "after" }
+      );
+    } catch (saveErr) {
+      // 16MB limit / driver fallback — ek baar purane option se retry (safe)
+      if (saveErr?.message?.includes("16MB") || saveErr?.code === 10334) {
+        console.log(`❌ Bank 16MB limit ke paas hai — $push fail: ${saveErr.message}`);
+        result.failed = true;
+        result.error = "16MB limit: bank too large to $push";
+        return result;
+      }
+      updated = await QuestionBank.findOneAndUpdate(
+        { category, difficulty },
+        {
+          $push: { questions: { $each: uniqueFresh } },
+          $set: { updatedAt: new Date(), lastRefreshAt: new Date() },
+        },
+        { upsert: true, new: true }
+      );
+    }
 
     result.saved = uniqueFresh.length;
 
-    console.log(`✅ SAVED: ${category} | ${difficulty} → ${updated.questions.length} total`);
+    console.log(`✅ SAVED: ${category} | ${difficulty} → ${updated?.questions?.length ?? "?"} total`);
     return result;
   } catch (error) {
     console.log(`❌ Bank error (${category} | ${difficulty}):`, error.message);
@@ -184,7 +288,7 @@ async function addQuestions(category, difficulty) {
 }
 
 // =====================================================
-// REFRESH ALL BANKS
+// REFRESH ALL BANKS — priority-ordered
 // =====================================================
 
 async function refreshAllBanks() {
@@ -197,35 +301,48 @@ async function refreshAllBanks() {
 
   const results = [];
   let quotaStopped = false;
+  let totalBanks = ALL_CATEGORIES.length * DIFFICULTIES.length;
 
   console.log("");
   console.log("==============================================");
-  console.log("🌙 BANK REFRESH STARTED");
+  console.log("🌙 BANK REFRESH STARTED (priority mode)");
   console.log("==============================================");
   console.log(`📚 Categories: ${ALL_CATEGORIES.length}`);
   console.log(`🎯 Difficulties: ${DIFFICULTIES.join(", ")}`);
-  console.log(`🎯 Total banks: ${ALL_CATEGORIES.length * DIFFICULTIES.length}`);
-  console.log(`🌱 Questions per bank/run: ${ADD_PER_RUN}`);
+  console.log(`🎯 Total banks: ${totalBanks}`);
+  console.log(`🌱 Questions per bank/run: ${addPerRun()}`);
   console.log("==============================================");
 
   try {
-    outer: for (const category of ALL_CATEGORIES) {
-      for (const difficulty of DIFFICULTIES) {
-        // Quota khatam → run safely stop, jo bana use save karte raho
-        if (isQuotaExhausted()) {
-          console.log("🚫 Gemini quota exhausted — run safely stop kar rahe hain");
-          console.log("➡️ Next scheduled run me resume hoga (already-done banks skip honge)");
-          quotaStopped = true;
-          break outer;
+    // Priority list banavo — missing/0 banks first
+    let queue;
+    try {
+      queue = await buildPriorityBanks();
+    } catch (pErr) {
+      console.log(`⚠️ Priority build fail (${pErr.message}) — normal order use kar rahe hain`);
+      queue = [];
+      for (const category of ALL_CATEGORIES) {
+        for (const difficulty of DIFFICULTIES) {
+          queue.push({ category, difficulty, effectiveCount: 0, lastRefreshAt: null });
         }
-
-        // Har bank independent — fail hone par loop kabhi terminate nahi hota
-        const res = await addQuestions(category, difficulty);
-        results.push(res);
-
-        console.log(`⏳ Waiting ${GAP_MS / 1000}s...`);
-        await sleep(GAP_MS);
       }
+    }
+
+    for (const entry of queue) {
+      // Quota khatam → run safely stop, fake success nahi
+      if (isQuotaExhausted()) {
+        console.log("🚫 Gemini quota exhausted — run safely stop kar rahe hain");
+        console.log("➡️ Next scheduled run me resume hoga (priority queue phir banegi)");
+        quotaStopped = true;
+        break;
+      }
+
+      // Har bank independent — fail hone par loop kabhi terminate nahi hota
+      const res = await addQuestions(entry.category, entry.difficulty);
+      results.push(res);
+
+      console.log(`⏳ Waiting ${GAP_MS / 1000}s...`);
+      await sleep(GAP_MS);
     }
 
     // Purane seen records cleanup
@@ -241,7 +358,7 @@ async function refreshAllBanks() {
     console.log("❌ CRON REFRESH ERROR:", error.message);
   } finally {
     running = false;
-    printSummary(results, quotaStopped);
+    printSummary(results, quotaStopped, totalBanks);
   }
 
   return { results, quotaStopped };
@@ -251,29 +368,30 @@ async function refreshAllBanks() {
 // RUN SUMMARY
 // =====================================================
 
-function printSummary(results, quotaStopped) {
+function printSummary(results, quotaStopped, totalBanks) {
+  if (!Number.isFinite(totalBanks)) totalBanks = ALL_CATEGORIES.length * DIFFICULTIES.length;
+
   const ok = results.filter((r) => !r.failed && !r.skipped);
   const skipped = results.filter((r) => r.skipped);
-  const partial = results.filter((r) => !r.failed && !r.skipped && r.saved > 0 && r.saved < r.requested);
+  const partial = ok.filter((r) => r.saved > 0 && r.saved < r.requested);
   const failed = results.filter((r) => r.failed);
 
-  const totalRequested = results.length * ADD_PER_RUN;
   const totalValid = results.reduce((a, r) => a + (r.valid || 0), 0);
   const totalSaved = results.reduce((a, r) => a + (r.saved || 0), 0);
   const totalDupes = results.reduce((a, r) => a + (r.duplicates || 0), 0);
 
-  const byDiff = (d) => results.filter((r) => r.difficulty === d && !r.failed && !r.skipped).length;
+  const byDiff = (d) =>
+    new Set(results.filter((r) => r.difficulty === d && !r.failed && !r.skipped).map((r) => r.category)).size;
 
   console.log("");
   console.log("========== BANK REFRESH SUMMARY ==========");
   console.log("");
-  console.log(`Total Banks Processed: ${results.length}`);
+  console.log(`Total Banks Processed: ${results.length}/${totalBanks}`);
   console.log(`Successful Banks: ${ok.length - partial.length}`);
   console.log(`Partial Banks: ${partial.length}`);
   console.log(`Skipped (already done today): ${skipped.length}`);
   console.log(`Failed Banks: ${failed.length}`);
   console.log("");
-  console.log(`Questions Requested: ${totalRequested}`);
   console.log(`Questions Accepted (unique/valid): ${totalValid}`);
   console.log(`Duplicates Removed: ${totalDupes}`);
   console.log(`Questions Saved: ${totalSaved}`);
@@ -291,8 +409,8 @@ function printSummary(results, quotaStopped) {
 
   if (quotaStopped) {
     console.log("STOPPED DUE TO GEMINI QUOTA");
-    console.log(`Completed: ${results.length}/${ALL_CATEGORIES.length * DIFFICULTIES.length}`);
-    console.log(`Remaining: ${ALL_CATEGORIES.length * DIFFICULTIES.length - results.length}`);
+    console.log(`Completed: ${results.length}/${totalBanks}`);
+    console.log(`Remaining: ${totalBanks - results.length} (priority queue in next run)`);
     console.log("");
   }
 
@@ -319,7 +437,7 @@ function startBankRefreshCron() {
 
 // =====================================================
 // MANUAL TEST MODE
-// node cron/refreshBanks.js              → full refresh
+// node cron/refreshBanks.js              → full refresh (priority)
 // node cron/refreshBanks.js --test       → 1 category, 1 difficulty, 8 questions
 // node cron/refreshBanks.js --test "SSC" "Hard" 10
 // =====================================================
@@ -338,12 +456,21 @@ if (require.main === module) {
 
         console.log(`🧪 TEST MODE: ${category} | ${difficulty} | ${count} questions`);
 
+        // Call-time read hone ki wajah se ye override ab SACH ME kaam karta hai
         const origAdd = process.env.ADD_PER_RUN;
         process.env.ADD_PER_RUN = String(count);
         const res = await addQuestions(category, difficulty);
         if (origAdd === undefined) delete process.env.ADD_PER_RUN;
 
         console.log("RESULT:", JSON.stringify(res, null, 2));
+
+        // Verify: bank exist karta hai?
+        const verify = await QuestionBank.findOne({ category, difficulty });
+        if (verify) {
+          console.log(`✅ VERIFY: ${category} | ${difficulty} → ${verify.questions.length} questions in DB`);
+        } else {
+          console.log(`❌ VERIFY FAIL: bank ab bhi DB me nahi hai`);
+        }
       } else {
         await refreshAllBanks();
       }
@@ -357,4 +484,4 @@ if (require.main === module) {
   })();
 }
 
-module.exports = { startBankRefreshCron, refreshAllBanks, addQuestions };
+module.exports = { startBankRefreshCron, refreshAllBanks, addQuestions, buildPriorityBanks };
