@@ -44,6 +44,7 @@ const uploadRoutes = require("./routes/upload");
 const connectDB = require("./config/db");
 const bulkUploader = require("./utils/bulkUploader");
 const classExamRoutes = require("./routes/classExam");
+const pptRoutes = require("./routes/ppt");
 
 
 // Existing routes
@@ -141,6 +142,7 @@ app.use("/api/resume", resumeRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/image-editor", imageEditorRoutes);
 app.use("/api/question-banks", questionBankRoutes);
+app.use("/api/ppt", pptRoutes);
 app.get("/api/ai-status", (req, res) => res.json(keyManager.stats()));
 app.use("/api/question-banks", questionBankRoutes);
 app.use("/api/bank-status", questionBankRoutes);
