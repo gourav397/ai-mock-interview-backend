@@ -17,7 +17,7 @@ const path = require("path");
 const rateLimit = require("express-rate-limit");
 
 // ⚠️ Ye line apne existing middleware export style ke hisab se verify karo
-const { protect } = require("../middleware/auth");
+const protect = require("../middleware/auth");
 
 const PPTGeneration = require("../models/PPTGeneration");
 const {
