@@ -37,6 +37,8 @@ const TRANSITION_MODES = ["Off", "Subtle", "Dynamic"];
 const ANIMATION_MODES = ["Off", "Subtle", "Professional"];
 const CHART_MODES = ["Auto", "Off"];
 const NARRATION_MODES = ["Off", "On"];
+const AUTO_ADVANCE_MIN_MS = 4500;
+const AUTO_ADVANCE_MAX_MS = 11000;
 
 const KNOWN_LAYOUTS = [
   "title", "section", "bullets", "twoColumn", "threeCards", "fourCards",
@@ -540,22 +542,48 @@ function addSoftShadow(slide, x, y, w, h, theme, radius = 0.16) {
 }
 
 function addCard(slide, x, y, w, h, theme, opts = {}) {
-  addSoftShadow(slide, x, y, w, h, theme);
+  const depth = opts.depth !== false;
+  if (depth) {
+    // Layered offset = reliable 3D-style depth in native PowerPoint shapes.
+    shape(slide, "roundRect", {
+      x: x + 0.055, y: y + 0.075, w, h, rectRadius: 0.16,
+      fill: { color: theme.dark ? "020617" : "CBD5E1", transparency: theme.dark ? 35 : 58 },
+      line: { color: theme.dark ? "020617" : "CBD5E1", transparency: 100 },
+    });
+    shape(slide, "roundRect", {
+      x: x + 0.025, y: y + 0.035, w, h, rectRadius: 0.16,
+      fill: { color: theme.dark ? theme.primary : theme.panelBorder, transparency: theme.dark ? 82 : 72 },
+      line: { color: theme.dark ? theme.primary : theme.panelBorder, transparency: 100 },
+    });
+  }
   shape(slide, "roundRect", {
     x, y, w, h,
     rectRadius: 0.16,
     fill: { color: opts.fill || theme.panel, transparency: opts.transparency || 0 },
     line: { color: opts.line || theme.panelBorder, width: opts.lineWidth || 0.7, transparency: opts.lineTransparency ?? 20 },
   });
+  // Tiny highlight gives cards a polished/glass-like edge without rasterizing the slide.
+  if (opts.highlight !== false) {
+    shape(slide, "roundRect", {
+      x: x + 0.08, y: y + 0.07, w: Math.max(0.2, w - 0.16), h: 0.025, rectRadius: 0.01,
+      fill: { color: theme.dark ? "FFFFFF" : theme.primary, transparency: theme.dark ? 84 : 92 },
+      line: { color: theme.dark ? "FFFFFF" : theme.primary, transparency: 100 },
+    });
+  }
 }
 
 function addBackground(slide, theme, index, total) {
   slide.background = { color: theme.bg };
-  // Subtle brand geometry; intentionally restrained.
-  shape(slide, "ellipse", { x: 11.35, y: -0.65, w: 2.45, h: 2.45, fill: { color: theme.primary, transparency: theme.dark ? 80 : 92 }, line: { color: theme.primary, transparency: 100 } });
-  shape(slide, "ellipse", { x: -0.75, y: 6.45, w: 1.9, h: 1.9, fill: { color: theme.secondary, transparency: theme.dark ? 88 : 94 }, line: { color: theme.secondary, transparency: 100 } });
+  // Layered ambient geometry creates depth while remaining native/editable.
+  shape(slide, "ellipse", { x: 10.75, y: -0.95, w: 3.45, h: 3.45, fill: { color: theme.primary, transparency: theme.dark ? 84 : 94 }, line: { color: theme.primary, transparency: 100 } });
+  shape(slide, "ellipse", { x: 11.35, y: -0.35, w: 2.25, h: 2.25, fill: { color: theme.secondary, transparency: theme.dark ? 78 : 92 }, line: { color: theme.secondary, transparency: 100 } });
+  shape(slide, "ellipse", { x: -0.9, y: 6.15, w: 2.55, h: 2.55, fill: { color: theme.secondary, transparency: theme.dark ? 88 : 95 }, line: { color: theme.secondary, transparency: 100 } });
+  if (theme.dark) {
+    shape(slide, "rect", { x: 0, y: 0, w: 13.333, h: 0.035, fill: { color: theme.accent }, line: { color: theme.accent, transparency: 100 } });
+    shape(slide, "rect", { x: 0.62, y: 1.15, w: 2.8, h: 0.02, fill: { color: theme.primary, transparency: 45 }, line: { color: theme.primary, transparency: 100 } });
+  }
   if (index > 0 && index < total - 1) {
-    shape(slide, "rect", { x: 0, y: 0, w: 0.07, h: 7.5, fill: { color: theme.primary }, line: { color: theme.primary, transparency: 100 } });
+    shape(slide, "rect", { x: 0, y: 0, w: 0.045, h: 7.5, fill: { color: theme.primary }, line: { color: theme.primary, transparency: 100 } });
   }
 }
 
@@ -1005,13 +1033,34 @@ async function buildPPTX(content, cfg) {
 }
 
 // ============================================================
+// MOTION / AUTO-ADVANCE
+// ============================================================
+
+function getSlideAdvanceMs(data, cfg, index, total) {
+  if (!cfg || cfg.animations === "Off" || cfg.transitions === "Off") return 0;
+  if (index === 0) return cfg.animations === "Professional" ? 6500 : 5500;
+  if (index === total - 1) return cfg.animations === "Professional" ? 8000 : 6500;
+
+  const textLength = [data?.title, ...(data?.content || [])].join(" ").length;
+  const hasChart = !!extractChartData(data);
+  const hasImage = !!data?.imagePrompt;
+  let ms = 5000 + Math.min(3200, Math.round(textLength * 18));
+  if (hasChart) ms += 1800;
+  if (hasImage) ms += 900;
+  if (cfg.animations === "Professional") ms += 800;
+  return Math.max(AUTO_ADVANCE_MIN_MS, Math.min(AUTO_ADVANCE_MAX_MS, ms));
+}
+
+// ============================================================
 // OOXML TRANSITIONS / OPTIONAL ANIMATION
 // ============================================================
 
-function transitionXML(mode, index) {
+function transitionXML(mode, index, advanceMs = 0) {
   if (mode === "Off") return "";
-  if (mode === "Dynamic" && index % 2 === 0) return '<p:transition spd="med"><p:push dir="l"/></p:transition>';
-  return '<p:transition spd="med"><p:fade/></p:transition>';
+  const advance = Number.isFinite(advanceMs) && advanceMs > 0 ? ` advClick="0" advTm="${Math.round(advanceMs)}"` : "";
+  if (mode === "Dynamic" && index % 3 === 1) return `<p:transition spd="med"${advance}><p:push dir="l"/></p:transition>`;
+  if (mode === "Dynamic" && index % 3 === 2) return `<p:transition spd="med"${advance}><p:wipe dir="r"/></p:transition>`;
+  return `<p:transition spd="med"${advance}><p:fade/></p:transition>`;
 }
 
 function isSlideXmlSane(xml) {
@@ -1029,7 +1078,9 @@ async function postProcessPPTX(filePath, options) {
     const name = slideFiles[i];
     let xml = await zip.file(name).async("string");
     if (xml.includes("<p:transition")) continue;
-    const transition = transitionXML(options.transitions, i);
+    const slideData = options.content?.slides?.[i];
+    const advanceMs = getSlideAdvanceMs(slideData, options, i, slideFiles.length);
+    const transition = transitionXML(options.transitions, i, advanceMs);
     const clr = "</p:clrMapOvr>";
     const end = "</p:sld>";
     let candidate = xml;
@@ -1131,7 +1182,7 @@ async function generatePPT(opts, userId) {
   await presentation.writeFile({ fileName: filePath });
 
   // Transitions are optional and isolated. A failure never destroys a valid PPT.
-  try { await postProcessPPTX(filePath, clean); } catch (error) { console.warn("[PPT] transition post-process skipped:", error.message); }
+  try { await postProcessPPTX(filePath, { ...clean, content }); } catch (error) { console.warn("[PPT] transition/motion post-process skipped:", error.message); }
 
   let issues = await validateOutput(filePath, content);
   const fatal = issues.some((x) => x === "file-missing" || x.startsWith("zip-invalid") || x.startsWith("blank-slide") || x.startsWith("content-missing") || x.startsWith("slide-xml-invalid"));
@@ -1158,6 +1209,7 @@ async function generatePPT(opts, userId) {
       imagePrompt: clean.addImages ? slide.imagePrompt : "",
       hasChart: clean.charts === "Auto" && !!extractChartData(slide),
       narrationScript: clean.narration ? slide.narrationScript : "",
+      autoAdvanceMs: getSlideAdvanceMs(slide, clean, slide.slideNumber - 1, content.slides.length),
     })),
   };
 
