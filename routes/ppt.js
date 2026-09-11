@@ -1,14 +1,6 @@
 // ============================================================
-// routes/ppt.js — PRO AI PPT Generator API (upgraded)
-//
-// CHANGES (upgrade):
-//  - /generate: naye optional options accept karta hai (layoutStyle,
-//    transitions, animations, charts, narration) — backward compatible,
-//    response me PREVIEW data + narration scripts add (purane fields
-//    preserved: success/message/file/downloadUrl/slideCount)
-//  - /my, /download/:fileName — behavior unchanged
-// ⚠️ VERIFY FLAG: `protect` import existing middleware export style
-// se match karna (routes/resume.js dekho).
+// routes/ppt.js — PREMIUM PPT API
+// Existing API contract preserved.
 // ============================================================
 
 const express = require("express");
@@ -16,41 +8,33 @@ const fs = require("fs");
 const path = require("path");
 const rateLimit = require("express-rate-limit");
 
-// ⚠️ Ye line apne existing middleware export style ke hisab se verify karo
+// Your current middleware exports the auth function directly.
 const protect = require("../middleware/auth");
 
 const PPTGeneration = require("../models/PPTGeneration");
-const {
-  generatePPT,
-  isSafeFileName,
-  PPT_DIR,
-} = require("../services/pptGenerator");
+const { generatePPT, isSafeFileName, PPT_DIR } = require("../services/pptGenerator");
 
 const router = express.Router();
 
-// Abuse protection — max 10 PPT per 10 min per user (unchanged)
 const pptLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 10,
   standardHeaders: true,
-  message: { success: false, message: "Too many PPT requests — 10 min baad try karo." },
+  message: {
+    success: false,
+    message: "Too many PPT requests — 10 min baad try karo.",
+  },
 });
 
-// ----------------------------------------------------------
 // POST /api/ppt/generate
-// Purane fields + naye optional fields dono accept hote hain
-// ----------------------------------------------------------
 router.post("/generate", pptLimiter, protect, async (req, res) => {
   try {
     const userId = req.user?._id || req.user?.id;
-    if (!userId) {
-      return res.status(401).json({ success: false, message: "Unauthorized" });
-    }
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized" });
 
     const body = req.body || {};
     const result = await generatePPT(body, String(userId));
 
-    // History save — fail hoga to bhi PPT user ko mil jayega
     try {
       await PPTGeneration.create({
         userId,
@@ -59,9 +43,8 @@ router.post("/generate", pptLimiter, protect, async (req, res) => {
         language: String(body.language || "English"),
         type: String(body.type || "General"),
         theme: String(body.theme || "Modern"),
-        addImages: !!body.addImages,
+        addImages: body.addImages === true || body.addImages === "true" || body.addImages === 1,
         fileName: result.fileName,
-        // naye optional fields (schema me optional — purane docs safe)
         layoutStyle: result.cfg.layoutStyle,
         transitions: result.cfg.transitions,
         animations: result.cfg.animations,
@@ -72,13 +55,11 @@ router.post("/generate", pptLimiter, protect, async (req, res) => {
     }
 
     return res.json({
-      // ---- PURANA CONTRACT (unchanged) ----
       success: true,
       message: "PPT generated successfully",
       file: result.fileName,
       downloadUrl: `/api/ppt/download/${result.fileName}`,
       slideCount: result.slideCount,
-      // ---- NAYA (upgrade) ----
       preview: result.preview,
       narrationScripts: result.cfg.narration
         ? result.content.slides.map((s) => ({
@@ -93,16 +74,14 @@ router.post("/generate", pptLimiter, protect, async (req, res) => {
     const friendly =
       status === 400
         ? error.message
-        : error.message?.includes("quota") || error.message?.includes("AI se")
+        : error.message?.toLowerCase().includes("quota") || error.message?.includes("AI se")
         ? error.message
         : "PPT generate nahi ho paya — thodi der baad try karo.";
     return res.status(status).json({ success: false, message: friendly });
   }
 });
 
-// ----------------------------------------------------------
-// GET /api/ppt/my — user ki history (UNCHANGED behavior)
-// ----------------------------------------------------------
+// GET /api/ppt/my
 router.get("/my", protect, async (req, res) => {
   try {
     const userId = req.user?._id || req.user?.id;
@@ -110,6 +89,7 @@ router.get("/my", protect, async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(30)
       .lean();
+
     return res.json({
       success: true,
       items: items.map((it) => ({
@@ -129,32 +109,23 @@ router.get("/my", protect, async (req, res) => {
   }
 });
 
-// ----------------------------------------------------------
-// GET /api/ppt/download/:fileName — ownership + traversal safe
-// (UNCHANGED behavior)
-// ----------------------------------------------------------
+// GET /api/ppt/download/:fileName
 router.get("/download/:fileName", protect, async (req, res) => {
   try {
     const { fileName } = req.params;
-    if (!isSafeFileName(fileName)) {
-      return res.status(400).json({ success: false, message: "Invalid file name" });
-    }
+    if (!isSafeFileName(fileName)) return res.status(400).json({ success: false, message: "Invalid file name" });
+
     const userId = req.user?._id || req.user?.id;
     const record = await PPTGeneration.findOne({ fileName, userId });
-    if (!record) {
-      return res.status(403).json({ success: false, message: "Ye file tumhari nahi hai" });
-    }
+    if (!record) return res.status(403).json({ success: false, message: "Ye file tumhari nahi hai" });
+
     const filePath = path.join(PPT_DIR, fileName);
     if (!fs.existsSync(filePath)) {
-      return res.status(410).json({
-        success: false,
-        message: "File expire ho gayi — PPT dobara generate karo",
-      });
+      return res.status(410).json({ success: false, message: "File expire ho gayi — PPT dobara generate karo" });
     }
+
     return res.download(filePath, fileName, (err) => {
-      if (err && !res.headersSent) {
-        return res.status(500).json({ success: false, message: "Download fail hua" });
-      }
+      if (err && !res.headersSent) return res.status(500).json({ success: false, message: "Download fail hua" });
     });
   } catch (error) {
     console.error("📊 [PPT] download error:", error.message);
