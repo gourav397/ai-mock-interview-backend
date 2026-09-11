@@ -1,8 +1,8 @@
 // ============================================================
-// models/PPTGeneration.js — AI PPT Generator history
-// Small history model: kaun si PPT kabhi banayi + ownership
-// (download endpoint ownership verify isse karta hai).
-// NOTE: 30-day TTL index — history bhi auto-cleanup hoti hai.
+// models/PPTGeneration.js — AI PPT Generator history (upgraded)
+// CHANGES: naye optional fields (layoutStyle/transitions/animations/
+// narration) — PURANE DOCUMENTS BINA MIGRATION SAFE (sab optional).
+// 30-day TTL preserved.
 // ============================================================
 
 const mongoose = require("mongoose");
@@ -21,6 +21,11 @@ const PPTGenerationSchema = new mongoose.Schema({
   theme: { type: String, default: "Modern" },
   addImages: { type: Boolean, default: false },
   fileName: { type: String, required: true, unique: true },
+  // 🆕 upgrade fields — optional, purane docs safe
+  layoutStyle: { type: String, default: "AI Auto" },
+  transitions: { type: String, default: "Subtle" },
+  animations: { type: String, default: "Subtle" },
+  narration: { type: Boolean, default: false },
   createdAt: {
     type: Date,
     default: Date.now,
