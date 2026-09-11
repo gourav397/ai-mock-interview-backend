@@ -25,7 +25,7 @@ const MAX_TOPIC_LEN = 300;
 const CHUNK_SIZE = 7;
 const CONTENT_MAX_BULLETS = 6;
 const BULLET_MAX_LEN = 160;
-const IMAGE_TIMEOUT_MS = 10000;
+const IMAGE_TIMEOUT_MS = 7000;
 const IMAGE_MAX_BYTES = 8 * 1024 * 1024;
 const DEVANAGARI_FONT = "Nirmala UI";
 
@@ -419,11 +419,15 @@ async function generatePPTContent(cfg) {
   let mainTitle = cfg.topic;
   let subtitle = "";
 
-  for (let i = 0; i < chunks.length; i++) {
-    const part = chunks[i];
-    const result = await callAIChunk(cfg, part.start, part.count, mainTitle, i + 1, chunks.length);
+  // Bounded parallel generation: 2 Gemini requests at a time.
+  // This keeps 15-20 slide decks fast without creating a large quota spike.
+  const chunkResults = await mapWithConcurrency(chunks, 2, async (part, idx) =>
+    callAIChunk(cfg, part.start, part.count, mainTitle, idx + 1, chunks.length)
+  );
+
+  for (const result of chunkResults) {
     if (result) {
-      if (result.title) mainTitle = result.title;
+      if (result.title && mainTitle === cfg.topic) mainTitle = result.title;
       if (result.subtitle && !subtitle) subtitle = result.subtitle;
       slides.push(...result.slides);
     }
@@ -505,7 +509,8 @@ async function mapWithConcurrency(items, limit, worker) {
 async function prepareImages(content, cfg) {
   const imageSlides = content.slides.map((slide, index) => ({ slide, index }))
     .filter(({ slide }) => cfg.addImages && ["imageText", "textImage", "fullImage"].includes(slide.layout) && slide.imagePrompt);
-  const buffers = await mapWithConcurrency(imageSlides, 3, async ({ slide, index }) => {
+  // Images are independent; 5 concurrent downloads keeps image-enabled decks fast.
+  const buffers = await mapWithConcurrency(imageSlides, 5, async ({ slide, index }) => {
     const buffer = await fetchSlideImage(slide.imagePrompt);
     if (!buffer) console.warn(`[PPT] image fallback on slide ${slide.slideNumber}`);
     return { index, buffer };
