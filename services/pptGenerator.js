@@ -158,8 +158,8 @@ function validatePPTOptions(opts = {}) {
       addImages: parseBool(opts.addImages),
       speakerNotes: opts.speakerNotes !== false,
       layoutStyle: pick(opts.layoutStyle, LAYOUT_STYLES, "AI Auto"),
-      transitions: pick(opts.transitions, TRANSITION_MODES, "Subtle"),
-      animations: pick(opts.animations, ANIMATION_MODES, "Off"),
+      transitions: pick(opts.transitions, TRANSITION_MODES, "Dynamic"),
+      animations: pick(opts.animations, ANIMATION_MODES, "Professional"),
       charts: pick(opts.charts, CHART_MODES, "Auto"),
       narration: parseBool(opts.narration),
     },
@@ -1062,45 +1062,180 @@ function getSlideAdvanceMs(data, cfg, index, total) {
 
 function transitionXML(mode, index, advanceMs = 0) {
   if (mode === "Off") return "";
-  const advance = Number.isFinite(advanceMs) && advanceMs > 0 ? ` advClick="0" advTm="${Math.round(advanceMs)}"` : "";
-  if (mode === "Dynamic" && index % 3 === 1) return `<p:transition spd="med"${advance}><p:push dir="l"/></p:transition>`;
-  if (mode === "Dynamic" && index % 3 === 2) return `<p:transition spd="med"${advance}><p:wipe dir="r"/></p:transition>`;
+
+  const advance = Number.isFinite(advanceMs) && advanceMs > 0
+    ? ` advClick="0" advTm="${Math.round(advanceMs)}"`
+    : "";
+
+  // PowerPoint-native slide transitions. Dynamic intentionally rotates
+  // through different effects so consecutive slides do not feel identical.
+  if (mode === "Dynamic") {
+    const effects = [
+      `<p:zoom dir="in"/>`,
+      `<p:push dir="l"/>`,
+      `<p:wipe dir="r"/>`,
+      `<p:split orient="vert" dir="out"/>`,
+      `<p:fade/>`,
+    ];
+    return `<p:transition spd="med"${advance}>${effects[index % effects.length]}</p:transition>`;
+  }
+
   return `<p:transition spd="med"${advance}><p:fade/></p:transition>`;
 }
 
+function collectAnimatableShapeIds(xml) {
+  const ids = [];
+  const re = /<p:(?:sp|pic|graphicFrame)\b[\s\S]*?<p:cNvPr\s+id="(\d+)"/g;
+  let match;
+  while ((match = re.exec(xml))) {
+    const id = Number(match[1]);
+    if (Number.isInteger(id) && id > 0 && !ids.includes(id)) ids.push(id);
+  }
+  return ids.slice(0, 8);
+}
+
+function buildEntranceAnimationXML(shapeIds, effect = "fade", duration = 420) {
+  if (!Array.isArray(shapeIds) || !shapeIds.length) return "";
+
+  const safeEffect = ["fade", "fly(in)", "blinds(horizontal)", "wipe(right)"].includes(effect)
+    ? effect
+    : "fade";
+
+  let nextId = 3;
+  const rows = shapeIds.map((spid, index) => {
+    const outer = nextId;
+    const inner = nextId + 1;
+    const behavior = nextId + 2;
+    const delay = index === 0 ? 0 : Math.min(900, index * 110);
+    nextId += 4;
+
+    return `
+      <p:par>
+        <p:cTn id="${outer}" fill="hold">
+          <p:stCondLst><p:cond delay="${delay}"/></p:stCondLst>
+          <p:childTnLst>
+            <p:par>
+              <p:cTn id="${inner}" fill="hold">
+                <p:childTnLst>
+                  <p:animEffect transition="in" filter="${safeEffect}">
+                    <p:cBhvr>
+                      <p:cTn id="${behavior}" dur="${duration}" fill="hold"/>
+                      <p:tgtEl><p:spTgt spid="${spid}"/></p:tgtEl>
+                    </p:cBhvr>
+                  </p:animEffect>
+                </p:childTnLst>
+              </p:cTn>
+            </p:par>
+          </p:childTnLst>
+        </p:cTn>
+      </p:par>`;
+  }).join("\n");
+
+  return `
+  <p:timing>
+    <p:tnLst>
+      <p:par>
+        <p:cTn id="1" dur="indefinite" restart="never" nodeType="tmRoot">
+          <p:childTnLst>
+            <p:seq concurrent="1" nextAc="seek">
+              <p:cTn id="2" dur="indefinite" nodeType="mainSeq">
+                <p:childTnLst>
+                  ${rows}
+                </p:childTnLst>
+                <p:prevCondLst>
+                  <p:cond evt="onPrev" delay="0"><p:tgtEl><p:sldTgt/></p:tgtEl></p:cond>
+                </p:prevCondLst>
+                <p:nextCondLst>
+                  <p:cond evt="onNext" delay="0"><p:tgtEl><p:sldTgt/></p:tgtEl></p:cond>
+                </p:nextCondLst>
+              </p:cTn>
+            </p:seq>
+          </p:childTnLst>
+        </p:cTn>
+      </p:par>
+    </p:tnLst>
+    <p:bldLst/>
+  </p:timing>`;
+}
+
 function isSlideXmlSane(xml) {
-  return typeof xml === "string" && xml.includes("<p:sld") && xml.includes("</p:sld>");
+  return typeof xml === "string" &&
+    xml.includes("<p:sld") &&
+    xml.includes("</p:sld>") &&
+    !xml.includes("<p:transition><p:transition>");
 }
 
 async function postProcessPPTX(filePath, options) {
   const needTransitions = options.transitions !== "Off";
-  if (!needTransitions) return;
+  const needAnimations = options.animations !== "Off";
+  if (!needTransitions && !needAnimations) return;
+
   const original = fs.readFileSync(filePath);
   const zip = await JSZip.loadAsync(original);
-  const slideFiles = Object.keys(zip.files).filter((name) => /^ppt\/slides\/slide\d+\.xml$/.test(name)).sort((a,b) => Number(a.match(/\d+/)[0]) - Number(b.match(/\d+/)[0]));
+  const slideFiles = Object.keys(zip.files)
+    .filter((name) => /^ppt\/slides\/slide\d+\.xml$/.test(name))
+    .sort((a, b) => Number(a.match(/\d+/)[0]) - Number(b.match(/\d+/)[0]));
 
   for (let i = 0; i < slideFiles.length; i++) {
     const name = slideFiles[i];
-    let xml = await zip.file(name).async("string");
-    if (xml.includes("<p:transition")) continue;
+    const originalXml = await zip.file(name).async("string");
+    let xml = originalXml;
     const slideData = options.content?.slides?.[i];
     const advanceMs = getSlideAdvanceMs(slideData, options, i, slideFiles.length);
-    const transition = transitionXML(options.transitions, i, advanceMs);
+
+    // Remove previously injected motion so repeated processing stays idempotent.
+    xml = xml.replace(/<p:transition\b[\s\S]*?<\/p:transition>/g, "");
+    xml = xml.replace(/<p:timing>[\s\S]*?<\/p:timing>/g, "");
+
+    const transition = needTransitions
+      ? transitionXML(options.transitions, i, advanceMs)
+      : "";
+
+    let candidate = xml;
     const clr = "</p:clrMapOvr>";
     const end = "</p:sld>";
-    let candidate = xml;
-    const pos = xml.indexOf(clr);
-    if (pos >= 0) {
-      const at = pos + clr.length;
-      candidate = xml.slice(0, at) + transition + xml.slice(at);
-    } else {
-      const at = xml.lastIndexOf(end);
-      if (at >= 0) candidate = xml.slice(0, at) + transition + xml.slice(at);
+    const clrPos = xml.indexOf(clr);
+
+    if (transition) {
+      if (clrPos >= 0) {
+        const at = clrPos + clr.length;
+        candidate = xml.slice(0, at) + transition + xml.slice(at);
+      } else {
+        const at = xml.lastIndexOf(end);
+        if (at >= 0) candidate = xml.slice(0, at) + transition + xml.slice(at);
+      }
     }
-    if (isSlideXmlSane(candidate)) xml = candidate;
+
+    if (needAnimations) {
+      const ids = collectAnimatableShapeIds(candidate);
+      // Use a small number of entrance targets to keep the animation pane
+      // elegant and the file lightweight. Background/chrome are skipped by
+      // limiting to the first content objects generated by the renderer.
+      if (ids.length) {
+        const effect = options.animations === "Professional"
+          ? ["fade", "wipe(right)", "blinds(horizontal)"][i % 3]
+          : "fade";
+        const timing = buildEntranceAnimationXML(ids, effect, options.animations === "Professional" ? 500 : 380);
+        const at = candidate.lastIndexOf(end);
+        if (at >= 0) candidate = candidate.slice(0, at) + timing + candidate.slice(at);
+      }
+    }
+
+    if (isSlideXmlSane(candidate)) {
+      xml = candidate;
+    } else {
+      // Roll back the entire post-processing operation for this slide.
+      console.warn(`[PPT] Motion XML rejected for ${name}; keeping original slide XML.`);
+      xml = originalXml;
+    }
+
     zip.file(name, xml);
   }
-  const output = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+
+  const output = await zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+  });
   fs.writeFileSync(filePath, output);
 }
 
