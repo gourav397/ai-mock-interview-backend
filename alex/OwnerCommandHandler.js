@@ -1,9 +1,13 @@
 // ============================================================
-// ALEX OWNER COMMAND HANDLER — PREMIUM PRODUCTION VERSION 3.2
+// ALEX OWNER COMMAND HANDLER — PREMIUM PRODUCTION VERSION 3.3
 // COMPLETE FILE WITH ALL FIXES:
 //   ✓ Natural language parsing (50+ variations)
 //   ✓ Goal Classifier for long natural-language build goals
-//   ✓ NEW: Deep Analysis intent (read-only project analysis reports)
+//   ✓ Deep Analysis (read-only project analysis reports)
+//   ✓ NEW: Analysis report CACHE + "show report" / "report dikhao"
+//   ✓ NEW: "file ka path btao" → affected files list
+//   ✓ NEW: "findings verify karo" → re-verify against actual code
+//   ✓ NEW: Markdown report text in response (frontend-renderable)
 //   ✓ Rich diagnostics on parse failure (no blind errors)
 //   ✓ File creation with content extraction
 //   ✓ Multiline code writing
@@ -83,6 +87,7 @@ class OwnerCommandHandler {
     this.pendingConfirmations = new Map();
     this.maxHistory = config.owner?.commandHistoryMax || 1000;
     this._skipVerification = false; // prevent infinite loops
+    this.lastAnalysis = null;       // cached deep-analysis report
   }
 
   // ============================================================
@@ -265,8 +270,6 @@ FORMAT:
 
     // ---------------------------------------------------------
     // DEEP ANALYSIS intent — read-only project analysis report
-    // e.g. "actual project analysis karo... detailed findings do...
-    //       koi file modify/delete mat karo"
     // ---------------------------------------------------------
     const analysisIntent =
       (/(analysis|analyze|analyse|inspect|audit|review|report)\b/.test(lower) &&
@@ -501,6 +504,7 @@ FORMAT:
   // ============================================================
   // DEEP PROJECT ANALYSIS — READ-ONLY static analysis report
   // No file is modified, created or deleted. Protected paths skipped.
+  // Result is CACHED in this.lastAnalysis for follow-up queries.
   // ============================================================
   async _analyzeProject(originalInput) {
     const findings = [];
@@ -624,7 +628,10 @@ FORMAT:
       .flatMap(sev => bySeverity[sev].slice(0, 5).map(f => `${sev}: ${f.problem} (${f.file})`))
       .slice(0, 10);
 
-    // Optional AI narrative summary (non-blocking, never required)
+    // Build markdown report so the frontend can display the full report
+    const reportText = this._formatReportText({ findings, bySeverity, totalIssues, readiness, fixOrder, stats, totalFiles: stats.filesScanned });
+
+    // Optional AI narrative summary (non-blocking)
     let aiSummary = null;
     if (config.ai?.available) {
       try {
@@ -635,9 +642,9 @@ FORMAT:
       } catch { aiSummary = null; }
     }
 
-    return {
+    const result = {
       success: true,
-      message: `Deep analysis complete: ${totalIssues} findings across ${stats.filesScanned} files (read-only, nothing modified).`,
+      message: `Deep analysis complete: ${totalIssues} findings across ${stats.filesScanned} files (read-only, nothing modified). Report ready — say "report dikhao" or "show report" to view it.`,
       mode: "read-only-analysis",
       summary: {
         totalIssues,
@@ -649,12 +656,204 @@ FORMAT:
       },
       topIssues: fixOrder,
       findings: findings.slice(0, 100),
+      report: reportText,
       filesScanned: stats.scannedFiles,
       notInspected: stats.notInspected.length ? stats.notInspected : undefined,
       skippedProtected: stats.filesSkippedProtected,
       aiSummary,
-      note: "Findings marked safelyFixable=true can be fixed via 'fix bugs' or explicit modify-file commands.",
+      note: "Findings marked safelyFixable=true can be fixed via 'fix bugs' or explicit modify-file commands. Follow-ups: 'report dikhao', 'file ka path btao', 'findings verify karo'.",
       requestedAs: String(originalInput || "").slice(0, 200),
+    };
+
+    // CACHE the full report for follow-up queries
+    this.lastAnalysis = {
+      ...result,
+      cachedAt: new Date().toISOString(),
+      bySeverity,
+    };
+
+    return result;
+  }
+
+  // ============================================================
+  // REPORT FORMATTER — markdown text for frontend display
+  // ============================================================
+  _formatReportText({ findings, bySeverity, totalIssues, readiness, fixOrder, stats, totalFiles }) {
+    const L = [];
+    L.push(`# 🔍 ALEX Deep Analysis Report`);
+    L.push(`**Files scanned:** ${totalFiles} | **Findings:** ${totalIssues} | **Production readiness:** ${readiness}%`);
+    L.push(`**Severity:** 🔴 Critical: ${bySeverity.Critical.length} | 🟠 High: ${bySeverity.High.length} | 🟡 Medium: ${bySeverity.Medium.length} | ⚪ Low: ${bySeverity.Low.length}`);
+    L.push("");
+
+    L.push(`## 🔴 Critical`);
+    if (bySeverity.Critical.length === 0) L.push("_None_");
+    for (const f of bySeverity.Critical.slice(0, 15)) L.push(`- **${f.file}** \`${f.location}\` — ${f.problem}\n  - Why: ${f.why}\n  - Fix: ${f.recommendedFix}\n  - Auto-fix: ${f.safelyFixable ? "✅ Yes" : "⚠️ Manual review required"}`);
+    L.push("");
+
+    L.push(`## 🟠 High`);
+    if (bySeverity.High.length === 0) L.push("_None_");
+    for (const f of bySeverity.High.slice(0, 15)) L.push(`- **${f.file}** \`${f.location}\` — ${f.problem}\n  - Why: ${f.why}\n  - Fix: ${f.recommendedFix}\n  - Auto-fix: ${f.safelyFixable ? "✅ Yes" : "⚠️ Manual review required"}`);
+    L.push("");
+
+    L.push(`## 🟡 Medium`);
+    if (bySeverity.Medium.length === 0) L.push("_None_");
+    for (const f of bySeverity.Medium.slice(0, 20)) L.push(`- **${f.file}** \`${f.location}\` — ${f.problem} → Fix: ${f.recommendedFix} (auto-fix: ${f.safelyFixable ? "yes" : "no"})`);
+    L.push("");
+
+    L.push(`## ⚪ Low`);
+    if (bySeverity.Low.length === 0) L.push("_None_");
+    for (const f of bySeverity.Low.slice(0, 20)) L.push(`- **${f.file}** \`${f.location}\` — ${f.problem}`);
+    L.push("");
+
+    L.push(`## 📋 TOP fixes (in order)`);
+    fixOrder.forEach((item, i) => L.push(`${i + 1}. ${item}`));
+    L.push("");
+
+    if (stats.notInspected.length) {
+      L.push(`## ⚠️ NOT INSPECTED (no guessing)`);
+      for (const n of stats.notInspected.slice(0, 15)) L.push(`- ${n.file} — ${n.reason}`);
+      L.push("");
+    }
+
+    L.push(`_Protected paths skipped: ${stats.filesSkippedProtected} | Generated: ${new Date().toISOString()}_`);
+    return L.join("\n");
+  }
+
+  // ============================================================
+  // FOLLOW-UP: affected files list from cached report
+  // ============================================================
+  _findingsByFile() {
+    if (!this.lastAnalysis) return null;
+    const byFile = new Map();
+    for (const f of this.lastAnalysis.findings) {
+      if (!byFile.has(f.file)) byFile.set(f.file, []);
+      byFile.get(f.file).push(f);
+    }
+    const L = [];
+    L.push(`# 📁 Files with issues (${byFile.size} files, ${this.lastAnalysis.findings.length} findings)`);
+    L.push("");
+    for (const [file, list] of byFile) {
+      const counts = {};
+      for (const f of list) counts[f.severity] = (counts[f.severity] || 0) + 1;
+      L.push(`## ${file} — ${list.length} issue(s) [${Object.entries(counts).map(([s, c]) => `${s}:${c}`).join(", ")}]`);
+      for (const f of list.slice(0, 10)) {
+        L.push(`- \`${f.location}\` **[${f.severity}]** ${f.problem}`);
+        L.push(`  - Why: ${f.why}`);
+        L.push(`  - Fix: ${f.recommendedFix} (auto-fix: ${f.safelyFixable ? "✅" : "⚠️ manual"})`);
+      }
+      if (list.length > 10) L.push(`- _...and ${list.length - 10} more in this file_`);
+      L.push("");
+    }
+    return {
+      success: true,
+      message: `Report for ${byFile.size} affected files (from cached analysis of ${new Date(this.lastAnalysis.cachedAt).toLocaleString()}).`,
+      mode: "cached-report",
+      report: L.join("\n"),
+      files: Array.from(byFile.keys()),
+      summary: this.lastAnalysis.summary,
+    };
+  }
+
+  // ============================================================
+  // FOLLOW-UP: verify top findings against actual code
+  // Re-reads the file at the finding's location and checks whether
+  // the flagged pattern is still present. Read-only.
+  // ============================================================
+  _verifyFindings(count = 5) {
+    if (!this.lastAnalysis) {
+      return { success: false, error: "No cached analysis report. Run a deep analysis first (e.g. 'deep analysis karo')." };
+    }
+
+    const priority = ["Critical", "High", "Medium", "Low"];
+    const targets = priority.flatMap(sev => this.lastAnalysis.bySeverity[sev] || []).slice(0, count);
+
+    const results = targets.map(f => {
+      const verification = {
+        finding: f,
+        verdict: "UNVERIFIED",
+        evidence: "",
+      };
+
+      // Repo-level finding (.gitignore check)
+      if (f.location === "-" || f.file === ".gitignore") {
+        try {
+          const gi = fs.readFileSync(path.join(PROJECT_ROOT, ".gitignore"), "utf8");
+          const envExists = fs.existsSync(path.join(PROJECT_ROOT, ".env"));
+          const stillMissing = envExists && !/^\.env/m.test(gi);
+          verification.verdict = stillMissing ? "GENUINE" : "FALSE_POSITIVE";
+          verification.evidence = `.env exists: ${envExists}; .gitignore contains .env entry: ${/^\.env/m.test(gi)}`;
+        } catch (e) {
+          verification.verdict = "CANNOT_VERIFY";
+          verification.evidence = e.message;
+        }
+        return verification;
+      }
+
+      // File:line finding — re-read actual file
+      const [filePart, linePart] = String(f.location).split(":");
+      const lineNo = parseInt(linePart, 10);
+      const abs = path.join(PROJECT_ROOT, filePart || f.file);
+      try {
+        const content = fs.readFileSync(abs, "utf8");
+        const lines = content.split("\n");
+        const idx = Number.isInteger(lineNo) ? lineNo - 1 : -1;
+
+        // Does the flagged pattern still exist anywhere in the file?
+        const patternStillPresent = lines.some(l => {
+          if (f.problem.includes("eval")) return /\beval\s*\(|new\s+Function\s*\(/.test(l) && !/^\s*\/[/*]/.test(l);
+          if (f.problem.includes("command injection")) return /\b(child_process|execSync|exec)\b/.test(l) && /\$\{/.test(l);
+          if (f.problem.includes("hardcoded secret")) return /(api[_-]?key|secret|password|token|credential)\s*[:=]\s*["'][^"'\s]{8,}["']/i.test(l) && !/process\.env/i.test(l);
+          if (f.problem.includes("Empty catch")) return /catch\s*(\([^)]*\))?\s*\{\s*\}/.test(l);
+          if (f.problem.includes("marker")) return /\b(TODO|FIXME|HACK|XXX)\b/.test(l);
+          if (f.problem.includes("test script")) return JSON.parse(content).scripts && !!JSON.parse(content).scripts.test;
+          return false;
+        });
+
+        if (idx >= 0 && idx < lines.length) {
+          const actualLine = lines[idx].trim();
+          // NEVER print secret values — mask anything that looks like one
+          const safeLine = actualLine.replace(/(["'])(?:(?!\1)[^\\]|\\.)*\1/g, m => {
+            return /secret|key|token|password|credential/i.test(actualLine) ? `"****"` : m;
+          }).slice(0, 160);
+          verification.verdict = patternStillPresent ? "GENUINE" : "FALSE_POSITIVE";
+          verification.evidence = `Line ${lineNo} (masked, value NOT shown): ${safeLine}`;
+        } else {
+          verification.verdict = patternStillPresent ? "GENUINE" : "FALSE_POSITIVE";
+          verification.evidence = `Line ${lineNo} not found in file, but pattern ${patternStillPresent ? "still present" : "absent"} elsewhere in file.`;
+        }
+      } catch (e) {
+        verification.verdict = "CANNOT_VERIFY";
+        verification.evidence = `NOT INSPECTED: ${e.message}`;
+      }
+      return verification;
+    });
+
+    const genuine = results.filter(r => r.verdict === "GENUINE").length;
+    const falsePos = results.filter(r => r.verdict === "FALSE_POSITIVE").length;
+
+    const L = [];
+    L.push(`# 🔬 Finding Verification (top ${results.length}, read-only — nothing modified)`);
+    L.push("");
+    for (const r of results) {
+      const icon = r.verdict === "GENUINE" ? "🔴 GENUINE" : r.verdict === "FALSE_POSITIVE" ? "🟢 FALSE POSITIVE" : "❓ CANNOT VERIFY";
+      L.push(`## ${icon} — ${r.finding.file} \`${r.finding.location}\` [${r.finding.severity}]`);
+      L.push(`- **Problem:** ${r.finding.problem}`);
+      L.push(`- **Evidence:** ${r.evidence}`);
+      L.push(`- **Secret type:** ${/api[_-]?key/i.test(r.finding.problem) ? "API key" : /secret/i.test(r.finding.problem) ? "Secret string" : /password/i.test(r.finding.problem) ? "Password" : /token/i.test(r.finding.problem) ? "Token" : "N/A"} _(value NOT displayed)_`);
+      L.push(`- **Safe fix:** ${r.finding.recommendedFix}`);
+      L.push(`- **Files to change:** ${r.finding.file}${r.finding.safelyFixable ? " (+ possibly .gitignore)" : ""}`);
+      L.push(`- **Impact:** ${r.finding.safelyFixable ? "Low — additive/safe change, existing functionality preserved" : "Needs manual review — could affect behavior"}`);
+      L.push(`- **Auto-fix:** ${r.finding.safelyFixable ? "✅ Possible via 'fix bugs'" : "⚠️ Manual approval required"}`);
+      L.push("");
+    }
+    L.push(`**Summary:** ${genuine} genuine, ${falsePos} false positive(s), ${results.length - genuine - falsePos} unverifiable.`);
+
+    return {
+      success: true,
+      message: `Verified ${results.length} findings: ${genuine} genuine, ${falsePos} false positive(s), ${results.length - genuine - falsePos} cannot verify. (read-only)`,
+      mode: "verification",
+      report: L.join("\n"),
+      verifications: results,
     };
   }
 
@@ -691,6 +890,23 @@ FORMAT:
         /^database/i.test(lower) ||
         /is\s+the\s+database\s+(up|connected|running)/i.test(lower)) {
       return { success: true, action: "check-database", target: "project", parameters: { originalInput: input }, riskLevel: 1, confidence: 0.9 };
+    }
+
+    // --- SHOW LAST REPORT (cached) — "report dikhao", "findings dikhao", "file ka path btao" ---
+    if (/(show|dikha|dikhao|dikha do|display|view|dekhna|batao|btao|list)\b[\s\S]{0,40}\b(report|findings|analysis|result|issues?|kami|kamiyan|files?)\b/.test(lower) ||
+        /^last\s+(analysis|report)/.test(lower) ||
+        /(file\s*ka\s*path|file\s*paths?|kin\s*files|kis\s*file|konsi\s*file)/.test(lower) ||
+        /path\s+batao|path\s+btao/.test(lower)) {
+      // If it's actually a request to RUN analysis (contains "karo"), let deep-analysis handle it
+      if (!/(karo|perform|run)\s*$/.test(lower) && !/analysis\s+karo/.test(lower)) {
+        return { success: true, action: "inspect", target: "project", parameters: { showLast: true, originalInput: input }, riskLevel: 1, confidence: 0.9 };
+      }
+    }
+
+    // --- VERIFY FINDINGS — "findings verify karo", "findings ko verify" ---
+    if (/(verify|confirm|check|validate)\b[\s\S]{0,40}\b(finding|issue|problem|report|analysis|kami)/.test(lower) ||
+        /(genuine|false\s+positive)/.test(lower)) {
+      return { success: true, action: "inspect", target: "project", parameters: { verifyFindings: true, originalInput: input }, riskLevel: 1, confidence: 0.9 };
     }
 
     // --- DEEP ANALYSIS (before generic inspect so it wins) ---
@@ -794,7 +1010,7 @@ FORMAT:
     return {
       success: false,
       error: `Could not understand command: "${input.slice(0, 200)}"`,
-      suggestion: "Try: inspect project, run tests, check health, show actions, fix bugs, check security, show incidents, show history, verify all — or state a build goal like 'Build a <name> module'"
+      suggestion: "Try: inspect project, run tests, check health, show actions, fix bugs, check security, show incidents, show history, verify all — 'deep analysis karo', 'report dikhao', 'file ka path btao', 'findings verify karo'"
     };
   }
 
@@ -967,7 +1183,7 @@ FORMAT:
   // ============================================================
   // EXECUTION — All 24+ actions
   // ============================================================
-  async _execute(action, target, parameters, owner) {
+  async _execute(action, target, parameters, owner, input = null) {
     switch (action) {
 
       // --- LIST ACTIONS ---
@@ -1008,8 +1224,20 @@ FORMAT:
         };
       }
 
-      // --- INSPECT (simple + deep analysis) ---
+      // --- INSPECT (simple / deep analysis / cached report / verification) ---
       case "inspect": {
+        if (parameters?.showLast) {
+          if (!this.lastAnalysis) {
+            return {
+              success: false,
+              error: "No cached analysis report. Run a deep analysis first (e.g. 'deep analysis karo').",
+            };
+          }
+          return this._findingsByFile();
+        }
+        if (parameters?.verifyFindings) {
+          return this._verifyFindings(5);
+        }
         if (parameters?.deep) {
           return this._analyzeProject(parameters.originalInput || input);
         }
@@ -1685,8 +1913,9 @@ Suggest a single fix action. Return JSON: {"action":"modify-file|run-command","p
     return {
       success: status === "completed", commandId, status,
       timestamp: new Date().toISOString(),
-      alex: { system: "ALEX Owner Command Handler", version: "3.2.0", capabilities: [
-        "natural-language-commands", "goal-classifier", "deep-analysis", "create-file", "modify-file", "delete-file",
+      alex: { system: "ALEX Owner Command Handler", version: "3.3.0", capabilities: [
+        "natural-language-commands", "goal-classifier", "deep-analysis", "cached-report",
+        "create-file", "modify-file", "delete-file",
         "project-inspection", "test-execution", "approved-command-execution",
         "audit-logging", "backup-before-modification", "path-traversal-protection",
         "protected-file-boundary", "self-verification", "fix-loop", "security-scan"
