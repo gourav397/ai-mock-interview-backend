@@ -1,9 +1,10 @@
 // ============================================================
-// ALEX OWNER COMMAND HANDLER — PREMIUM PRODUCTION VERSION 3.1
+// ALEX OWNER COMMAND HANDLER — PREMIUM PRODUCTION VERSION 3.2
 // COMPLETE FILE WITH ALL FIXES:
 //   ✓ Natural language parsing (50+ variations)
-//   ✓ NEW: Goal Classifier for long natural-language build goals
-//   ✓ NEW: Rich diagnostics on parse failure (no blind errors)
+//   ✓ Goal Classifier for long natural-language build goals
+//   ✓ NEW: Deep Analysis intent (read-only project analysis reports)
+//   ✓ Rich diagnostics on parse failure (no blind errors)
 //   ✓ File creation with content extraction
 //   ✓ Multiline code writing
 //   ✓ Cross-platform test execution (npm.cmd on Windows)
@@ -15,7 +16,6 @@
 //   ✓ Protected-path enforcement
 //   ✓ Protected-file boundary
 //   ✓ Self-verification
-//   ✓ Fix-loop
 //   ✓ Security-scan
 // ============================================================
 
@@ -238,7 +238,7 @@ FORMAT:
     const fallback = this._fallbackParse(trimmed);
     if (fallback.success) return fallback;
 
-    // PRIORITY 4 — GOAL CLASSIFIER (natural-language build/implement goals)
+    // PRIORITY 4 — GOAL CLASSIFIER (natural-language build/analysis goals)
     const goal = this._parseGoal(trimmed, aiParseError, fallback.error);
     if (goal) return goal;
 
@@ -249,7 +249,7 @@ FORMAT:
         reason: "Command matched none of: file-command parser, AI parser, regex NLU patterns, goal classifier.",
         aiParser: aiParseError,
         regexNlu: "No regex pattern matched.",
-        goalClassifier: "No build/implement intent detected.",
+        goalClassifier: "No build/implement/analysis intent detected.",
         inputLength: trimmed.length,
         isMultiLine: trimmed.includes("\n"),
       },
@@ -257,15 +257,46 @@ FORMAT:
   }
 
   // ============================================================
-  // GOAL CLASSIFIER — natural-language build/implement goals
-  // Converts long owner goals (e.g. "Build an authorized CCTV
-  // Security Control module...") into structured file actions.
+  // GOAL CLASSIFIER — natural-language build/implement/analysis goals
   // ============================================================
 
   _parseGoal(input, aiParseError = null, regexError = null) {
     const lower = input.toLowerCase();
 
-    // Build/implement intent detection
+    // ---------------------------------------------------------
+    // DEEP ANALYSIS intent — read-only project analysis report
+    // e.g. "actual project analysis karo... detailed findings do...
+    //       koi file modify/delete mat karo"
+    // ---------------------------------------------------------
+    const analysisIntent =
+      (/(analysis|analyze|analyse|inspect|audit|review|report)\b/.test(lower) &&
+       /(karo|kar|do|dijiye|perform|run|give|provide|dedo|dena|chahiye|report|findings|detailed|deep)/.test(lower)) ||
+      /(har\s+(bug|problem|issue|vulnerability|finding))|((bug|issue|problem|vulnerabilit)\S*\s+dhundo)|(dhundo|khojo)\b/.test(lower) ||
+      (/(project|code|system)\b/.test(lower) && /(detailed|deep|full|complete)\s+(analysis|review|audit|report|inspection)/.test(lower)) ||
+      (/sirf\s+.{0,30}(inspect|analysis|report|review)/.test(lower)) ||
+      (/modify\/?delete\s+mat\s+karo/.test(lower)) ||
+      (/mat\s+bolo\s+.{0,20}(inspection|analysis)/.test(lower));
+
+    if (analysisIntent && !this._parseFileCommand(input)) {
+      return {
+        success: true,
+        action: "inspect",
+        target: "project",
+        parameters: {
+          deep: true,
+          originalInput: input,
+          source: "goal-classifier",
+        },
+        riskLevel: 1,
+        confidence: 0.85,
+        reason: "Detected read-only deep-analysis goal → routed to inspect (deep analysis report). No files will be modified.",
+        parsedBy: "goal-classifier",
+      };
+    }
+
+    // ---------------------------------------------------------
+    // BUILD / IMPLEMENT intent
+    // ---------------------------------------------------------
     const buildIntent = /\b(build|create|implement|develop|scaffold|generate|write|make|add)\b[\s\S]{0,40}\b(module|feature|component|system|service|class|library|controller|api|dashboard|script|utility|tool|handler|manager)\b/.test(lower);
     const modifyIntent = /\b(update|extend|refactor|improve|rewrite)\b[\s\S]{0,30}\b(module|feature|component|class|service|handler|manager)\b/.test(lower);
 
@@ -280,7 +311,6 @@ FORMAT:
       action = "modify-file";
       fileName = existing;
     } else if (modifyIntent) {
-      // Modify intent but file not found — create it instead of failing
       action = "create-file";
       fileName = `modules/${this._toSnakeCase(moduleName)}.js`;
     } else {
@@ -469,6 +499,166 @@ FORMAT:
   }
 
   // ============================================================
+  // DEEP PROJECT ANALYSIS — READ-ONLY static analysis report
+  // No file is modified, created or deleted. Protected paths skipped.
+  // ============================================================
+  async _analyzeProject(originalInput) {
+    const findings = [];
+    const stats = {
+      filesScanned: 0,
+      filesSkippedProtected: 0,
+      totalLines: 0,
+      scannedFiles: [],
+      notInspected: [],
+    };
+
+    const CODE_EXT = new Set([".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"]);
+    const PROTECTED_DIRS = new Set([".git", "node_modules", ".alex-backups", "cache", "dist", "build", ".env"]);
+    const MAX_FILE_BYTES = 200 * 1024;
+    const MAX_FILES = 400;
+
+    const addFinding = (severity, file, location, problem, why, fix, safelyFixable) => {
+      findings.push({ severity, file, location: location || "unknown", problem, why, recommendedFix: fix, safelyFixable });
+    };
+
+    const walk = (dir, depth) => {
+      if (depth > 5 || stats.filesScanned >= MAX_FILES) return;
+      let entries;
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+
+      for (const entry of entries) {
+        if (stats.filesScanned >= MAX_FILES) break;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (PROTECTED_DIRS.has(entry.name) || entry.name.startsWith(".")) { stats.filesSkippedProtected++; continue; }
+          walk(full, depth + 1);
+          continue;
+        }
+        if (!entry.isFile()) continue;
+        const ext = path.extname(entry.name).toLowerCase();
+
+        // Protected file patterns never read
+        if (/^\.env|^credentials|^secrets|\.pem$|\.cert$|\.key$/.test(entry.name)) { stats.filesSkippedProtected++; continue; }
+
+        if (!CODE_EXT.has(ext) && entry.name !== "package.json") continue;
+
+        let content;
+        let stat;
+        try {
+          stat = fs.statSync(full);
+          if (stat.size > MAX_FILE_BYTES) { stats.notInspected.push({ file: full, reason: `too large (${stat.size} bytes)` }); continue; }
+          content = fs.readFileSync(full, "utf8");
+        } catch (e) {
+          stats.notInspected.push({ file: full, reason: e.message });
+          continue;
+        }
+
+        stats.filesScanned++;
+        const rel = path.relative(PROJECT_ROOT, full);
+        stats.scannedFiles.push({ file: rel, size: stat.size, lines: content.split("\n").length });
+        stats.totalLines += content.split("\n").length;
+
+        const lines = content.split("\n");
+
+        // --- Static checks per file ---
+        lines.forEach((line, i) => {
+          const loc = `${rel}:${i + 1}`;
+          if (/\b(TODO|FIXME|HACK|XXX)\b/.test(line)) {
+            addFinding("Low", rel, loc, `Unresolved marker: ${line.trim().slice(0, 100)}`, "Indicates incomplete work.", "Complete or remove the marker.", true);
+          }
+          if (/\beval\s*\(|new\s+Function\s*\(/.test(line) && !/^\s*\/[/*]/.test(line)) {
+            addFinding("High", rel, loc, "Use of eval()/new Function()", "Code injection risk if any part of the input is user-controlled.", "Replace with safe parsing (JSON.parse, explicit logic).", false);
+          }
+          if (/\b(child_process|execSync|exec)\b/.test(line) && /\breq\.(body|query|params)\b|template literal.*\$\{/.test(line)) {
+            addFinding("Critical", rel, loc, "Possible command injection (exec with dynamic input)", "Unsanitized input can reach shell.", "Use execFile with fixed args; never interpolate input into shell strings.", false);
+          }
+          if (/(api[_-]?key|secret|password|token|credential)\s*[:=]\s*["'][^"'\s]{8,}["']/i.test(line) && !/process\.env|placeholder|example/i.test(line)) {
+            addFinding("Critical", rel, loc, "Possible hardcoded secret", "Secrets in source leak via git.", "Move to environment variables.", false);
+          }
+          if (/catch\s*\([^)]*\)\s*\{\s*\}/.test(line) || /catch\s*\{\s*\}/.test(line)) {
+            addFinding("Medium", rel, loc, "Empty catch block — errors silently swallowed", "Failures become invisible and hard to debug.", "Log the error or handle it explicitly.", true);
+          }
+        });
+
+        // File-level checks
+        if (content.split("\n").length > 800) {
+          addFinding("Low", rel, "whole file", `Very large file (${content.split("\n").length} lines)`, "Hard to maintain and review.", "Split into smaller modules.", false);
+        }
+
+        // package.json checks
+        if (entry.name === "package.json") {
+          try {
+            const pkg = JSON.parse(content);
+            if (!pkg.scripts || !pkg.scripts.test) {
+              addFinding("Medium", rel, "scripts", "No test script defined", "npm test will fail; fix-loop and verification depend on it.", 'Add "test": "node --test" or a test runner.', true);
+            }
+            if (!pkg.scripts || (!pkg.scripts.start && !pkg.scripts.main)) {
+              addFinding("Low", rel, "scripts", "No start script", "Deployment tooling may fail.", 'Add "start" script.', true);
+            }
+          } catch { addFinding("Medium", rel, "JSON", "package.json is not valid JSON", "npm tooling may break.", "Fix JSON syntax.", false); }
+        }
+      }
+    };
+
+    walk(PROJECT_ROOT, 0);
+
+    // Repo-level checks
+    const gitignorePath = path.join(PROJECT_ROOT, ".gitignore");
+    if (fs.existsSync(path.join(PROJECT_ROOT, ".env")) && fs.existsSync(gitignorePath)) {
+      const gi = fs.readFileSync(gitignorePath, "utf8");
+      if (!/^\.env/m.test(gi)) {
+        addFinding("Critical", ".gitignore", "-", ".env exists but is NOT in .gitignore", "Secrets may be committed to git.", 'Add ".env" to .gitignore.', true);
+      }
+    }
+
+    // Severity summary + top issues
+    const bySeverity = { Critical: [], High: [], Medium: [], Low: [] };
+    for (const f of findings) (bySeverity[f.severity] || bySeverity.Low).push(f);
+
+    const totalIssues = findings.length;
+    const readiness = Math.max(0, Math.min(100,
+      100 - (bySeverity.Critical.length * 12) - (bySeverity.High.length * 7) - (bySeverity.Medium.length * 3) - (bySeverity.Low.length * 1)
+    ));
+
+    const fixOrder = ["Critical", "High", "Medium", "Low"]
+      .flatMap(sev => bySeverity[sev].slice(0, 5).map(f => `${sev}: ${f.problem} (${f.file})`))
+      .slice(0, 10);
+
+    // Optional AI narrative summary (non-blocking, never required)
+    let aiSummary = null;
+    if (config.ai?.available) {
+      try {
+        const condensed = findings.slice(0, 30).map(f => `[${f.severity}] ${f.file} ${f.location}: ${f.problem}`).join("\n");
+        const prompt = `Summarize this project analysis in under 200 words. Highlight the top risks and overall production readiness.\n\nFindings:\n${condensed}`;
+        const res = await callGemini(prompt, { temperature: 0.2, timeoutMs: 12000 });
+        if (res) aiSummary = typeof res === "string" ? res.slice(0, 1200) : (res.text || res.summary || String(res).slice(0, 1200));
+      } catch { aiSummary = null; }
+    }
+
+    return {
+      success: true,
+      message: `Deep analysis complete: ${totalIssues} findings across ${stats.filesScanned} files (read-only, nothing modified).`,
+      mode: "read-only-analysis",
+      summary: {
+        totalIssues,
+        critical: bySeverity.Critical.length,
+        high: bySeverity.High.length,
+        medium: bySeverity.Medium.length,
+        low: bySeverity.Low.length,
+        productionReadinessPercent: readiness,
+      },
+      topIssues: fixOrder,
+      findings: findings.slice(0, 100),
+      filesScanned: stats.scannedFiles,
+      notInspected: stats.notInspected.length ? stats.notInspected : undefined,
+      skippedProtected: stats.filesSkippedProtected,
+      aiSummary,
+      note: "Findings marked safelyFixable=true can be fixed via 'fix bugs' or explicit modify-file commands.",
+      requestedAs: String(originalInput || "").slice(0, 200),
+    };
+  }
+
+  // ============================================================
   // COMPREHENSIVE FALLBACK PARSER — 50+ natural variations
   // ============================================================
   _fallbackParse(input) {
@@ -501,6 +691,15 @@ FORMAT:
         /^database/i.test(lower) ||
         /is\s+the\s+database\s+(up|connected|running)/i.test(lower)) {
       return { success: true, action: "check-database", target: "project", parameters: { originalInput: input }, riskLevel: 1, confidence: 0.9 };
+    }
+
+    // --- DEEP ANALYSIS (before generic inspect so it wins) ---
+    if (/(deep|detailed|full|complete|actual)\s+(analysis|inspect|review|audit)/i.test(lower) ||
+        /(analysis|inspect|review|audit)\s+karo/i.test(lower) ||
+        /(detailed\s+findings|findings\s+do|report\s+do)/i.test(lower) ||
+        /(har\s+(bug|problem|issue|vulnerabilit))/i.test(lower) ||
+        /modify\s*\/?\s*delete\s+mat\s+karo/i.test(lower)) {
+      return { success: true, action: "inspect", target: "project", parameters: { deep: true, originalInput: input }, riskLevel: 1, confidence: 0.85 };
     }
 
     // --- INSPECT ---
@@ -809,8 +1008,11 @@ FORMAT:
         };
       }
 
-      // --- INSPECT ---
+      // --- INSPECT (simple + deep analysis) ---
       case "inspect": {
+        if (parameters?.deep) {
+          return this._analyzeProject(parameters.originalInput || input);
+        }
         return this._inspectProject(target);
       }
 
@@ -1483,8 +1685,8 @@ Suggest a single fix action. Return JSON: {"action":"modify-file|run-command","p
     return {
       success: status === "completed", commandId, status,
       timestamp: new Date().toISOString(),
-      alex: { system: "ALEX Owner Command Handler", version: "3.1.0", capabilities: [
-        "natural-language-commands", "goal-classifier", "create-file", "modify-file", "delete-file",
+      alex: { system: "ALEX Owner Command Handler", version: "3.2.0", capabilities: [
+        "natural-language-commands", "goal-classifier", "deep-analysis", "create-file", "modify-file", "delete-file",
         "project-inspection", "test-execution", "approved-command-execution",
         "audit-logging", "backup-before-modification", "path-traversal-protection",
         "protected-file-boundary", "self-verification", "fix-loop", "security-scan"
