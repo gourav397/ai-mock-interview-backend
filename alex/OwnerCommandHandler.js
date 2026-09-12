@@ -1,13 +1,18 @@
 // ============================================================
-// ALEX OWNER COMMAND HANDLER — PREMIUM PRODUCTION VERSION 3.3
+// ALEX OWNER COMMAND HANDLER — PREMIUM PRODUCTION VERSION 3.4
 // COMPLETE FILE WITH ALL FIXES:
 //   ✓ Natural language parsing (50+ variations)
 //   ✓ Goal Classifier for long natural-language build goals
 //   ✓ Deep Analysis (read-only project analysis reports)
-//   ✓ NEW: Analysis report CACHE + "show report" / "report dikhao"
-//   ✓ NEW: "file ka path btao" → affected files list
-//   ✓ NEW: "findings verify karo" → re-verify against actual code
-//   ✓ NEW: Markdown report text in response (frontend-renderable)
+//   ✓ Analysis report CACHE + "show report" / "report dikhao"
+//   ✓ "file ka path btao" → affected files list
+//   ✓ "findings verify karo" → re-verify against actual code
+//   ✓ NEW v3.4: Remediation-plan intent (read-only fix plan)
+//   ✓ NEW v3.4: plan-execute intent → existing fix-bugs action
+//   ✓ NEW v3.4: file-detection no longer hijacks long remediation
+//               goals (fixes "package.json content not provided" bug)
+//   ✓ NEW v3.4: read-only git-tracked .env history check
+//   ✓ Markdown report text in response (frontend-renderable)
 //   ✓ Rich diagnostics on parse failure (no blind errors)
 //   ✓ File creation with content extraction
 //   ✓ Multiline code writing
@@ -185,6 +190,8 @@ class OwnerCommandHandler {
   // ============================================================
   // COMMAND PARSER — COMPREHENSIVE NLU
   // Order: deterministic file parser → AI parser → regex NLU → goal classifier
+  // v3.4: deterministic parser failures on LONG multi-requirement goals
+  // no longer abort the pipeline (fixes "package.json content not provided").
   // ============================================================
 
   async _parseCommand(input) {
@@ -196,7 +203,22 @@ class OwnerCommandHandler {
 
     // PRIORITY 1 — DETERMINISTIC PARSER for file commands
     const deterministic = this._parseFileCommand(trimmed);
-    if (deterministic) return deterministic;
+    let fileCommandHint = null;
+    if (deterministic) {
+      if (deterministic.success) return deterministic;
+
+      // Hard-fail only for SHORT explicit file commands. Long
+      // multi-requirement goals that merely MENTION a filename
+      // (e.g. "package.json mein test script add karo") must NOT
+      // abort — they continue to AI / regex / goal classifiers.
+      const isExplicitFileCommand =
+        /^\s*(create|make|add|generate|write|save|build)\b[\s\S]{0,80}\bfile\b/i.test(trimmed) ||
+        /^\s*(modify|edit|update|rewrite|change|replace)\b[\s\S]{0,80}\b(file|code)\b/i.test(trimmed);
+      if (isExplicitFileCommand || trimmed.length < 300) {
+        return deterministic;
+      }
+      fileCommandHint = deterministic.error;
+    }
 
     // PRIORITY 2 — AI PARSER (if available)
     let aiParseError = null;
@@ -222,7 +244,8 @@ IMPORTANT RULES:
 4. For modify-file: parameters.path MUST contain the existing file. parameters.content MUST contain the complete replacement content if supplied.
 5. Never use "project" as the filename when a filename exists in the command.
 6. If content is explicitly provided, preserve it exactly.
-7. Return JSON only.
+7. If the command is a goal/request for analysis, inspection, fixes, testing or status — choose the matching non-file action.
+8. Return JSON only.
 
 FORMAT:
 {"action":"create-file","target":"example.js","parameters":{"path":"example.js","content":"console.log('hello');"},"riskLevel":1,"confidence":1}`;
@@ -243,8 +266,8 @@ FORMAT:
     const fallback = this._fallbackParse(trimmed);
     if (fallback.success) return fallback;
 
-    // PRIORITY 4 — GOAL CLASSIFIER (natural-language build/analysis goals)
-    const goal = this._parseGoal(trimmed, aiParseError, fallback.error);
+    // PRIORITY 4 — GOAL CLASSIFIER (natural-language build/analysis/remediation goals)
+    const goal = this._parseGoal(trimmed, aiParseError, fallback.error, fileCommandHint);
     if (goal) return goal;
 
     // All parsers failed — return rich diagnostics
@@ -254,7 +277,8 @@ FORMAT:
         reason: "Command matched none of: file-command parser, AI parser, regex NLU patterns, goal classifier.",
         aiParser: aiParseError,
         regexNlu: "No regex pattern matched.",
-        goalClassifier: "No build/implement/analysis intent detected.",
+        goalClassifier: "No build/implement/analysis/remediation intent detected.",
+        fileCommandHint,
         inputLength: trimmed.length,
         isMultiLine: trimmed.includes("\n"),
       },
@@ -263,10 +287,69 @@ FORMAT:
 
   // ============================================================
   // GOAL CLASSIFIER — natural-language build/implement/analysis goals
+  // v3.4: remediation-plan + plan-execute intents added
   // ============================================================
 
-  _parseGoal(input, aiParseError = null, regexError = null) {
+  _parseGoal(input, aiParseError = null, regexError = null, fileCommandHint = null) {
     const lower = input.toLowerCase();
+
+    // ---------------------------------------------------------
+    // v3.4 — REMEDIATION EXECUTE intent (plan approved → fix)
+    // Routed to existing fix-bugs action (confirmation + backup
+    // + audit all preserved by allowlist/risk rules).
+    // ---------------------------------------------------------
+    const planExecuteIntent =
+      /(plan\s+(approve|approved|accept|apply|execute|shuru|start|confirm))/.test(lower) ||
+      /(approve\s+kar|apply\s+kar|execute\s+the\s+plan|plan\s+manzoor)/.test(lower) ||
+      /(ab\s+fix\s+karo|ab\s+fixes?\s+apply|fixes?\s+apply\s+karo)/.test(lower);
+
+    if (planExecuteIntent) {
+      return {
+        success: true,
+        action: "fix-bugs",
+        target: "project",
+        parameters: {
+          originalInput: input,
+          source: "goal-classifier",
+          remediation: true,
+        },
+        riskLevel: 2,
+        confidence: 0.85,
+        reason: "Detected plan-approval/execute intent → routed to fix-bugs (requires confirmation, creates backups before any modification).",
+        parsedBy: "goal-classifier",
+      };
+    }
+
+    // ---------------------------------------------------------
+    // v3.4 — REMEDIATION PLAN intent (read-only fix planning)
+    // "safe fixes karo", "production ready banao", "findings fix
+    // karo", "systematically fix karo" → per-finding fix plan.
+    // NOTHING is modified at this stage.
+    // ---------------------------------------------------------
+    const fixIntent =
+      /(findings?\s+(fix|repair|resolve|patch|hal))/.test(lower) ||
+      /(fix|repair|resolve|patch|auto[\s-]?fix)[a-z]*\s+[\s\S]{0,30}\b(karo|kar|do|dena|apply|hal|kam)\b/.test(lower) &&
+        /(finding|kami|issue|bug|vulnerabilit|problem|critical|security|error)/.test(lower) ||
+      /(safe\s+fixes|security\s+fixes|critical\s+security\s+fixes)/.test(lower) ||
+      /(production[\s-]*ready\s+(bana|ban|karo|karna|banana))/i.test(lower) ||
+      /(systematically\s+(karo|fix))/.test(lower) && /(fix|finding|kami|issue|repair)/.test(lower);
+
+    if (fixIntent) {
+      return {
+        success: true,
+        action: "inspect",
+        target: "project",
+        parameters: {
+          remediationPlan: true,
+          originalInput: input,
+          source: "goal-classifier",
+        },
+        riskLevel: 1,
+        confidence: 0.85,
+        reason: "Detected remediation/production-readiness goal → routed to inspect (READ-ONLY fix plan). No file will be modified without explicit plan approval.",
+        parsedBy: "goal-classifier",
+      };
+    }
 
     // ---------------------------------------------------------
     // DEEP ANALYSIS intent — read-only project analysis report
@@ -328,6 +411,7 @@ FORMAT:
     reasonBits.push(`Detected natural-language ${modifyIntent ? "modification" : "build"} goal → routed to ${action} with generated scaffold for "${moduleName}".`);
     if (aiParseError) reasonBits.push(`(AI parser: ${aiParseError})`);
     if (regexError) reasonBits.push(`(Regex NLU: ${String(regexError).slice(0, 120)})`);
+    if (fileCommandHint) reasonBits.push(`(File parser hint: ${String(fileCommandHint).slice(0, 120)})`);
 
     return {
       success: true,
@@ -661,7 +745,7 @@ FORMAT:
       notInspected: stats.notInspected.length ? stats.notInspected : undefined,
       skippedProtected: stats.filesSkippedProtected,
       aiSummary,
-      note: "Findings marked safelyFixable=true can be fixed via 'fix bugs' or explicit modify-file commands. Follow-ups: 'report dikhao', 'file ka path btao', 'findings verify karo'.",
+      note: "Findings marked safelyFixable=true can be fixed via 'fix bugs' or explicit modify-file commands. Follow-ups: 'report dikhao', 'file ka path btao', 'findings verify karo', 'remediation plan banao'.",
       requestedAs: String(originalInput || "").slice(0, 200),
     };
 
@@ -673,6 +757,123 @@ FORMAT:
     };
 
     return result;
+  }
+
+  // ============================================================
+  // v3.4 — REMEDIATION PLAN (READ-ONLY)
+  // Uses cached analysis (or runs fresh analysis) and produces a
+  // per-finding fix plan: severity, file:line, problem, fix,
+  // auto-fixable vs manual, git-tracked .env check (names only,
+  // NO secret values), required env-var NAMES and deployment
+  // checklist. NOTHING is modified until the owner explicitly
+  // approves the plan ("plan approve karo").
+  // ============================================================
+  async _buildRemediationPlan(originalInput) {
+    // Ensure we have an analysis (fresh or cached)
+    if (!this.lastAnalysis) {
+      console.log("[ALEX] Remediation plan: no cached analysis — running fresh deep analysis (read-only)...");
+      await this._analyzeProject(originalInput);
+      if (!this.lastAnalysis) {
+        return { success: false, error: "Analysis could not be completed; remediation plan unavailable." };
+      }
+    }
+
+    const a = this.lastAnalysis;
+
+    // --- READ-ONLY git history check: is .env tracked? (names only, never values) ---
+    let gitStatus;
+    try {
+      const tracked = execFileSync("git", ["ls-files", "--", ".env", ".env.*"],
+        { cwd: PROJECT_ROOT, encoding: "utf8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] });
+      const files = tracked.split("\n").map(s => s.trim()).filter(Boolean);
+      gitStatus = {
+        checked: true,
+        envTrackedInGit: files.length > 0,
+        trackedFiles: files,
+        warning: files.length > 0
+          ? "⚠️ .env file(s) are TRACKED in git history. Do NOT simply unblock/unignore and push. Safe cleanup plan: (1) rotate ALL secrets now, (2) add .env to .gitignore, (3) git rm --cached .env, (4) rewrite history with git filter-repo or BFG, (5) force-push only after owner review."
+          : null,
+      };
+    } catch (e) {
+      gitStatus = { checked: false, reason: `git check unavailable: ${e.message}` };
+    }
+
+    // --- Split findings into auto-fixable vs manual ---
+    const autoFixable = a.findings.filter(f => f.safelyFixable);
+    const manual = a.findings.filter(f => !f.safelyFixable);
+
+    const priority = ["Critical", "High", "Medium", "Low"];
+    const bySev = list => priority.flatMap(s => list.filter(f => f.severity === s));
+
+    // --- Build markdown plan (NEVER prints secret values) ---
+    const L = [];
+    L.push(`# 🛠️ ALEX Remediation Plan (READ-ONLY — nothing modified yet)`);
+    L.push(`**Based on analysis of:** ${new Date(a.cachedAt).toLocaleString()}`);
+    L.push(`**Total findings:** ${a.summary.totalIssues} | 🔴 ${a.summary.critical} | 🟠 ${a.summary.high} | 🟡 ${a.summary.medium} | ⚪ ${a.summary.low}`);
+    L.push(`**Current production readiness:** ${a.summary.productionReadinessPercent}%`);
+    L.push("");
+    L.push(`## ✅ AUTO-FIXABLE (${autoFixable.length}) — safe, will ask confirmation + backup each`);
+    for (const f of bySev(autoFixable).slice(0, 40)) {
+      L.push(`- **[${f.severity}]** \`${f.file}\` \`${f.location}\` — ${f.problem}`);
+      L.push(`  - Fix: ${f.recommendedFix}`);
+    }
+    if (!autoFixable.length) L.push("_None_");
+    L.push("");
+    L.push(`## ⚠️ REQUIRES MANUAL REVIEW (${manual.length}) — ALEX will NOT auto-touch these`);
+    for (const f of bySev(manual).slice(0, 40)) {
+      L.push(`- **[${f.severity}]** \`${f.file}\` \`${f.location}\` — ${f.problem}`);
+      L.push(`  - Why manual: ${f.why}`);
+      L.push(`  - Recommended: ${f.recommendedFix}`);
+    }
+    if (!manual.length) L.push("_None_");
+    L.push("");
+
+    L.push(`## 🔐 Git / .env status`);
+    if (gitStatus.checked) {
+      L.push(`- .env tracked in git history: **${gitStatus.envTrackedInGit ? "YES — CRITICAL: rotate secrets + history cleanup required (see warning)" : "No (good)"}**`);
+      if (gitStatus.warning) L.push(`- ${gitStatus.warning}`);
+    } else {
+      L.push(`- Git check unavailable: ${gitStatus.reason}`);
+    }
+    L.push(`- .gitignore contains .env: check via "findings verify karo"`);
+    L.push("");
+
+    L.push(`## 🚀 Deployment: required env-var NAMES (values OWNER-ONLY, never shown)`);
+    L.push(`- \`ADMIN_KEY\` — owner command auth (currently weak/known value — MUST rotate before deploy)`);
+    L.push(`- \`JWT_SECRET\` — auth token signing`);
+    L.push(`- \`MONGO_URI\` — database connection`);
+    L.push(`- Gemini API keys (via config/geminiKeys.js source as configured)`);
+    L.push(`- Any other \`process.env.*\` referenced by the app (frontend needs \`VITE_API_URL\`)`);
+    L.push("");
+
+    L.push(`## ▶️ NEXT STEP`);
+    L.push(`- Reply **"plan approve karo"** or **"ab fix karo"** → ALEX will execute the AUTO-FIXABLE items via its fix-loop, with explicit confirmation + backup before every modification. Manual items will be listed as "requires manual review" — ALEX will NOT guess those.`);
+    L.push("");
+    L.push(`_Generated: ${new Date().toISOString()} | mode: read-only planning_`);
+
+    const estimatedReadiness = Math.max(0, Math.min(100,
+      a.summary.productionReadinessPercent + (autoFixable.filter(f => f.severity === "Critical").length * 12)
+      + (autoFixable.filter(f => f.severity === "High").length * 7)
+      + (autoFixable.filter(f => f.severity === "Medium").length * 3)
+    ));
+
+    return {
+      success: true,
+      mode: "remediation-plan",
+      message: `Remediation plan ready: ${autoFixable.length} auto-fixable, ${manual.length} manual-review findings. NOTHING modified yet. Say "plan approve karo" to begin safe fixes (each with confirmation + backup).`,
+      summary: {
+        ...a.summary,
+        autoFixable: autoFixable.length,
+        manualReview: manual.length,
+        estimatedReadinessAfterAutoFix: estimatedReadiness,
+      },
+      gitStatus,
+      autoFixableFindings: autoFixable.slice(0, 100),
+      manualFindings: manual.slice(0, 100),
+      report: L.join("\n"),
+      note: "Plan is read-only. Execution requires explicit approval and runs through confirmation + backup-before-modification. Secret values are never displayed.",
+      requestedAs: String(originalInput || "").slice(0, 200),
+    };
   }
 
   // ============================================================
@@ -918,6 +1119,14 @@ FORMAT:
       return { success: true, action: "inspect", target: "project", parameters: { deep: true, originalInput: input }, riskLevel: 1, confidence: 0.85 };
     }
 
+    // --- REMEDIATION PLAN (v3.4 — before fix-bugs so "fix findings" wins) ---
+    if (/(fix|repair|resolve|patch|auto[\s-]?fix)\b[\s\S]{0,60}\b(findings?|kami|kamiyan|vulnerabilit)/i.test(lower) ||
+        /(safe\s+fixes|security\s+fixes|critical\s+security\s+fixes)/i.test(lower) ||
+        /(production[\s-]*ready)/i.test(lower) ||
+        /(systematically\s+(karo|fix))/i.test(lower)) {
+      return { success: true, action: "inspect", target: "project", parameters: { remediationPlan: true, originalInput: input }, riskLevel: 1, confidence: 0.85 };
+    }
+
     // --- INSPECT ---
     if (/(inspect|explore|browse|show\s+structure|list\s+files|directory|tree)\b.*(project|code|app|structure|files|directory)/i.test(lower) ||
         /^inspect/i.test(lower) ||
@@ -1010,7 +1219,7 @@ FORMAT:
     return {
       success: false,
       error: `Could not understand command: "${input.slice(0, 200)}"`,
-      suggestion: "Try: inspect project, run tests, check health, show actions, fix bugs, check security, show incidents, show history, verify all — 'deep analysis karo', 'report dikhao', 'file ka path btao', 'findings verify karo'"
+      suggestion: "Try: inspect project, run tests, check health, show actions, fix bugs, check security, show incidents, show history, verify all — 'deep analysis karo', 'report dikhao', 'file ka path btao', 'findings verify karo', 'remediation plan banao', 'plan approve karo'"
     };
   }
 
@@ -1224,7 +1433,7 @@ FORMAT:
         };
       }
 
-      // --- INSPECT (simple / deep analysis / cached report / verification) ---
+      // --- INSPECT (simple / deep analysis / cached report / verification / remediation plan) ---
       case "inspect": {
         if (parameters?.showLast) {
           if (!this.lastAnalysis) {
@@ -1237,6 +1446,9 @@ FORMAT:
         }
         if (parameters?.verifyFindings) {
           return this._verifyFindings(5);
+        }
+        if (parameters?.remediationPlan) {
+          return await this._buildRemediationPlan(parameters.originalInput || input);
         }
         if (parameters?.deep) {
           return this._analyzeProject(parameters.originalInput || input);
@@ -1268,7 +1480,7 @@ FORMAT:
           const incident = await im.createIncident({
             severity: "LOW", source: "owner_command", component: target || "project",
             category: "code_review", description: `Owner requested auto-fix: ${target || "project"}`,
-            evidence: { ownerCommand: true, target, action: "fix-bugs" }, probableCause: "Owner initiated fix"
+            evidence: { ownerCommand: true, target, action: "fix-bugs", remediation: parameters?.remediation === true }, probableCause: "Owner initiated fix"
           });
           if (!incident) return { success: true, message: "Fix already in progress." };
           const result = await getSecurityAgent().handleIncident(incident);
@@ -1913,8 +2125,9 @@ Suggest a single fix action. Return JSON: {"action":"modify-file|run-command","p
     return {
       success: status === "completed", commandId, status,
       timestamp: new Date().toISOString(),
-      alex: { system: "ALEX Owner Command Handler", version: "3.3.0", capabilities: [
+      alex: { system: "ALEX Owner Command Handler", version: "3.4.0", capabilities: [
         "natural-language-commands", "goal-classifier", "deep-analysis", "cached-report",
+        "remediation-plan", "plan-execute",
         "create-file", "modify-file", "delete-file",
         "project-inspection", "test-execution", "approved-command-execution",
         "audit-logging", "backup-before-modification", "path-traversal-protection",
