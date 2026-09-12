@@ -1,6 +1,7 @@
 // ============================================================
 // ALEX Dashboard Routes — Mounted at /api/alex/*
 // FIXED: Synchronous router creation, proper auth, no async issues
+// FIXED: audit variable bug in GET /incidents/:id
 // ============================================================
 
 const express = require("express");
@@ -67,8 +68,8 @@ async function createDashboardRouter() {
       const im = getIncidentManager();
       const incident = await im.getIncident(req.params.id);
       if (!incident) return res.status(404).json({ success: false, message: "Not found" });
-      const audit = getAuditLogger();
-      const auditEvents = await audit.getByIncident(req.params.id);
+      const auditLogger = getAuditLogger();
+      const auditEvents = await auditLogger.getByIncident(req.params.id);
       res.json({ success: true, data: { incident, auditEvents } });
     } catch (err) {
       res.status(500).json({ success: false, message: err.message });

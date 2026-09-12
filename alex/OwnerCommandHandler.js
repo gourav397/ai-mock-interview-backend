@@ -1,7 +1,9 @@
 // ============================================================
-// ALEX OWNER COMMAND HANDLER — PREMIUM PRODUCTION VERSION 3.0
+// ALEX OWNER COMMAND HANDLER — PREMIUM PRODUCTION VERSION 3.1
 // COMPLETE FILE WITH ALL FIXES:
 //   ✓ Natural language parsing (50+ variations)
+//   ✓ NEW: Goal Classifier for long natural-language build goals
+//   ✓ NEW: Rich diagnostics on parse failure (no blind errors)
 //   ✓ File creation with content extraction
 //   ✓ Multiline code writing
 //   ✓ Cross-platform test execution (npm.cmd on Windows)
@@ -11,7 +13,10 @@
 //   ✓ Command history
 //   ✓ Audit logging
 //   ✓ Protected-path enforcement
+//   ✓ Protected-file boundary
 //   ✓ Self-verification
+//   ✓ Fix-loop
+//   ✓ Security-scan
 // ============================================================
 
 const {
@@ -100,6 +105,7 @@ class OwnerCommandHandler {
           understood: input,
           error: "Could not understand the command.",
           details: parsed.error,
+          diagnostics: parsed.diagnostics || null,
           suggestion: parsed.suggestion || "Try: inspect project, run tests, check health, show actions, fix bugs, show incidents, show history"
         });
       }
@@ -173,6 +179,7 @@ class OwnerCommandHandler {
 
   // ============================================================
   // COMMAND PARSER — COMPREHENSIVE NLU
+  // Order: deterministic file parser → AI parser → regex NLU → goal classifier
   // ============================================================
 
   async _parseCommand(input) {
@@ -182,11 +189,12 @@ class OwnerCommandHandler {
 
     const trimmed = input.trim();
 
-    // DETERMINISTIC PARSER runs FIRST for file commands
+    // PRIORITY 1 — DETERMINISTIC PARSER for file commands
     const deterministic = this._parseFileCommand(trimmed);
     if (deterministic) return deterministic;
 
-    // AI PARSER (if available)
+    // PRIORITY 2 — AI PARSER (if available)
+    let aiParseError = null;
     if (config.ai?.available) {
       try {
         const allowedActions = CommandAllowlist.getAllowedActions()
@@ -217,13 +225,247 @@ FORMAT:
         const result = await callGemini(prompt, { temperature: 0, timeoutMs: 15000 });
         const normalized = this._normalizeAIParse(result, trimmed);
         if (normalized && normalized.success) return normalized;
+        aiParseError = "AI parser returned no usable action (unavailable, malformed JSON, quota, or unknown action).";
       } catch (error) {
+        aiParseError = `AI parser error: ${error.message}`;
         console.log("[ALEX] AI parser fallback:", error.message);
       }
+    } else {
+      aiParseError = "AI parser unavailable (config.ai.available = false).";
     }
 
-    // FALLBACK PARSER — comprehensive NLU
-    return this._fallbackParse(trimmed);
+    // PRIORITY 3 — REGEX FALLBACK PARSER
+    const fallback = this._fallbackParse(trimmed);
+    if (fallback.success) return fallback;
+
+    // PRIORITY 4 — GOAL CLASSIFIER (natural-language build/implement goals)
+    const goal = this._parseGoal(trimmed, aiParseError, fallback.error);
+    if (goal) return goal;
+
+    // All parsers failed — return rich diagnostics
+    return {
+      ...fallback,
+      diagnostics: {
+        reason: "Command matched none of: file-command parser, AI parser, regex NLU patterns, goal classifier.",
+        aiParser: aiParseError,
+        regexNlu: "No regex pattern matched.",
+        goalClassifier: "No build/implement intent detected.",
+        inputLength: trimmed.length,
+        isMultiLine: trimmed.includes("\n"),
+      },
+    };
+  }
+
+  // ============================================================
+  // GOAL CLASSIFIER — natural-language build/implement goals
+  // Converts long owner goals (e.g. "Build an authorized CCTV
+  // Security Control module...") into structured file actions.
+  // ============================================================
+
+  _parseGoal(input, aiParseError = null, regexError = null) {
+    const lower = input.toLowerCase();
+
+    // Build/implement intent detection
+    const buildIntent = /\b(build|create|implement|develop|scaffold|generate|write|make|add)\b[\s\S]{0,40}\b(module|feature|component|system|service|class|library|controller|api|dashboard|script|utility|tool|handler|manager)\b/.test(lower);
+    const modifyIntent = /\b(update|extend|refactor|improve|rewrite)\b[\s\S]{0,30}\b(module|feature|component|class|service|handler|manager)\b/.test(lower);
+
+    if (!buildIntent && !modifyIntent) return null;
+
+    const moduleName = this._extractModuleName(input);
+    const existing = modifyIntent ? this._guessExistingFile(moduleName) : null;
+
+    let fileName;
+    let action;
+    if (modifyIntent && existing) {
+      action = "modify-file";
+      fileName = existing;
+    } else if (modifyIntent) {
+      // Modify intent but file not found — create it instead of failing
+      action = "create-file";
+      fileName = `modules/${this._toSnakeCase(moduleName)}.js`;
+    } else {
+      action = "create-file";
+      fileName = `modules/${this._toSnakeCase(moduleName)}.js`;
+    }
+
+    const requirements = this._parseRequirements(input);
+    const content = this._buildModuleScaffold(moduleName, requirements, input);
+
+    const reasonBits = [];
+    reasonBits.push(`Detected natural-language ${modifyIntent ? "modification" : "build"} goal → routed to ${action} with generated scaffold for "${moduleName}".`);
+    if (aiParseError) reasonBits.push(`(AI parser: ${aiParseError})`);
+    if (regexError) reasonBits.push(`(Regex NLU: ${String(regexError).slice(0, 120)})`);
+
+    return {
+      success: true,
+      action,
+      target: fileName,
+      parameters: {
+        path: fileName,
+        content,
+        originalInput: input,
+        source: "goal-classifier",
+      },
+      riskLevel: action === "modify-file" ? 2 : 1,
+      confidence: 0.8,
+      reason: reasonBits.join(" "),
+      parsedBy: "goal-classifier",
+    };
+  }
+
+  _extractModuleName(input) {
+    // Quoted name first
+    const quoted = input.match(/["'`]([A-Za-z][A-Za-z0-9 _-]{2,40})["'`]/);
+    if (quoted) return quoted[1].trim();
+
+    // TitleCase / Capitalized phrase (e.g. "CCTV Security Control")
+    const title = input.match(/\b([A-Z][a-zA-Z0-9]*(?:\s+[A-Z][a-zA-Z0-9]*){1,5})\b/);
+    if (title && !/^(the|this|owner|alex)/i.test(title[1])) return title[1];
+
+    // "... module for X" pattern
+    const forMatch = input.match(/\b(?:module|system|service|component|handler|manager)\b[\s\S]{0,30}\bfor\b\s+(?:my\s+|the\s+)?([A-Za-z0-9 _-]{3,40})/i);
+    if (forMatch) {
+      const cleaned = forMatch[1].trim().replace(/\s+(system|cameras?|devices?).*$/i, "").trim();
+      if (cleaned) return cleaned;
+    }
+
+    return "CustomModule";
+  }
+
+  _toSnakeCase(name) {
+    return String(name)
+      .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+      .replace(/[^a-zA-Z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .toLowerCase() || "custom_module";
+  }
+
+  _guessExistingFile(moduleName) {
+    const candidates = [
+      `modules/${this._toSnakeCase(moduleName)}.js`,
+      `${this._toSnakeCase(moduleName)}.js`,
+      `${this._toSnakeCase(moduleName)}.ts`,
+    ];
+    for (const rel of candidates) {
+      const validation = CommandAllowlist.validateFilePath(rel);
+      if (validation.valid && fs.existsSync(validation.resolved)) return rel;
+    }
+    return null;
+  }
+
+  _parseRequirements(input) {
+    const lines = input.split(/\n+/).map(l => l.trim()).filter(Boolean);
+    const reqs = [];
+    for (const line of lines) {
+      const m = line.match(/^\d+[\).\s]+(.+)$/);
+      if (m) reqs.push(m[1].replace(/\*+/g, "").trim());
+    }
+    return reqs;
+  }
+
+  _buildModuleScaffold(moduleName, requirements, originalInput) {
+    const isDeviceModule = /\b(camera|cctv|nvr|iot|device|sensor|lock)\b/i.test(originalInput);
+    const safeCommentInput = String(originalInput).slice(0, 200).replace(/\*\//g, "").replace(/\r?\n/g, " ");
+    const className = moduleName.replace(/[^A-Za-z0-9]/g, "") || "CustomModule";
+
+    const lines = [
+      "// ============================================================",
+      `// ${moduleName} — generated by ALEX goal-classifier`,
+      `// Owner request: ${safeCommentInput}`,
+      "// ============================================================",
+      "",
+      "// SAFETY CONTRACT (applies to device-related modules):",
+      "//  - Only owner-registered/authorized devices may be managed.",
+      "//  - NO network scanning, discovery, or access of unknown devices.",
+      "//  - Proximity/IP/location alone never grants authorization.",
+      "//  - All control actions are reversible, confirmed, and audited.",
+      "//  - Fail-safe: on communication loss, devices return to default state.",
+      "",
+      `class ${className} {`,
+      "  constructor(options = {}) {",
+      "    this.options = options;",
+      "    this.initialized = false;",
+      "    this.auditLog = [];",
+      "    this.authorized = new Map();",
+      "  }",
+      "",
+      "  async init() {",
+      "    // TODO: initialize per requirements below",
+      "    this.initialized = true;",
+      "    return this;",
+      "  }",
+      "",
+      "  _audit(action, target, result) {",
+      "    this.auditLog.push({ action, target, result, timestamp: new Date().toISOString() });",
+      "  }",
+      "",
+    ];
+
+    if (requirements.length) {
+      lines.push("  // ---- Owner requirements (for implementation) ----");
+      for (const r of requirements.slice(0, 20)) {
+        lines.push("  // * " + r.replace(/\*\//g, "").replace(/\r?\n/g, " "));
+      }
+      lines.push("");
+    }
+
+    if (isDeviceModule) {
+      lines.push(
+        "  // Owner-registered device registry — devices must be pre-authorized",
+        "  // via explicit registration (id + official API details supplied by owner).",
+        "  registerAuthorizedDevice(device) {",
+        "    if (!device || !device.id || !device.apiBaseUrl) {",
+        "      throw new Error(\"Device registration requires id and official API base URL\");",
+        "    }",
+        "    this.authorized.set(device.id, { ...device, registeredAt: new Date().toISOString() });",
+        "    this._audit(\"register-device\", device.id, \"ok\");",
+        "    return true;",
+        "  }",
+        "",
+        "  _requireAuthorized(deviceId) {",
+        "    const d = this.authorized.get(deviceId);",
+        "    if (!d) throw new Error(\"Device not registered as owner-authorized: \" + deviceId);",
+        "    return d;",
+        "  }",
+        "",
+        "  // Temporary pause via device's OFFICIAL management interface only",
+        "  async pauseDevice(deviceId) {",
+        "    const device = this._requireAuthorized(deviceId);",
+        "    try {",
+        "      const res = await fetch(device.apiBaseUrl + \"/pause\", { method: \"POST\", headers: device.authHeaders || {} });",
+        "      this._audit(\"pause\", deviceId, res.ok ? \"ok\" : \"failed\");",
+        "      return res.ok;",
+        "    } catch (err) {",
+        "      this._audit(\"pause\", deviceId, \"error: \" + err.message);",
+        "      throw new Error(\"Communication lost — device left unchanged (fail-safe)\");",
+        "    }",
+        "  }",
+        "",
+        "  async restoreDevice(deviceId) {",
+        "    const device = this._requireAuthorized(deviceId);",
+        "    try {",
+        "      const res = await fetch(device.apiBaseUrl + \"/resume\", { method: \"POST\", headers: device.authHeaders || {} });",
+        "      this._audit(\"restore\", deviceId, res.ok ? \"ok\" : \"failed\");",
+        "      return res.ok;",
+        "    } catch (err) {",
+        "      this._audit(\"restore\", deviceId, \"error: \" + err.message);",
+        "      throw new Error(\"Communication lost — device left unchanged (fail-safe)\");",
+        "    }",
+        "  }",
+        "",
+        "  healthCheck(deviceId) {",
+        "    const device = this._requireAuthorized(deviceId);",
+        "    this._audit(\"health-check\", deviceId, \"reported\");",
+        "    return { deviceId, status: \"unknown\", note: \"Report unsupported/unverifiable devices instead of controlling them\" };",
+        "  }",
+        "",
+      );
+    }
+
+    lines.push("}", "");
+    lines.push(`module.exports = { ${className} };`, "");
+
+    return lines.join("\n");
   }
 
   // ============================================================
@@ -353,7 +595,7 @@ FORMAT:
     return {
       success: false,
       error: `Could not understand command: "${input.slice(0, 200)}"`,
-      suggestion: "Try: inspect project, run tests, check health, show actions, fix bugs, check security, show incidents, show history, verify all"
+      suggestion: "Try: inspect project, run tests, check health, show actions, fix bugs, check security, show incidents, show history, verify all — or state a build goal like 'Build a <name> module'"
     };
   }
 
@@ -365,7 +607,7 @@ FORMAT:
 
     // Create file detection
     const createMatch = normalized.match(/\b(?:create|make|add|generate|write|save|build)\b[\s\S]*?\bfile\b[\s\S]*?(?:"([^"]+\.[A-Za-z0-9]+)"|'([^']+\.[A-Za-z0-9]+)'|`([^`]+\.[A-Za-z0-9]+)`|([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+))/i);
-    
+
     if (createMatch || /\bcreate\s+file\b/i.test(normalized)) {
       const filePath = createMatch?.[1] || createMatch?.[2] || createMatch?.[3] || createMatch?.[4];
       if (!filePath) {
@@ -380,7 +622,7 @@ FORMAT:
 
     // Modify file detection
     const modifyMatch = normalized.match(/\b(?:modify|edit|update|rewrite|change|replace)\b[\s\S]*?\b(?:file|code)\b[\s\S]*?(?:"([^"]+\.[A-Za-z0-9]+)"|'([^']+\.[A-Za-z0-9]+)'|`([^`]+\.[A-Za-z0-9]+)`|([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+))/i);
-    
+
     if (modifyMatch) {
       const filePath = modifyMatch[1] || modifyMatch[2] || modifyMatch[3] || modifyMatch[4];
       const content = this._extractFileContent(normalized, filePath);
@@ -457,10 +699,16 @@ FORMAT:
     if (!result) return null;
     let parsed = result;
     if (typeof result === "string") {
-      try { parsed = JSON.parse(this._extractJSON(result)); } catch { return null; }
+      try { parsed = JSON.parse(this._extractJSON(result)); } catch {
+        console.log("[ALEX] AI parse rejected: malformed JSON. Raw:", String(result).slice(0, 200));
+        return null;
+      }
     }
     if (!parsed || typeof parsed !== "object") return null;
-    if (!parsed.action || parsed.action === "unknown") return null;
+    if (!parsed.action || parsed.action === "unknown") {
+      console.log("[ALEX] AI parse rejected: no/unknown action. Raw:", String(result).slice(0, 200));
+      return null;
+    }
 
     const action = String(parsed.action).trim();
     const parameters = parsed.parameters && typeof parsed.parameters === "object" ? { ...parsed.parameters } : {};
@@ -471,6 +719,7 @@ FORMAT:
       const local = this._parseFileCommand(originalInput);
       if (local) return local;
       if (!parameters.path && (!target || target === "project")) {
+        console.log("[ALEX] AI parse rejected: file action without extractable path.");
         return { success: false, error: "File action detected but filename/path was not extracted." };
       }
     }
@@ -479,6 +728,7 @@ FORMAT:
       success: true, action, target, parameters,
       riskLevel: typeof parsed.riskLevel === "number" ? parsed.riskLevel : 1,
       confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.5,
+      parsedBy: "ai",
     };
   }
 
@@ -1233,8 +1483,8 @@ Suggest a single fix action. Return JSON: {"action":"modify-file|run-command","p
     return {
       success: status === "completed", commandId, status,
       timestamp: new Date().toISOString(),
-      alex: { system: "ALEX Owner Command Handler", version: "3.0.0", capabilities: [
-        "natural-language-commands", "create-file", "modify-file", "delete-file",
+      alex: { system: "ALEX Owner Command Handler", version: "3.1.0", capabilities: [
+        "natural-language-commands", "goal-classifier", "create-file", "modify-file", "delete-file",
         "project-inspection", "test-execution", "approved-command-execution",
         "audit-logging", "backup-before-modification", "path-traversal-protection",
         "protected-file-boundary", "self-verification", "fix-loop", "security-scan"
