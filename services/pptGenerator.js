@@ -1,27 +1,33 @@
 // ============================================================
-// services/pptGenerator.js — PREMIUM CONTENT-AWARE PPT ENGINE
-// Cinematic covers/sections, glass cards, KPI cards, process
-// flows, native charts, base64 images, OOXML transitions +
-// entrance animations, auto-advance 4.5–11s, blank-slide QC.
-// Existing API contract + exports preserved.
+// services/pptGenerator.js
+// TRUE PREMIUM / PROFESSIONAL AI PRESENTATION DESIGN ENGINE
+// Backward-compatible with the existing PPT API.
 // ============================================================
+
+require("dotenv").config();
 
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
 const https = require("https");
-const JSZip = require("jszip");
+const crypto = require("crypto");
 const PptxGenJS = require("pptxgenjs");
+const JSZip = require("jszip");
+
 const { geminiGenerate, extractJSON } = require("../config/geminiClient");
 const { keyManager } = require("../config/geminiKeys");
-const { THEMES, GRID, getTheme } = require("./pptThemes");
+const { getTheme, THEMES, GRID } = require("./pptThemes");
 
-const PPT_DIR = path.join(process.cwd(), "uploads", "ppt");
-const MIN_SLIDES = 4;
+const PPT_DIR = path.join(__dirname, "..", "uploads", "ppt");
+const TTL_HOURS = positiveInt(process.env.PPT_FILE_TTL_HOURS, 72);
+const MIN_SLIDES = 5;
 const MAX_SLIDES = 20;
-const TTL_HOURS = Number(process.env.PPT_FILE_TTL_HOURS || 72);
-const AUTO_ADVANCE_MIN_MS = 4500;
-const AUTO_ADVANCE_MAX_MS = 11000;
+const MAX_TOPIC_LEN = 300;
+const CHUNK_SIZE = 7;
+const CONTENT_MAX_BULLETS = 6;
+const BULLET_MAX_LEN = 160;
+const IMAGE_TIMEOUT_MS = 7000;
+const IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+const DEVANAGARI_FONT = "Nirmala UI";
 
 const LANGUAGES = ["English", "Hindi", "Bilingual"];
 const TYPES = ["Student", "Professional", "Educational", "Interview", "General"];
@@ -31,529 +37,971 @@ const TRANSITION_MODES = ["Off", "Subtle", "Dynamic"];
 const ANIMATION_MODES = ["Off", "Subtle", "Professional"];
 const CHART_MODES = ["Auto", "Off"];
 const NARRATION_MODES = ["Off", "On"];
+const AUTO_ADVANCE_MIN_MS = 4500;
+const AUTO_ADVANCE_MAX_MS = 11000;
+
 const KNOWN_LAYOUTS = [
-  "title", "section", "agenda", "bullets", "panelBullets", "kpi",
-  "process", "quote", "imageText", "textImage", "fullImage",
-  "twoColumn", "comparison", "chart", "thanks",
+  "title", "section", "bullets", "twoColumn", "threeCards", "fourCards",
+  "fiveCards", "comparison", "timeline", "process", "stats", "quote",
+  "imageText", "textImage", "fullImage", "flow", "grid", "problemSolution",
+  "beforeAfter", "prosCons", "diagram", "summary", "thanks",
 ];
 
-// ------------------------------------------------------------
-// OPTION VALIDATION (backward-compatible)
-// ------------------------------------------------------------
+const PRESENTATION_W = GRID.width;
+const PRESENTATION_H = GRID.height;
+
+function positiveInt(value, fallback) {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+// ============================================================
+// JSON / TEXT
+// ============================================================
+
+function repairTruncatedJson(text) {
+  try {
+    let inString = false;
+    let escaped = false;
+    const stack = [];
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (c === "\\") escaped = true;
+        else if (c === '"') inString = false;
+        continue;
+      }
+      if (c === '"') inString = true;
+      else if (c === "{") stack.push("}");
+      else if (c === "[") stack.push("]");
+      else if (c === "}" || c === "]") {
+        if (stack[stack.length - 1] !== c) return null;
+        stack.pop();
+      }
+    }
+    let output = text;
+    if (inString) output += '"';
+    output = output.replace(/,\s*$/, "");
+    while (stack.length) output += stack.pop();
+    return output;
+  } catch {
+    return null;
+  }
+}
+
+function parseAIJson(text) {
+  if (!text) return null;
+  try {
+    const value = extractJSON(text);
+    if (value && typeof value === "object") return value;
+  } catch {}
+  const raw = String(text);
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+  const value = raw.slice(start);
+  try { return JSON.parse(value); } catch {}
+  const repaired = repairTruncatedJson(value);
+  try { return repaired ? JSON.parse(repaired) : null; } catch { return null; }
+}
+
+function cleanText(value, max = BULLET_MAX_LEN) {
+  return String(value == null ? "" : value)
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
+function shorten(text, max) {
+  const value = cleanText(text, max);
+  if (String(text || "").length <= max) return value;
+  return value.slice(0, Math.max(1, max - 1)).trimEnd() + "…";
+}
+
+function pick(value, allowed, fallback) {
+  const v = String(value || "");
+  return allowed.includes(v) ? v : fallback;
+}
+
+function parseBool(value) {
+  return value === true || value === 1 || value === "1" || value === "true" || value === "on" || value === "On";
+}
+
 function validatePPTOptions(opts = {}) {
   const errors = [];
-  const num = (v, def, min, max) => {
-    const n = Number.parseInt(v, 10);
-    if (Number.isNaN(n)) return def;
-    return Math.max(min, Math.min(max, n));
-  };
-  const pick = (v, list, def) => (list.includes(v) ? v : def);
+  const topic = cleanText(opts.topic, MAX_TOPIC_LEN);
+  if (!topic) errors.push("Topic required hai");
+  if (topic.length > MAX_TOPIC_LEN) errors.push(`Topic max ${MAX_TOPIC_LEN} characters`);
 
-  const clean = {
-    topic: String(opts.topic || "").trim().slice(0, 300),
-    slideCount: num(opts.slides ?? opts.slideCount, 8, MIN_SLIDES, MAX_SLIDES),
-    language: pick(opts.language, LANGUAGES, "English"),
-    type: pick(opts.type, TYPES, "General"),
-    theme: pick(opts.theme, THEME_NAMES, "Modern"),
-    layoutStyle: pick(opts.layoutStyle, LAYOUT_STYLES, "AI Auto"),
-    addImages: opts.addImages === true || opts.addImages === "true" || opts.addImages === 1,
-    speakerNotes: opts.speakerNotes !== false,
-    transitions: pick(opts.transitions, TRANSITION_MODES, "Subtle"),
-    animations: pick(opts.animations, ANIMATION_MODES, "Off"),
-    charts: pick(opts.charts, CHART_MODES, "Auto"),
-    narration: pick(opts.narration, NARRATION_MODES, "Off") === "On",
-  };
+  const requestedSlides = opts.slides ?? opts.slideCount;
+  const slides = parseInt(requestedSlides, 10);
+  if (!Number.isFinite(slides) || slides < MIN_SLIDES || slides > MAX_SLIDES) {
+    errors.push(`Slides ${MIN_SLIDES}-${MAX_SLIDES} ke beech hone chahiye`);
+  }
 
-  if (!clean.topic) errors.push("Topic required hai");
-  if (clean.topic.length < 3) errors.push("Topic kam se kam 3 characters ka hona chahiye");
-  return { errors, clean };
+  const language = String(opts.language || "English");
+  const type = String(opts.type || "General");
+  const theme = String(opts.theme || THEME_NAMES[0] || "Modern");
+  if (!LANGUAGES.includes(language)) errors.push("Invalid language");
+  if (!TYPES.includes(type)) errors.push("Invalid presentation type");
+  if (!THEMES[theme]) errors.push("Invalid theme");
+
+  return {
+    errors,
+    clean: {
+      topic,
+      slides: Number.isFinite(slides) ? Math.min(MAX_SLIDES, Math.max(MIN_SLIDES, slides)) : 10,
+      language,
+      type,
+      theme,
+      addImages: parseBool(opts.addImages),
+      speakerNotes: opts.speakerNotes !== false,
+      layoutStyle: pick(opts.layoutStyle, LAYOUT_STYLES, "AI Auto"),
+      transitions: pick(opts.transitions, TRANSITION_MODES, "Dynamic"),
+      animations: pick(opts.animations, ANIMATION_MODES, "Professional"),
+      charts: pick(opts.charts, CHART_MODES, "Auto"),
+      narration: parseBool(opts.narration),
+    },
+  };
 }
 
-// ------------------------------------------------------------
-// AI CONTENT GENERATION
-// ------------------------------------------------------------
-function buildPrompt(cfg) {
-  const langLine = {
-    English: "Write everything in English.",
-    Hindi: "Sab kuch Hindi (Devanagari) me likho. English words sirf zaroorat par.",
-    Bilingual: "Har line bilingual likho: English sentence then Hindi translation separated by ' / '.",
-  }[cfg.language];
+// ============================================================
+// CONTENT-AWARE DESIGN PLAN
+// ============================================================
 
-  const audience = {
-    Student: "College students (clear, exam-oriented)",
-    Professional: "Working professionals (business tone, ROI, metrics)",
-    Educational: "Teachers/trainers (definitions, examples, mnemonics)",
-    Interview: "Interview prep (frequent questions, model answers)",
-    General: "General audience (simple, engaging)",
-  }[cfg.type];
-
-  return `You are a world-class presentation designer + content writer.
-Create premium presentation content for topic: "${cfg.topic}"
-Slides: exactly ${cfg.slideCount}. Audience: ${audience}. ${langLine}
-
-For EACH slide return:
-- slideNumber (1..N)
-- layout: one of ${KNOWN_LAYOUTS.join(", ")}
-- title (<=60 chars)
-- content: array of 2-6 SHORT lines (each <=110 chars)
-- kpis: ONLY for kpi layout — array of {label, value} (3-4 items)
-- steps: ONLY for process layout — array of {step, desc} (3-5 items)
-- quote: ONLY for quote layout (a strong quote line)
-- quoteBy: ONLY for quote layout (attribution)
-- left/right: ONLY for twoColumn/comparison — arrays of SHORT lines
-- leftTitle/rightTitle: headers for twoColumn/comparison
-- chartSpec: ONLY if layout chart or data is numeric — {type: "bar"|"line"|"pie"|"doughnut", labels:[...], values:[numbers], title}
-- imagePrompt: short English image-search style prompt (only for imageText/textImage/fullImage)
-- speakerNotes: 1-2 sentence notes
-- narrationScript: 2-3 spoken sentences
-
-Structure rules:
-Slide 1 layout MUST be "title", last slide "thanks". Insert "section" divider before each major part. Use variety: at most 2 "bullets"; include at least one of agenda/kpi/process/comparison/chart when slideCount >= 6.
-Return ONLY valid JSON:
-{"title":"...","subtitle":"...","slides":[ ... ]}`;
+function layoutBiasHint(style) {
+  if (style === "Professional") return "Use executive, corporate layouts: stats, comparison, twoColumn, fourCards, process, summary. Use imagery sparingly.";
+  if (style === "Visual") return "Strongly prefer imageText, textImage, fullImage, timeline, process, flow, grid, stats and section slides. Minimize bullet-only slides.";
+  if (style === "Academic") return "Prefer twoColumn, timeline, diagram, quote, comparison, summary and evidence-focused layouts.";
+  return "Use the best layout for the content. Never repeat a layout on consecutive slides unless structurally necessary.";
 }
 
-function isQuotaError(error) {
-  const m = String(error?.message || "").toLowerCase();
-  return m.includes("quota") || m.includes("429") || m.includes("resource_exhausted");
+function languageRule(language) {
+  if (language === "Hindi") return "ALL visible presentation text must be proper Hindi in Devanagari. Never use Roman Hindi.";
+  if (language === "Bilingual") return 'Visible titles and bullets should use the format "English | Hindi". Keep each side concise.';
+  return "ALL visible presentation text must be in English.";
+}
+
+function buildChunkPrompt(cfg, chunkNo, totalChunks, startNo, count, mainTitle) {
+  return `
+You are a world-class presentation strategist and premium presentation designer.
+Create content for a professional ${cfg.type} presentation.
+
+TOPIC: ${cfg.topic}
+LANGUAGE: ${cfg.language}
+${languageRule(cfg.language)}
+DESIGN STYLE: ${cfg.layoutStyle}
+${layoutBiasHint(cfg.layoutStyle)}
+
+This is content chunk ${chunkNo}/${totalChunks}, for slides ${startNo}-${startNo + count - 1}.
+Main title: ${mainTitle || cfg.topic}
+
+STORYTELLING:
+Build a coherent narrative. Think like a premium consultant deck:
+cover -> context/problem -> key concepts -> evidence/examples -> visual explanation -> insights -> conclusion.
+Do not make slides feel like disconnected notes.
+
+AVAILABLE LAYOUTS:
+${KNOWN_LAYOUTS.join(", ")}
+
+LAYOUT SELECTION RULES:
+- title = premium cover only.
+- section = major section/divider, minimal text.
+- bullets = only when bullets are genuinely the best representation.
+- twoColumn = two related groups or contrasting ideas.
+- threeCards/fourCards/fiveCards = distinct categories/features; keep each item concise.
+- comparison = explicit A vs B / alternative comparison.
+- timeline = dates, eras or chronological progression.
+- process = sequential steps.
+- flow = logical workflow / system flow.
+- stats = meaningful numeric/KPI data. Include chartData with 3-6 objects.
+- quote = memorable quote + attribution.
+- imageText/textImage = meaningful image plus concise content.
+- fullImage = highly visual statement slide; still include readable title/overlay content.
+- grid = 4-6 categorized items.
+- problemSolution = problem on one side, solution on the other.
+- beforeAfter = before/current vs after/future.
+- prosCons = advantages vs limitations.
+- diagram = hierarchy, relationship or system explanation.
+- summary = key takeaways/conclusion.
+- thanks = final slide only.
+
+CONTENT QUALITY:
+- 3-6 concise content strings per normal slide.
+- Prefer short phrases over paragraphs.
+- Each content string should normally be under 110 characters.
+- Never invent fake statistics. Use stats only when the topic supports real/clearly framed illustrative numbers; mark illustrative data in the text when appropriate.
+- Never repeat the same idea across slides.
+- For imagePrompt, write an English visual description, no text inside the image.
+- For quote, content[0] is quote and content[1] is attribution.
+- For problemSolution/beforeAfter/prosCons, split content clearly using labels such as "Problem: ..." / "Solution: ...".
+- speakerNotes: 1-2 sentences.
+- narrationScript: natural 2-3 sentence spoken script.
+
+IMPORTANT:
+1. Slide ${startNo} is title ONLY if startNo is 1.
+2. The final requested slide should be thanks or summary depending on chunk position; the server will enforce the final bookend.
+3. Do not return markdown.
+4. Return ONLY valid JSON.
+
+JSON:
+{
+  "title": "...",
+  "subtitle": "...",
+  "slides": [
+    {
+      "slideNumber": ${startNo},
+      "layout": "bullets",
+      "title": "...",
+      "content": ["...", "...", "..."],
+      "imagePrompt": "",
+      "speakerNotes": "",
+      "narrationScript": "",
+      "chartData": [{"label":"...","value":10}]
+    }
+  ]
+}
+`;
+}
+
+function normalizeSlide(raw, expectedNo, cfg) {
+  if (!raw || typeof raw !== "object") return null;
+  const title = shorten(raw.title, 120);
+  if (!title) return null;
+
+  let content = Array.isArray(raw.content) ? raw.content : [];
+  content = content.map((x) => shorten(x, 150)).filter(Boolean).slice(0, CONTENT_MAX_BULLETS);
+  if (!content.length) content = [title];
+
+  let layout = String(raw.layout || "").trim();
+  if (!KNOWN_LAYOUTS.includes(layout)) layout = heuristicLayout({ title, content, chartData: raw.chartData }, cfg);
+  if (expectedNo === 1) layout = "title";
+
+  return {
+    slideNumber: expectedNo,
+    title,
+    content,
+    layout,
+    imagePrompt: cfg.addImages ? shorten(raw.imagePrompt || "", 240) : "",
+    speakerNotes: shorten(raw.speakerNotes || "", 600),
+    narrationScript: cfg.narration ? shorten(raw.narrationScript || "", 700) : "",
+    chartData: normalizeChartData(raw.chartData),
+  };
+}
+
+function normalizeChartData(raw) {
+  if (!Array.isArray(raw)) return null;
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const label = shorten(item.label, 36);
+    const value = Number(item.value);
+    if (label && Number.isFinite(value)) out.push({ label, value });
+  }
+  return out.length >= 3 && out.length <= 8 ? out : null;
+}
+
+function extractChartData(slide) {
+  if (slide && Array.isArray(slide.chartData) && slide.chartData.length >= 3) return slide.chartData;
+  const items = [];
+  for (const item of slide?.content || []) {
+    const text = String(item).trim();
+    const match = text.match(/^(.{1,45}?)\s*(?::|=|-|–)\s*(\d+(?:\.\d+)?)\s*%?\s*$/);
+    if (match) items.push({ label: shorten(match[1], 36), value: Number(match[2]) });
+  }
+  return items.length >= 3 && items.length <= 8 ? items : null;
+}
+
+function heuristicLayout(slide, cfg) {
+  const title = String(slide.title || "");
+  const content = slide.content || [];
+  const text = `${title} ${content.join(" ")}`.toLowerCase();
+  if (slide.slideNumber === 1) return "title";
+  if (/thank|धन्यवाद/.test(text)) return "thanks";
+  if (/summary|takeaway|conclusion|निष्कर्ष|सारांश/.test(text)) return "summary";
+  if (extractChartData(slide) && cfg.charts === "Auto") return "stats";
+  if (/problem.*solution|challenge.*solution|समस्या.*समाधान/.test(text)) return "problemSolution";
+  if (/before.*after|पहले.*बाद/.test(text)) return "beforeAfter";
+  if (/pros.*cons|advantages.*disadvantages|फायदे.*नुकसान/.test(text)) return "prosCons";
+  if (/\bvs\b|versus|comparison|तुलना/.test(text)) return "comparison";
+  if (/timeline|history|historical|chronolog|इतिहास|क्रम/.test(text)) return "timeline";
+  if (/step|process|how to|workflow|कैसे|प्रक्रिया/.test(text)) return "process";
+  if (/quote|says|according to|उद्धरण/.test(text) || /^[“"']/.test(content[0] || "")) return "quote";
+  if (/system|architecture|hierarchy|relationship|ecosystem|ढांचा|संबंध/.test(text)) return "diagram";
+  if (/\b(3|4|5|6)\b.*(features|types|categories|ways)|categories|features|types/.test(text)) return "fourCards";
+  if (cfg.addImages && content.length <= 4) return cfg.layoutStyle === "Visual" ? "imageText" : "textImage";
+  if (content.length >= 5) return "twoColumn";
+  return "bullets";
+}
+
+function fallbackSlide(no, total, cfg, title) {
+  const isFirst = no === 1;
+  const isLast = no === total;
+  if (isFirst) {
+    return {
+      slideNumber: no, title: title || cfg.topic, content: [
+        cfg.type === "General" ? "Professional presentation" : `${cfg.type} presentation`,
+        cfg.language === "Hindi" ? "मुख्य विषय और महत्वपूर्ण अंतर्दृष्टियाँ" : "Key concepts, insights and practical takeaways",
+      ], layout: "title", imagePrompt: "", speakerNotes: "", narrationScript: "", chartData: null,
+    };
+  }
+  if (isLast) {
+    return {
+      slideNumber: no,
+      title: cfg.language === "Hindi" ? "धन्यवाद" : cfg.language === "Bilingual" ? "Thank You | धन्यवाद" : "Thank You",
+      content: [cfg.language === "Hindi" ? "मुख्य सीख के लिए धन्यवाद" : cfg.language === "Bilingual" ? "Key takeaways | मुख्य सीख" : "Key takeaways"],
+      layout: "thanks", imagePrompt: "", speakerNotes: "", narrationScript: "", chartData: null,
+    };
+  }
+  return {
+    slideNumber: no,
+    title: `${title || cfg.topic} — Key Insight ${no - 1}`,
+    content: cfg.language === "Hindi"
+      ? ["मुख्य अवधारणा", "व्यावहारिक महत्व", "महत्वपूर्ण उदाहरण"]
+      : cfg.language === "Bilingual"
+      ? ["Core concept | मुख्य अवधारणा", "Practical value | व्यावहारिक महत्व", "Key example | महत्वपूर्ण उदाहरण"]
+      : ["Core concept", "Practical value", "Key example"],
+    layout: no % 4 === 0 ? "threeCards" : no % 3 === 0 ? "twoColumn" : "bullets",
+    imagePrompt: "", speakerNotes: "", narrationScript: "", chartData: null,
+  };
+}
+
+async function callAIChunk(cfg, startNo, count, mainTitle, chunkNo, totalChunks) {
+  if (keyManager && typeof keyManager.isQuotaExhausted === "function" && keyManager.isQuotaExhausted()) return null;
+  try {
+    const text = await geminiGenerate(buildChunkPrompt(cfg, chunkNo, totalChunks, startNo, count, mainTitle), 60000);
+    const parsed = parseAIJson(text);
+    if (!parsed || !Array.isArray(parsed.slides)) return null;
+    const slides = parsed.slides.map((s, i) => normalizeSlide(s, startNo + i, cfg)).filter(Boolean);
+    return { title: shorten(parsed.title || "", 120), subtitle: shorten(parsed.subtitle || "", 180), slides };
+  } catch (error) {
+    console.warn(`[PPT] AI chunk ${chunkNo}/${totalChunks} failed:`, error.message);
+    return null;
+  }
+}
+
+function enforceBookends(slides, cfg, total) {
+  if (!slides.length) return slides;
+  slides[0] = { ...slides[0], slideNumber: 1, layout: "title" };
+  if (slides.length >= 2) {
+    const last = slides[slides.length - 1];
+    slides[slides.length - 1] = {
+      ...last,
+      slideNumber: slides.length,
+      layout: "thanks",
+      title: cfg.language === "Hindi" ? "धन्यवाद" : cfg.language === "Bilingual" ? "Thank You | धन्यवाद" : "Thank You",
+      content: last.content?.length ? last.content.slice(0, 1) : [cfg.language === "Hindi" ? "मुख्य सीख" : "Key takeaways"],
+    };
+  }
+  return slides;
+}
+
+function enforceVariety(slides, cfg) {
+  const result = [...slides];
+  const alternatives = ["threeCards", "twoColumn", "grid", "process", "stats", "quote", "imageText", "textImage", "diagram", "summary"];
+  for (let i = 1; i < result.length - 1; i++) {
+    if (result[i].layout !== result[i - 1].layout) continue;
+    const candidate = alternatives[(i + result[i].title.length) % alternatives.length];
+    if (candidate === "stats" && !extractChartData(result[i])) continue;
+    if (["imageText", "textImage"].includes(candidate) && !cfg.addImages) continue;
+    result[i] = { ...result[i], layout: candidate };
+  }
+  return result;
 }
 
 async function generatePPTContent(cfg) {
-  const prompt = buildPrompt(cfg);
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const key = keyManager?.pickKey?.() || undefined;
-      const raw = await geminiGenerate(prompt, key);
-      const parsed = extractJSON(raw);
-      const slides = (parsed?.slides || []).filter((s) => s && s.title);
-      if (slides.length >= MIN_SLIDES) return normalizeContent(parsed, cfg);
-      console.warn(`[PPT] attempt ${attempt}: slides=${slides.length} — retry`);
-    } catch (error) {
-      console.warn(`[PPT] attempt ${attempt} fail:`, error.message);
-      if (isQuotaError(error)) throw error;
-      await new Promise((r) => setTimeout(r, 1200 * attempt));
+  const total = cfg.slides;
+  const chunks = [];
+  for (let start = 1; start <= total; start += CHUNK_SIZE) chunks.push({ start, count: Math.min(CHUNK_SIZE, total - start + 1) });
+
+  const slides = [];
+  let mainTitle = cfg.topic;
+  let subtitle = "";
+
+  // Bounded parallel generation: 2 Gemini requests at a time.
+  // This keeps 15-20 slide decks fast without creating a large quota spike.
+  const chunkResults = await mapWithConcurrency(chunks, 2, async (part, idx) =>
+    callAIChunk(cfg, part.start, part.count, mainTitle, idx + 1, chunks.length)
+  );
+
+  for (const result of chunkResults) {
+    if (result) {
+      if (result.title && mainTitle === cfg.topic) mainTitle = result.title;
+      if (result.subtitle && !subtitle) subtitle = result.subtitle;
+      slides.push(...result.slides);
     }
   }
-  return fallbackContent(cfg);
+
+  const normalized = [];
+  const seen = new Set();
+  for (const slide of slides) {
+    const key = `${slide.title.toLowerCase()}|${slide.content[0]?.toLowerCase() || ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(slide);
+    if (normalized.length >= total) break;
+  }
+
+  while (normalized.length < total) normalized.push(fallbackSlide(normalized.length + 1, total, cfg, mainTitle));
+  normalized.length = total;
+  normalized.forEach((s, i) => { s.slideNumber = i + 1; });
+
+  // Guarantee valid content and layouts.
+  for (let i = 0; i < normalized.length; i++) {
+    if (!normalized[i].title) normalized[i].title = `${mainTitle} — ${i + 1}`;
+    if (!Array.isArray(normalized[i].content) || !normalized[i].content.length) normalized[i].content = [normalized[i].title];
+    normalized[i].layout = KNOWN_LAYOUTS.includes(normalized[i].layout) ? normalized[i].layout : heuristicLayout(normalized[i], cfg);
+  }
+
+  const varied = enforceVariety(normalized, cfg);
+  enforceBookends(varied, cfg, total);
+  varied.forEach((s, i) => { s.slideNumber = i + 1; });
+
+  return { title: mainTitle || cfg.topic, subtitle, slides: varied };
 }
 
-function normalizeContent(parsed, cfg) {
-  const slides = (parsed.slides || []).map((s, i) => ({
-    slideNumber: i + 1,
-    layout: KNOWN_LAYOUTS.includes(s.layout) ? s.layout : "bullets",
-    title: String(s.title || "").slice(0, 110),
-    content: (Array.isArray(s.content) ? s.content : [String(s.content || "")])
-      .map((c) => String(c).slice(0, 150)).filter(Boolean).slice(0, 6),
-    kpis: Array.isArray(s.kpis) ? s.kpis.slice(0, 4) : null,
-    steps: Array.isArray(s.steps) ? s.steps.slice(0, 5) : null,
-    quote: s.quote ? String(s.quote).slice(0, 180) : "",
-    quoteBy: s.quoteBy ? String(s.quoteBy).slice(0, 60) : "",
-    left: Array.isArray(s.left) ? s.left.slice(0, 5) : null,
-    right: Array.isArray(s.right) ? s.right.slice(0, 5) : null,
-    leftTitle: s.leftTitle ? String(s.leftTitle).slice(0, 40) : "",
-    rightTitle: s.rightTitle ? String(s.rightTitle).slice(0, 40) : "",
-    chartSpec: s.chartSpec && Array.isArray(s.chartSpec.labels) && s.chartSpec.labels.length ? s.chartSpec : null,
-    imagePrompt: s.imagePrompt ? String(s.imagePrompt).slice(0, 140) : "",
-    speakerNotes: s.speakerNotes ? String(s.speakerNotes).slice(0, 400) : "",
-    narrationScript: s.narrationScript ? String(s.narrationScript).slice(0, 600) : "",
-  }));
-  // enforce bookends
-  if (slides.length) {
-    slides[0].layout = "title";
-    slides[slides.length - 1].layout = "thanks";
-  }
-  return {
-    title: String(parsed.title || cfg.topic).slice(0, 120),
-    subtitle: String(parsed.subtitle || `A premium presentation on ${cfg.topic}`).slice(0, 160),
-    slides,
-  };
-}
+// ============================================================
+// IMAGE PIPELINE
+// ============================================================
 
-function fallbackContent(cfg) {
-  const n = cfg.slideCount;
-  const empty = { kpis: null, steps: null, quote: "", quoteBy: "", left: null, right: null, leftTitle: "", rightTitle: "", chartSpec: null, imagePrompt: "", speakerNotes: "", narrationScript: "" };
-  const slides = [{ slideNumber: 1, layout: "title", title: cfg.topic, content: ["Premium AI Presentation", "AI Interview"], ...empty }];
-  for (let i = 2; i <= n - 1; i++) {
-    slides.push({
-      slideNumber: i,
-      layout: i === 2 ? "agenda" : i % 3 === 0 ? "panelBullets" : "bullets",
-      title: `${cfg.topic} — Part ${i - 1}`,
-      content: [`${cfg.topic} ka key point ${i - 1}`, "Important insight", "Practical example"],
-      ...empty,
-    });
-  }
-  slides.push({ slideNumber: n, layout: "thanks", title: "Thank You", content: ["Questions & Discussion"], ...empty });
-  return { title: cfg.topic, subtitle: "AI Interview Premium Deck", slides };
-}
-
-// ------------------------------------------------------------
-// CHART DATA EXTRACT
-// ------------------------------------------------------------
-function extractChartData(slide) {
-  if (!slide) return null;
-  if (slide.chartSpec?.labels?.length && slide.chartSpec?.values?.length) {
-    const labels = slide.chartSpec.labels.map(String).slice(0, 8);
-    const values = slide.chartSpec.values.map((v) => Number(v) || 0).slice(0, 8);
-    const type = ["bar", "line", "pie", "doughnut"].includes(slide.chartSpec.type) ? slide.chartSpec.type : "bar";
-    return { labels, values, type, title: slide.chartSpec.title || slide.title };
-  }
-  const rows = [];
-  for (const line of slide.content || []) {
-    const m = String(line).match(/^(.+?)[::-–]\s*([\d.]+)\s*%?$/);
-    if (m && rows.length < 8) rows.push([m[1].trim().slice(0, 24), Number(m[2])]);
-  }
-  if (rows.length >= 3) return { labels: rows.map((r) => r[0]), values: rows.map((r) => r[1]), type: "bar", title: slide.title };
-  return null;
-}
-
-// ------------------------------------------------------------
-// IMAGES (keyless Pollinations → base64 data)
-// ------------------------------------------------------------
-function fetchImage(url) {
+function fetchSlideImage(prompt) {
   return new Promise((resolve) => {
+    if (!prompt) return resolve(null);
+    let finished = false;
+    const finish = (value) => { if (!finished) { finished = true; resolve(value); } };
+    const timer = setTimeout(() => finish(null), IMAGE_TIMEOUT_MS);
     try {
-      https.get(url, (res) => {
-        if (res.statusCode !== 200) { res.resume(); return resolve(null); }
+      const safePrompt = encodeURIComponent(`${String(prompt).slice(0, 260)}, premium presentation photography, no text, no watermark`);
+      const url = `https://image.pollinations.ai/prompt/${safePrompt}?width=1280&height=720&nologo=true`;
+      const request = https.get(url, { timeout: IMAGE_TIMEOUT_MS, headers: { "User-Agent": "AI-PPT-Generator/2.0" } }, (response) => {
+        if (response.statusCode !== 200) { response.resume(); clearTimeout(timer); return finish(null); }
         const chunks = [];
         let size = 0;
-        res.on("data", (c) => { size += c.length; if (size <= 4 * 1024 * 1024) chunks.push(c); else res.destroy(); });
-        res.on("end", () => resolve(Buffer.concat(chunks)));
-        res.on("error", () => resolve(null));
-      }).on("error", () => resolve(null)).setTimeout(9000, function () { this.destroy(); resolve(null); });
-    } catch { resolve(null); }
+        response.on("data", (chunk) => {
+          size += chunk.length;
+          if (size > IMAGE_MAX_BYTES) { response.destroy(); clearTimeout(timer); finish(null); return; }
+          chunks.push(chunk);
+        });
+        response.on("end", () => { clearTimeout(timer); const buffer = Buffer.concat(chunks); finish(buffer.length > 1500 ? buffer : null); });
+        response.on("error", () => { clearTimeout(timer); finish(null); });
+      });
+      request.on("timeout", () => { request.destroy(); clearTimeout(timer); finish(null); });
+      request.on("error", () => { clearTimeout(timer); finish(null); });
+    } catch { clearTimeout(timer); finish(null); }
   });
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function runner() {
+    while (true) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      try { results[index] = await worker(items[index], index); } catch { results[index] = null; }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runner));
+  return results;
 }
 
 async function prepareImages(content, cfg) {
+  const imageSlides = content.slides.map((slide, index) => ({ slide, index }))
+    .filter(({ slide }) => cfg.addImages && ["imageText", "textImage", "fullImage"].includes(slide.layout) && slide.imagePrompt);
+  // Images are independent; 5 concurrent downloads keeps image-enabled decks fast.
+  const buffers = await mapWithConcurrency(imageSlides, 5, async ({ slide, index }) => {
+    const buffer = await fetchSlideImage(slide.imagePrompt);
+    if (!buffer) console.warn(`[PPT] image fallback on slide ${slide.slideNumber}`);
+    return { index, buffer };
+  });
   const map = new Map();
-  if (!cfg.addImages) return map;
-  const wanted = content.slides.filter((s) => ["imageText", "textImage", "fullImage"].includes(s.layout) && s.imagePrompt);
-  await Promise.all(wanted.slice(0, 6).map(async (s) => {
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(s.imagePrompt.slice(0, 120))}?width=1024&height=768&nologo=true&seed=${s.slideNumber}`;
-    const buf = await fetchImage(url);
-    if (buf && buf.length > 10 * 1024) {
-      map.set(s.slideNumber - 1, `data:image/jpeg;base64,${buf.toString("base64")}`);
-    } else {
-      console.warn(`[PPT] image fallback on slide ${s.slideNumber}`);
-    }
-  }));
+  for (const item of buffers) if (item) map.set(item.index, item.buffer);
   return map;
 }
 
-// ------------------------------------------------------------
-// PREMIUM VISUAL PRIMITIVES
-// ------------------------------------------------------------
-function addBackground(slide, theme, index, kind = "content") {
+// ============================================================
+// PPTX DESIGN SYSTEM
+// ============================================================
+
+function fontConfig(cfg, theme) {
+  const devanagari = cfg.language !== "English";
+  return {
+    heading: devanagari ? DEVANAGARI_FONT : (theme.fontPair?.heading || "Aptos Display"),
+    body: devanagari ? DEVANAGARI_FONT : (theme.fontPair?.body || "Aptos"),
+  };
+}
+
+function shape(slide, type, opts) {
+  try { slide.addShape(type, opts); } catch (error) { console.warn("[PPT] shape failed:", error.message); }
+}
+
+function text(slide, value, opts, fonts) {
+  if (value == null || String(value).trim() === "") return;
+  const base = { fontFace: fonts?.body || "Aptos", color: "334155", margin: 0, breakLine: false, fit: "shrink" };
+  try { slide.addText(String(value), Object.assign(base, opts || {})); } catch (error) { console.warn("[PPT] text failed:", error.message); }
+}
+
+function addSoftShadow(slide, x, y, w, h, theme, radius = 0.16) {
+  shape(slide, "roundRect", { x: x + 0.035, y: y + 0.05, w, h, rectRadius: radius, fill: { color: theme.dark ? "05070C" : "D9E2EC", transparency: 68 }, line: { color: theme.dark ? "05070C" : "D9E2EC", transparency: 100 } });
+}
+
+function addCard(slide, x, y, w, h, theme, opts = {}) {
+  const depth = opts.depth !== false;
+  if (depth) {
+    // Layered offset = reliable 3D-style depth in native PowerPoint shapes.
+    shape(slide, "roundRect", {
+      x: x + 0.055, y: y + 0.075, w, h, rectRadius: 0.16,
+      fill: { color: theme.dark ? "020617" : "CBD5E1", transparency: theme.dark ? 35 : 58 },
+      line: { color: theme.dark ? "020617" : "CBD5E1", transparency: 100 },
+    });
+    shape(slide, "roundRect", {
+      x: x + 0.025, y: y + 0.035, w, h, rectRadius: 0.16,
+      fill: { color: theme.dark ? theme.primary : theme.panelBorder, transparency: theme.dark ? 82 : 72 },
+      line: { color: theme.dark ? theme.primary : theme.panelBorder, transparency: 100 },
+    });
+  }
+  shape(slide, "roundRect", {
+    x, y, w, h,
+    rectRadius: 0.16,
+    fill: { color: opts.fill || theme.panel, transparency: opts.transparency || 0 },
+    line: { color: opts.line || theme.panelBorder, width: opts.lineWidth || 0.7, transparency: opts.lineTransparency ?? 20 },
+  });
+  // Tiny highlight gives cards a polished/glass-like edge without rasterizing the slide.
+  if (opts.highlight !== false) {
+    shape(slide, "roundRect", {
+      x: x + 0.08, y: y + 0.07, w: Math.max(0.2, w - 0.16), h: 0.025, rectRadius: 0.01,
+      fill: { color: theme.dark ? "FFFFFF" : theme.primary, transparency: theme.dark ? 84 : 92 },
+      line: { color: theme.dark ? "FFFFFF" : theme.primary, transparency: 100 },
+    });
+  }
+}
+
+function addBackground(slide, theme, index, total) {
   slide.background = { color: theme.bg };
-  const d = theme.depth || [];
-  if (d[0]) slide.addShape("roundRect", { x: -1.2, y: -1.0, w: GRID.W * 0.62, h: GRID.H * 0.5, rectRadius: 0.6, fill: { color: d[0].color, transparency: d[0].transparency }, line: { type: "none" } });
-  if (d[1]) slide.addShape("roundRect", { x: GRID.W * 0.5, y: GRID.H * 0.62, w: GRID.W * 0.62, h: GRID.H * 0.5, rectRadius: 0.6, fill: { color: d[1].color, transparency: d[1].transparency }, line: { type: "none" } });
-
-  const orbs = theme.orbColors || [theme.primary, theme.accent, theme.secondary];
-  slide.addShape("ellipse", { x: GRID.W - 2.2, y: -0.9, w: 1.9, h: 1.9, fill: { color: orbs[index % orbs.length], transparency: kind === "cinematic" ? 55 : 82 }, line: { type: "none" } });
-  slide.addShape("ellipse", { x: -0.8, y: GRID.H - 1.6, w: 1.4, h: 1.4, fill: { color: orbs[(index + 1) % orbs.length], transparency: kind === "cinematic" ? 60 : 86 }, line: { type: "none" } });
-  slide.addShape("rect", { x: 0, y: 0, w: GRID.W, h: 0.07, fill: { color: theme.primary, transparency: kind === "cinematic" ? 0 : 30 }, line: { type: "none" } });
+  // Layered ambient geometry creates depth while remaining native/editable.
+  shape(slide, "ellipse", { x: 10.75, y: -0.95, w: 3.45, h: 3.45, fill: { color: theme.primary, transparency: theme.dark ? 84 : 94 }, line: { color: theme.primary, transparency: 100 } });
+  shape(slide, "ellipse", { x: 11.35, y: -0.35, w: 2.25, h: 2.25, fill: { color: theme.secondary, transparency: theme.dark ? 78 : 92 }, line: { color: theme.secondary, transparency: 100 } });
+  shape(slide, "ellipse", { x: -0.9, y: 6.15, w: 2.55, h: 2.55, fill: { color: theme.secondary, transparency: theme.dark ? 88 : 95 }, line: { color: theme.secondary, transparency: 100 } });
+  if (theme.dark) {
+    shape(slide, "rect", { x: 0, y: 0, w: 13.333, h: 0.035, fill: { color: theme.accent }, line: { color: theme.accent, transparency: 100 } });
+    shape(slide, "rect", { x: 0.62, y: 1.15, w: 2.8, h: 0.02, fill: { color: theme.primary, transparency: 45 }, line: { color: theme.primary, transparency: 100 } });
+  }
+  if (index > 0 && index < total - 1) {
+    shape(slide, "rect", { x: 0, y: 0, w: 0.045, h: 7.5, fill: { color: theme.primary }, line: { color: theme.primary, transparency: 100 } });
+  }
 }
 
-function glassCard(slide, theme, { x, y, w, h }) {
-  slide.addShape("roundRect", {
-    x, y, w, h, rectRadius: 0.12,
-    fill: { color: theme.panel, transparency: theme.dark ? 12 : 0 },
-    line: { color: theme.panelBorder, width: 1 },
-    shadow: { type: "outer", color: theme.dark ? "000000" : "94A3B8", blur: 12, offset: 3, angle: 90, opacity: theme.dark ? 0.55 : 0.28 },
+function addTitle(slide, title, theme, fonts, opts = {}) {
+  const size = opts.size || theme.headingSize || 28;
+  text(slide, title, { x: opts.x ?? GRID.marginX, y: opts.y ?? 0.5, w: opts.w ?? 11.9, h: opts.h ?? 0.72, fontSize: size, bold: true, color: opts.color || theme.titleColor, fontFace: fonts.heading, valign: "mid", fit: "shrink" }, fonts);
+  if (opts.kicker) text(slide, opts.kicker.toUpperCase(), { x: opts.x ?? GRID.marginX, y: (opts.y ?? 0.5) - 0.25, w: opts.w ?? 11.9, h: 0.2, fontSize: 9, bold: true, charSpacing: 1.4, color: theme.accent, fontFace: fonts.body }, fonts);
+}
+
+function addAccentLine(slide, theme, x = GRID.marginX, y = 1.28, w = 1.1) {
+  shape(slide, "roundRect", { x, y, w, h: 0.055, rectRadius: 0.03, fill: { color: theme.accent }, line: { color: theme.accent, transparency: 100 } });
+}
+
+function addFooter(slide, theme, number, total, fonts) {
+  shape(slide, "line", { x: 0.62, y: 6.92, w: 12.05, h: 0, line: { color: theme.panelBorder, width: 0.5, transparency: 25 } });
+  text(slide, "AI Interview", { x: 0.62, y: 7.02, w: 2, h: 0.22, fontSize: 8.5, bold: true, color: theme.mutedColor, fontFace: fonts.body }, fonts);
+  text(slide, `${number} / ${total}`, { x: 11.6, y: 7.02, w: 1.05, h: 0.22, fontSize: 8.5, bold: true, align: "right", color: theme.mutedColor, fontFace: fonts.body }, fonts);
+}
+
+function addBullets(slide, items, theme, fonts, box, opts = {}) {
+  const list = items.filter(Boolean).slice(0, opts.max || CONTENT_MAX_BULLETS);
+  const size = opts.fontSize || 16;
+  const bulletColor = opts.bulletColor || theme.accent;
+  const rows = list.map((item) => ({ text: shorten(item, 125), options: { bullet: { code: "2022" }, breakLine: true, color: theme.textColor, bulletColor } }));
+  try {
+    slide.addText(rows, {
+      x: box.x, y: box.y, w: box.w, h: box.h, fontFace: fonts.body, fontSize: size,
+      color: theme.textColor, valign: "top", paraSpaceAfterPt: opts.paraSpaceAfterPt || 12,
+      breakLine: false, fit: "shrink", margin: 0.02, bullet: { type: "ul" },
+      lineSpacingMultiple: 1.08,
+    });
+  } catch (error) {
+    console.warn("[PPT] bullets failed:", error.message);
+    text(slide, list.join("\n"), { x: box.x, y: box.y, w: box.w, h: box.h, fontFace: fonts.body, fontSize: size, color: theme.textColor, fit: "shrink", valign: "top" }, fonts);
+  }
+}
+
+function addPill(slide, label, x, y, theme, fonts, opts = {}) {
+  const width = Math.max(0.8, Math.min(2.4, String(label).length * 0.075 + 0.45));
+  shape(slide, "roundRect", { x, y, w: width, h: 0.34, rectRadius: 0.17, fill: { color: opts.color || theme.primary, transparency: opts.transparency || 8 }, line: { color: opts.color || theme.primary, transparency: 100 } });
+  text(slide, label, { x: x + 0.08, y: y + 0.04, w: width - 0.16, h: 0.24, fontSize: 8.5, bold: true, align: "center", color: opts.textColor || "FFFFFF", fontFace: fonts.body, fit: "shrink" }, fonts);
+  return width;
+}
+
+function addNumberBadge(slide, number, x, y, theme, fonts, size = 0.48) {
+  shape(slide, "ellipse", { x, y, w: size, h: size, fill: { color: theme.accent }, line: { color: theme.accent, transparency: 100 } });
+  text(slide, String(number), { x, y: y + 0.05, w: size, h: size - 0.05, fontSize: 13, bold: true, align: "center", color: "FFFFFF", fontFace: fonts.body }, fonts);
+}
+
+function addImage(slide, buffer, box) {
+  if (!buffer) return false;
+  try {
+    slide.addImage({ data: `data:image/jpeg;base64,${buffer.toString("base64")}`, x: box.x, y: box.y, w: box.w, h: box.h, sizing: { type: "cover", x: box.x, y: box.y, w: box.w, h: box.h } });
+    return true;
+  } catch (error) {
+    console.warn("[PPT] image add failed:", error.message);
+    return false;
+  }
+}
+
+function addImageFrame(slide, buffer, box, theme, opts = {}) {
+  addSoftShadow(slide, box.x, box.y, box.w, box.h, theme);
+  shape(slide, "roundRect", { x: box.x, y: box.y, w: box.w, h: box.h, rectRadius: 0.16, fill: { color: theme.panel }, line: { color: theme.panelBorder, transparency: 35, width: 0.7 } });
+  if (buffer && addImage(slide, buffer, box)) {
+    if (opts.overlay) shape(slide, "rect", { x: box.x, y: box.y, w: box.w, h: box.h, fill: { color: opts.overlay, transparency: opts.transparency || 40 }, line: { color: opts.overlay, transparency: 100 } });
+    return true;
+  }
+  return false;
+}
+
+function safeLayoutForImageFailure(data) {
+  if (data.layout === "fullImage") return "summary";
+  if (data.layout === "imageText" || data.layout === "textImage") return data.content.length >= 4 ? "threeCards" : "twoColumn";
+  return "bullets";
+}
+
+// ============================================================
+// RENDERERS
+// ============================================================
+
+function renderTitle(slide, data, theme, fonts, cfg) {
+  // Premium cover: asymmetric composition + accent geometry.
+  shape(slide, "rect", { x: 0, y: 0, w: 8.15, h: 7.5, fill: { color: theme.primary }, line: { color: theme.primary, transparency: 100 } });
+  shape(slide, "rect", { x: 7.72, y: 0, w: 0.43, h: 7.5, fill: { color: theme.accent }, line: { color: theme.accent, transparency: 100 } });
+  shape(slide, "ellipse", { x: 9.0, y: -0.4, w: 4.7, h: 4.7, fill: { color: theme.secondary, transparency: 28 }, line: { color: theme.secondary, transparency: 100 } });
+  shape(slide, "ellipse", { x: 10.2, y: 3.9, w: 3.3, h: 3.3, fill: { color: theme.accent, transparency: 58 }, line: { color: theme.accent, transparency: 100 } });
+  addPill(slide, cfg.type, 0.72, 0.72, theme, fonts, { color: theme.accent });
+  text(slide, data.title, { x: 0.72, y: 1.55, w: 6.35, h: 2.25, fontSize: 34, bold: true, color: "FFFFFF", fontFace: fonts.heading, valign: "mid", fit: "shrink", breakLine: false }, fonts);
+  text(slide, data.content[0] || cfg.topic, { x: 0.74, y: 4.2, w: 5.9, h: 0.95, fontSize: 16, color: "E2E8F0", fontFace: fonts.body, fit: "shrink" }, fonts);
+  text(slide, "AI Interview", { x: 0.74, y: 6.72, w: 2.3, h: 0.28, fontSize: 10, bold: true, charSpacing: 0.8, color: "FFFFFF", fontFace: fonts.body }, fonts);
+  text(slide, "PREMIUM PRESENTATION", { x: 9.0, y: 6.75, w: 3.3, h: 0.25, fontSize: 8, bold: true, charSpacing: 1.2, color: theme.mutedColor, align: "right", fontFace: fonts.body }, fonts);
+}
+
+function renderSection(slide, data, theme, fonts) {
+  shape(slide, "rect", { x: 0, y: 0, w: 13.333, h: 7.5, fill: { color: theme.primary }, line: { color: theme.primary, transparency: 100 } });
+  shape(slide, "rect", { x: 0.7, y: 0.78, w: 0.08, h: 5.9, fill: { color: theme.accent }, line: { color: theme.accent, transparency: 100 } });
+  text(slide, "SECTION", { x: 1.12, y: 1.35, w: 2, h: 0.3, fontSize: 10, bold: true, charSpacing: 2, color: theme.accent, fontFace: fonts.body }, fonts);
+  text(slide, data.title, { x: 1.12, y: 2.0, w: 9.6, h: 1.6, fontSize: 34, bold: true, color: "FFFFFF", fontFace: fonts.heading, fit: "shrink" }, fonts);
+  text(slide, data.content[0] || "A focused part of the story", { x: 1.14, y: 4.15, w: 7.6, h: 0.7, fontSize: 16, color: theme.dark ? "CBD5E1" : "E2E8F0", fontFace: fonts.body, fit: "shrink" }, fonts);
+  shape(slide, "ellipse", { x: 10.1, y: 1.2, w: 2.1, h: 2.1, fill: { color: theme.accent, transparency: 45 }, line: { color: theme.accent, transparency: 100 } });
+  shape(slide, "ellipse", { x: 10.9, y: 3.2, w: 1.2, h: 1.2, fill: { color: theme.secondary, transparency: 20 }, line: { color: theme.secondary, transparency: 100 } });
+}
+
+function renderBullets(slide, data, theme, fonts) {
+  addTitle(slide, data.title, theme, fonts, { kicker: "Key idea" });
+  addAccentLine(slide, theme);
+  const items = data.content.slice(0, 6);
+  items.forEach((item, i) => {
+    const y = 1.62 + i * 0.78;
+    addNumberBadge(slide, i + 1, 0.66, y, theme, fonts, 0.38);
+    text(slide, item, { x: 1.22, y: y - 0.02, w: 10.9, h: 0.55, fontSize: items.length > 5 ? 14 : 16, color: theme.textColor, fontFace: fonts.body, valign: "mid", fit: "shrink" }, fonts);
+    if (i < items.length - 1) shape(slide, "line", { x: 1.22, y: y + 0.63, w: 10.65, h: 0, line: { color: theme.panelBorder, transparency: 35, width: 0.5 } });
   });
 }
 
-function text(slide, txt, opts, fonts) {
-  slide.addText(String(txt || ""), { fontFace: (fonts && fonts.body) || "Aptos", fit: "shrink", ...opts });
-}
-
-function kicker(slide, theme, label, x, y, fonts) {
-  slide.addShape("roundRect", { x, y, w: 0.5, h: 0.28, rectRadius: 0.14, fill: { color: theme.accent, transparency: 20 }, line: { type: "none" } });
-  text(slide, label || "PREMIUM", { x: x + 0.6, y: y - 0.03, w: 6, h: 0.34, fontSize: 11, bold: true, color: theme.mutedColor, charSpacing: 2 }, fonts);
-}
-
-function header(slide, theme, title, fonts, opts = {}) {
-  kicker(slide, theme, opts.kicker || "PREMIUM", GRID.MX, GRID.MY, fonts);
-  text(slide, title, {
-    x: GRID.MX, y: GRID.MY + 0.36, w: GRID.contentW, h: 0.85,
-    fontSize: theme.headingSize, bold: true, color: theme.titleColor,
-    fontFace: fonts.heading, align: "left", valign: "top",
-  }, fonts);
-  slide.addShape("rect", { x: GRID.MX, y: GRID.MY + 1.28, w: 1.6, h: 0.06, fill: { color: theme.accent }, line: { type: "none" } });
-}
-
-function addFooter(slide, theme, num, total, fonts) {
-  text(slide, "AI Interview", { x: GRID.MX, y: GRID.H - 0.42, w: 3, h: 0.3, fontSize: 9, color: theme.mutedColor }, fonts);
-  text(slide, `${num} / ${total}`, { x: GRID.W - 1.6, y: GRID.H - 0.42, w: 0.9, h: 0.3, fontSize: 9, align: "right", color: theme.mutedColor }, fonts);
-  slide.addShape("rect", { x: GRID.W - 0.55, y: GRID.H - 0.36, w: Math.max(0.05, (num / total) * 0.5), h: 0.05, fill: { color: theme.accent }, line: { type: "none" } });
-}
-
-function bulletsInto(slide, theme, items, box, fonts, opts = {}) {
-  const list = (items || []).slice(0, 6);
-  const per = Math.min(0.72, box.h / Math.max(1, list.length));
-  list.forEach((item, i) => {
-    const cy = box.y + i * per;
-    slide.addShape("ellipse", { x: box.x, y: cy + 0.1, w: 0.14, h: 0.14, fill: { color: i % 2 ? theme.accent : theme.primary }, line: { type: "none" } });
-    text(slide, item, { x: box.x + 0.3, y: cy, w: box.w - 0.3, h: per - 0.05, fontSize: opts.fontSize || theme.bodySize, color: theme.textColor, valign: "top" }, fonts);
+function renderTwoColumn(slide, data, theme, fonts) {
+  addTitle(slide, data.title, theme, fonts);
+  addAccentLine(slide, theme);
+  const mid = Math.ceil(data.content.length / 2);
+  const groups = [data.content.slice(0, mid), data.content.slice(mid)];
+  groups.forEach((group, g) => {
+    const x = g === 0 ? 0.62 : 6.88;
+    addCard(slide, x, 1.62, 5.83, 4.95, theme, { fill: theme.panel });
+    addPill(slide, g === 0 ? "CORE" : "IMPACT", x + 0.32, 1.95, theme, fonts, { color: g === 0 ? theme.primary : theme.secondary });
+    addBullets(slide, group, theme, fonts, { x: x + 0.38, y: 2.52, w: 5.0, h: 3.55 }, { fontSize: 14, max: 4, paraSpaceAfterPt: 11 });
   });
 }
 
-// ------------------------------------------------------------
-// CONTENT-AWARE LAYOUT AUTO-SELECTION
-// ------------------------------------------------------------
-function autoLayout(data, index, total, cfg) {
-  if (data.layout && data.layout !== "bullets" && KNOWN_LAYOUTS.includes(data.layout)) return data.layout;
-  if (cfg.charts !== "Off" && extractChartData(data)) return "chart";
-  if (index === 0) return "title";
-  if (index === total - 1) return "thanks";
-  if (data.quote) return "quote";
-  if (Array.isArray(data.steps) && data.steps.length >= 3) return "process";
-  if (Array.isArray(data.kpis) && data.kpis.length >= 3) return "kpi";
-  if (data.left && data.right) return "comparison";
-  const bodyLen = (data.content || []).join(" ").length;
-  if ((data.content || []).length >= 4 && bodyLen < 400) return "panelBullets";
-  if (index === 1) return "agenda";
-  if (index % 4 === 2) return "section";
-  return "panelBullets";
+function renderCards(slide, data, theme, fonts, count) {
+  addTitle(slide, data.title, theme, fonts);
+  addAccentLine(slide, theme);
+  const items = data.content.slice(0, count);
+  const gap = 0.18;
+  const width = (12.08 - gap * (items.length - 1)) / items.length;
+  items.forEach((item, i) => {
+    const x = 0.62 + i * (width + gap);
+    addCard(slide, x, 1.68, width, 4.78, theme);
+    shape(slide, "rect", { x: x, y: 1.68, w: width, h: 0.08, fill: { color: i % 2 ? theme.secondary : theme.accent }, line: { color: i % 2 ? theme.secondary : theme.accent, transparency: 100 } });
+    addNumberBadge(slide, i + 1, x + 0.28, 2.05, theme, fonts, 0.44);
+    text(slide, shorten(item, count >= 5 ? 85 : 110), { x: x + 0.28, y: 2.72, w: width - 0.56, h: 2.2, fontSize: count >= 5 ? 11.5 : 13.5, bold: count <= 3, color: theme.textColor, fontFace: fonts.body, valign: "mid", align: count <= 3 ? "center" : "left", fit: "shrink" }, fonts);
+  });
 }
 
-// ------------------------------------------------------------
-// PREMIUM RENDERERS
-// (slide, data, theme, fonts, cfg, buf, pres)
-// ------------------------------------------------------------
+function renderComparison(slide, data, theme, fonts) {
+  addTitle(slide, data.title, theme, fonts, { kicker: "Compare" });
+  addAccentLine(slide, theme);
+  const mid = Math.ceil(data.content.length / 2);
+  const left = data.content.slice(0, mid);
+  const right = data.content.slice(mid);
+  const labels = ["OPTION A", "OPTION B"];
+  [left, right].forEach((items, i) => {
+    const x = i === 0 ? 0.62 : 6.88;
+    const color = i === 0 ? theme.primary : theme.secondary;
+    addCard(slide, x, 1.66, 5.83, 4.9, theme);
+    shape(slide, "roundRect", { x: x + 0.28, y: 1.95, w: 1.45, h: 0.42, rectRadius: 0.21, fill: { color }, line: { color, transparency: 100 } });
+    text(slide, labels[i], { x: x + 0.28, y: 2.03, w: 1.45, h: 0.22, fontSize: 8.5, bold: true, align: "center", color: "FFFFFF", fontFace: fonts.body }, fonts);
+    addBullets(slide, items, theme, fonts, { x: x + 0.4, y: 2.7, w: 5.0, h: 3.2 }, { fontSize: 14, max: 4 });
+  });
+  shape(slide, "ellipse", { x: 6.27, y: 3.0, w: 0.8, h: 0.8, fill: { color: theme.accent }, line: { color: theme.accent, transparency: 100 } });
+  text(slide, "VS", { x: 6.27, y: 3.25, w: 0.8, h: 0.25, fontSize: 10, bold: true, align: "center", color: "FFFFFF", fontFace: fonts.body }, fonts);
+}
+
+function renderTimeline(slide, data, theme, fonts) {
+  addTitle(slide, data.title, theme, fonts, { kicker: "Timeline" });
+  addAccentLine(slide, theme);
+  const items = data.content.slice(0, 5);
+  shape(slide, "line", { x: 1.0, y: 3.55, w: 11.0, h: 0, line: { color: theme.accent, width: 2.2 } });
+  const step = items.length > 1 ? 11 / (items.length - 1) : 11;
+  items.forEach((item, i) => {
+    const x = 1 + i * step;
+    shape(slide, "ellipse", { x: x - 0.12, y: 3.43, w: 0.24, h: 0.24, fill: { color: theme.accent }, line: { color: theme.accent, transparency: 100 } });
+    text(slide, String(i + 1).padStart(2, "0"), { x: x - 0.35, y: 2.05, w: 0.7, h: 0.35, fontSize: 14, bold: true, align: "center", color: theme.primary, fontFace: fonts.heading }, fonts);
+    text(slide, shorten(item, 70), { x: x - 0.8, y: i % 2 ? 3.95 : 4.02, w: 1.6, h: 1.25, fontSize: 11.5, align: "center", color: theme.textColor, fontFace: fonts.body, fit: "shrink", valign: "mid" }, fonts);
+  });
+}
+
+function renderProcess(slide, data, theme, fonts) {
+  addTitle(slide, data.title, theme, fonts, { kicker: "Process" });
+  addAccentLine(slide, theme);
+  const items = data.content.slice(0, 5);
+  const width = 2.2;
+  items.forEach((item, i) => {
+    const x = 0.62 + i * 2.48;
+    addCard(slide, x, 2.0, width, 3.35, theme);
+    addNumberBadge(slide, i + 1, x + 0.22, 2.28, theme, fonts, 0.48);
+    text(slide, shorten(item, 90), { x: x + 0.22, y: 3.05, w: width - 0.44, h: 1.5, fontSize: 13, bold: true, color: theme.textColor, fontFace: fonts.body, fit: "shrink", valign: "mid", align: "center" }, fonts);
+    if (i < items.length - 1) {
+      text(slide, "→", { x: x + width + 0.12, y: 3.1, w: 0.45, h: 0.4, fontSize: 20, bold: true, color: theme.accent, align: "center", fontFace: fonts.body }, fonts);
+    }
+  });
+}
+
+function renderStats(slide, data, theme, fonts, cfg) {
+  addTitle(slide, data.title, theme, fonts, { kicker: "Key metrics" });
+  addAccentLine(slide, theme);
+  const chart = extractChartData(data);
+  if (!chart) {
+    renderCards(slide, data, theme, fonts, Math.min(4, Math.max(3, data.content.length)));
+    return;
+  }
+  const max = Math.max(...chart.map((x) => x.value), 1);
+  const cardCount = Math.min(chart.length, 4);
+  chart.slice(0, cardCount).forEach((item, i) => {
+    const x = 0.62 + i * 3.02;
+    addCard(slide, x, 1.65, 2.75, 1.65, theme, { fill: theme.panel2 || theme.panel });
+    text(slide, String(item.value), { x: x + 0.2, y: 1.93, w: 2.35, h: 0.58, fontSize: 26, bold: true, color: theme.primary, fontFace: fonts.heading, fit: "shrink" }, fonts);
+    text(slide, item.label, { x: x + 0.2, y: 2.62, w: 2.35, h: 0.34, fontSize: 10, color: theme.mutedColor, fontFace: fonts.body, fit: "shrink" }, fonts);
+  });
+  const startY = 3.85;
+  chart.slice(0, 6).forEach((item, i) => {
+    const y = startY + i * 0.42;
+    text(slide, item.label, { x: 0.7, y: y - 0.02, w: 2.3, h: 0.24, fontSize: 9.5, color: theme.textColor, fontFace: fonts.body, fit: "shrink" }, fonts);
+    shape(slide, "roundRect", { x: 3.1, y, w: 7.65, h: 0.18, rectRadius: 0.09, fill: { color: theme.panelBorder }, line: { color: theme.panelBorder, transparency: 100 } });
+    shape(slide, "roundRect", { x: 3.1, y, w: Math.max(0.15, 7.65 * (item.value / max)), h: 0.18, rectRadius: 0.09, fill: { color: i % 2 ? theme.secondary : theme.accent }, line: { color: i % 2 ? theme.secondary : theme.accent, transparency: 100 } });
+    text(slide, String(item.value), { x: 10.95, y: y - 0.06, w: 0.9, h: 0.28, fontSize: 9.5, bold: true, align: "right", color: theme.titleColor, fontFace: fonts.body }, fonts);
+  });
+  text(slide, "Use as directional insight unless the source data is explicitly provided.", { x: 0.7, y: 6.45, w: 6.5, h: 0.24, fontSize: 7.5, italic: true, color: theme.mutedColor, fontFace: fonts.body }, fonts);
+}
+
+function renderQuote(slide, data, theme, fonts) {
+  shape(slide, "rect", { x: 0, y: 0, w: 13.333, h: 7.5, fill: { color: theme.panel2 || theme.bg }, line: { color: theme.panel2 || theme.bg, transparency: 100 } });
+  text(slide, "“", { x: 0.85, y: 1.0, w: 1.1, h: 1.1, fontSize: 68, bold: true, color: theme.accent, fontFace: "Georgia" }, fonts);
+  text(slide, data.content[0] || data.title, { x: 1.45, y: 1.75, w: 10.25, h: 2.45, fontSize: 27, bold: true, italic: true, color: theme.titleColor, fontFace: fonts.heading, fit: "shrink", valign: "mid" }, fonts);
+  shape(slide, "rect", { x: 1.48, y: 4.55, w: 1.0, h: 0.06, fill: { color: theme.accent }, line: { color: theme.accent, transparency: 100 } });
+  text(slide, data.content[1] || data.title, { x: 1.48, y: 4.82, w: 6.6, h: 0.45, fontSize: 13, bold: true, color: theme.mutedColor, fontFace: fonts.body, fit: "shrink" }, fonts);
+}
+
+function renderImageText(slide, data, theme, fonts, buffer, reverse = false) {
+  addTitle(slide, data.title, theme, fonts);
+  addAccentLine(slide, theme);
+  const imageBox = reverse ? { x: 7.05, y: 1.62, w: 5.65, h: 4.9 } : { x: 0.62, y: 1.62, w: 5.65, h: 4.9 };
+  const textX = reverse ? 0.62 : 6.68;
+  const imageOK = addImageFrame(slide, buffer, imageBox, theme);
+  if (!imageOK) {
+    // Never leave the image area blank; use a designed visual card.
+    addCard(slide, imageBox.x, imageBox.y, imageBox.w, imageBox.h, theme, { fill: theme.panel2 || theme.panel });
+    shape(slide, "ellipse", { x: imageBox.x + 1.7, y: imageBox.y + 1.1, w: 2.2, h: 2.2, fill: { color: theme.accent, transparency: 28 }, line: { color: theme.accent, transparency: 100 } });
+    text(slide, "VISUAL\nSTORY", { x: imageBox.x + 1.2, y: imageBox.y + 1.95, w: 3.2, h: 0.9, fontSize: 19, bold: true, align: "center", color: theme.primary, fontFace: fonts.heading, fit: "shrink" }, fonts);
+  }
+  addBullets(slide, data.content, theme, fonts, { x: textX, y: 1.85, w: 5.45, h: 4.35 }, { fontSize: 14, max: 5 });
+}
+
+function renderFullImage(slide, data, theme, fonts, buffer) {
+  const imageOK = buffer && addImage(slide, buffer, { x: 0, y: 0, w: 13.333, h: 7.5 });
+  if (!imageOK) {
+    // Designed fallback rather than blank slide.
+    shape(slide, "rect", { x: 0, y: 0, w: 13.333, h: 7.5, fill: { color: theme.primary }, line: { color: theme.primary, transparency: 100 } });
+    shape(slide, "ellipse", { x: 8.7, y: -0.4, w: 5.4, h: 5.4, fill: { color: theme.secondary, transparency: 25 }, line: { color: theme.secondary, transparency: 100 } });
+    shape(slide, "ellipse", { x: 9.8, y: 3.6, w: 3.3, h: 3.3, fill: { color: theme.accent, transparency: 48 }, line: { color: theme.accent, transparency: 100 } });
+  } else {
+    shape(slide, "rect", { x: 0, y: 0, w: 13.333, h: 7.5, fill: { color: "000000", transparency: 45 }, line: { color: "000000", transparency: 100 } });
+  }
+  addPill(slide, "INSIGHT", 0.72, 0.7, theme, fonts, { color: theme.accent });
+  text(slide, data.title, { x: 0.72, y: 1.65, w: 8.7, h: 1.35, fontSize: 34, bold: true, color: "FFFFFF", fontFace: fonts.heading, fit: "shrink" }, fonts);
+  text(slide, data.content[0] || "", { x: 0.75, y: 3.25, w: 7.3, h: 0.9, fontSize: 16, color: "F8FAFC", fontFace: fonts.body, fit: "shrink" }, fonts);
+}
+
+function renderFlow(slide, data, theme, fonts) {
+  addTitle(slide, data.title, theme, fonts, { kicker: "Flow" });
+  addAccentLine(slide, theme);
+  const items = data.content.slice(0, 5);
+  items.forEach((item, i) => {
+    const x = 0.65 + i * 2.48;
+    addCard(slide, x, 2.1, 1.95, 1.7, theme);
+    addNumberBadge(slide, i + 1, x + 0.16, 2.27, theme, fonts, 0.38);
+    text(slide, shorten(item, 60), { x: x + 0.18, y: 2.82, w: 1.58, h: 0.62, fontSize: 11.5, bold: true, align: "center", color: theme.textColor, fontFace: fonts.body, fit: "shrink" }, fonts);
+    if (i < items.length - 1) text(slide, "→", { x: x + 2.0, y: 2.67, w: 0.45, h: 0.4, fontSize: 20, bold: true, color: theme.accent, align: "center", fontFace: fonts.body }, fonts);
+  });
+  text(slide, "A connected visual sequence makes the logic easier to scan.", { x: 0.7, y: 5.15, w: 7.5, h: 0.35, fontSize: 10, color: theme.mutedColor, fontFace: fonts.body }, fonts);
+}
+
+function renderGrid(slide, data, theme, fonts) {
+  addTitle(slide, data.title, theme, fonts, { kicker: "Framework" });
+  addAccentLine(slide, theme);
+  const items = data.content.slice(0, 6);
+  const cols = items.length <= 4 ? 2 : 3;
+  const rows = Math.ceil(items.length / cols);
+  const w = cols === 2 ? 5.83 : 3.75;
+  const h = rows === 2 ? 2.25 : 1.8;
+  items.forEach((item, i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const x = 0.62 + col * (w + 0.42);
+    const y = 1.68 + row * (h + 0.35);
+    addCard(slide, x, y, w, h, theme);
+    addNumberBadge(slide, i + 1, x + 0.22, y + 0.24, theme, fonts, 0.4);
+    text(slide, shorten(item, 95), { x: x + 0.82, y: y + 0.28, w: w - 1.08, h: h - 0.5, fontSize: 12.5, color: theme.textColor, fontFace: fonts.body, fit: "shrink", valign: "mid" }, fonts);
+  });
+}
+
+function renderProblemSolution(slide, data, theme, fonts) {
+  addTitle(slide, data.title, theme, fonts, { kicker: "Problem → Solution" });
+  addAccentLine(slide, theme);
+  addCard(slide, 0.62, 1.72, 5.7, 4.65, theme, { fill: theme.panel2 || theme.panel });
+  addCard(slide, 7.0, 1.72, 5.7, 4.65, theme);
+  addPill(slide, "PROBLEM", 0.95, 2.05, theme, fonts, { color: theme.secondary });
+  addPill(slide, "SOLUTION", 7.33, 2.05, theme, fonts, { color: theme.primary });
+  const problem = data.content.filter((x) => /problem|challenge|issue|समस्या|चुनौती/i.test(x));
+  const solution = data.content.filter((x) => /solution|answer|approach|समाधान|तरीका/i.test(x));
+  addBullets(slide, problem.length ? problem : data.content.slice(0, Math.ceil(data.content.length / 2)), theme, fonts, { x: 1.0, y: 2.65, w: 4.85, h: 2.9 }, { fontSize: 14, max: 3 });
+  addBullets(slide, solution.length ? solution : data.content.slice(Math.ceil(data.content.length / 2)), theme, fonts, { x: 7.38, y: 2.65, w: 4.85, h: 2.9 }, { fontSize: 14, max: 3 });
+  text(slide, "→", { x: 6.35, y: 3.65, w: 0.55, h: 0.45, fontSize: 24, bold: true, color: theme.accent, align: "center", fontFace: fonts.body }, fonts);
+}
+
+function renderBeforeAfter(slide, data, theme, fonts) {
+  addTitle(slide, data.title, theme, fonts, { kicker: "Transformation" });
+  addAccentLine(slide, theme);
+  [0, 1].forEach((i) => {
+    const x = i === 0 ? 0.62 : 6.88;
+    addCard(slide, x, 1.72, 5.83, 4.65, theme);
+    addPill(slide, i === 0 ? "BEFORE" : "AFTER", x + 0.3, 2.04, theme, fonts, { color: i === 0 ? theme.secondary : theme.accent });
+    const half = Math.ceil(data.content.length / 2);
+    addBullets(slide, i === 0 ? data.content.slice(0, half) : data.content.slice(half), theme, fonts, { x: x + 0.4, y: 2.65, w: 5.0, h: 3.1 }, { fontSize: 14, max: 4 });
+  });
+  text(slide, "→", { x: 6.28, y: 3.65, w: 0.65, h: 0.45, fontSize: 25, bold: true, color: theme.accent, align: "center", fontFace: fonts.body }, fonts);
+}
+
+function renderProsCons(slide, data, theme, fonts) {
+  addTitle(slide, data.title, theme, fonts, { kicker: "Balanced view" });
+  addAccentLine(slide, theme);
+  const half = Math.ceil(data.content.length / 2);
+  [["PROS", data.content.slice(0, half), theme.accent], ["CONS", data.content.slice(half), theme.secondary]].forEach(([label, items, color], i) => {
+    const x = i === 0 ? 0.62 : 6.88;
+    addCard(slide, x, 1.72, 5.83, 4.65, theme);
+    addPill(slide, label, x + 0.3, 2.04, theme, fonts, { color });
+    addBullets(slide, items, theme, fonts, { x: x + 0.4, y: 2.65, w: 5.0, h: 3.1 }, { fontSize: 14, max: 4, bulletColor: color });
+  });
+}
+
+function renderDiagram(slide, data, theme, fonts) {
+  addTitle(slide, data.title, theme, fonts, { kicker: "System view" });
+  addAccentLine(slide, theme);
+  const items = data.content.slice(0, 5);
+  const centerX = 5.33;
+  addCard(slide, centerX, 2.62, 2.7, 1.35, theme, { fill: theme.panel2 || theme.panel });
+  text(slide, data.title, { x: centerX + 0.2, y: 3.02, w: 2.3, h: 0.42, fontSize: 14, bold: true, align: "center", color: theme.primary, fontFace: fonts.heading, fit: "shrink" }, fonts);
+  const positions = [[0.8,1.8],[8.9,1.8],[0.8,4.65],[8.9,4.65]];
+  items.slice(0, 4).forEach((item, i) => {
+    const [x, y] = positions[i];
+    addCard(slide, x, y, 3.2, 1.15, theme);
+    text(slide, shorten(item, 80), { x: x + 0.2, y: y + 0.25, w: 2.8, h: 0.62, fontSize: 11.5, bold: true, align: "center", color: theme.textColor, fontFace: fonts.body, fit: "shrink" }, fonts);
+    shape(slide, "line", { x: x < 5 ? x + 3.2 : centerX + 2.7, y: y + 0.57, w: x < 5 ? centerX - (x + 3.2) : x - (centerX + 2.7), h: (3.3 - (y + 0.57)) * 0.12, line: { color: theme.accent, width: 1.1, beginArrowType: "none", endArrowType: "triangle" } });
+  });
+}
+
+function renderSummary(slide, data, theme, fonts) {
+  shape(slide, "rect", { x: 0, y: 0, w: 13.333, h: 7.5, fill: { color: theme.panel2 || theme.bg }, line: { color: theme.panel2 || theme.bg, transparency: 100 } });
+  addPill(slide, "TAKEAWAYS", 0.72, 0.72, theme, fonts, { color: theme.accent });
+  text(slide, data.title, { x: 0.72, y: 1.4, w: 10.6, h: 0.95, fontSize: 31, bold: true, color: theme.titleColor, fontFace: fonts.heading, fit: "shrink" }, fonts);
+  const items = data.content.slice(0, 4);
+  items.forEach((item, i) => {
+    const x = 0.72 + (i % 2) * 6.05;
+    const y = 2.65 + Math.floor(i / 2) * 1.6;
+    addCard(slide, x, y, 5.55, 1.25, theme);
+    addNumberBadge(slide, i + 1, x + 0.24, y + 0.36, theme, fonts, 0.45);
+    text(slide, shorten(item, 105), { x: x + 0.9, y: y + 0.3, w: 4.25, h: 0.62, fontSize: 13, bold: true, color: theme.textColor, fontFace: fonts.body, fit: "shrink", valign: "mid" }, fonts);
+  });
+}
+
+function renderThanks(slide, data, theme, fonts) {
+  shape(slide, "rect", { x: 0, y: 0, w: 13.333, h: 7.5, fill: { color: theme.primary }, line: { color: theme.primary, transparency: 100 } });
+  shape(slide, "ellipse", { x: 8.4, y: -0.8, w: 5.5, h: 5.5, fill: { color: theme.secondary, transparency: 20 }, line: { color: theme.secondary, transparency: 100 } });
+  shape(slide, "ellipse", { x: 10.5, y: 4.5, w: 2.2, h: 2.2, fill: { color: theme.accent, transparency: 25 }, line: { color: theme.accent, transparency: 100 } });
+  text(slide, data.title || "Thank You", { x: 0.8, y: 2.0, w: 8.6, h: 1.2, fontSize: 42, bold: true, color: "FFFFFF", fontFace: fonts.heading, fit: "shrink" }, fonts);
+  shape(slide, "roundRect", { x: 0.82, y: 3.55, w: 1.2, h: 0.06, rectRadius: 0.03, fill: { color: theme.accent }, line: { color: theme.accent, transparency: 100 } });
+  text(slide, data.content[0] || "Key takeaways", { x: 0.82, y: 3.9, w: 6.7, h: 0.55, fontSize: 15, color: "E2E8F0", fontFace: fonts.body, fit: "shrink" }, fonts);
+  text(slide, "AI Interview", { x: 0.82, y: 6.75, w: 2.2, h: 0.25, fontSize: 9, bold: true, charSpacing: 1, color: "FFFFFF", fontFace: fonts.body }, fonts);
+}
+
 const RENDERERS = {
-  // 🎬 CINEMATIC COVER
-  title(slide, data, theme, fonts, cfg) {
-    slide.addShape("roundRect", { x: -0.5, y: 4.2, w: GRID.W + 1, h: 3.6, rectRadius: 0.3, fill: { color: theme.panel, transparency: theme.dark ? 25 : 8 }, line: { type: "none" }, shadow: { type: "outer", color: "000000", blur: 18, offset: 4, angle: 90, opacity: 0.3 } });
-    slide.addShape("roundRect", { x: GRID.MX, y: 1.05, w: 1.4, h: 0.16, rectRadius: 0.08, fill: { color: theme.primary }, line: { type: "none" } });
-    text(slide, data.title, { x: GRID.MX, y: 1.5, w: GRID.contentW - 0.5, h: 1.9, fontSize: 44, bold: true, color: theme.titleColor, fontFace: fonts.heading }, fonts);
-    text(slide, data.content?.[0] || "", { x: GRID.MX, y: 3.4, w: GRID.contentW - 0.5, h: 0.7, fontSize: 18, color: theme.textColor }, fonts);
-    const badges = [cfg.language, cfg.type, "AI Premium"];
-    let bx = GRID.MX;
-    badges.forEach((b, i) => {
-      const bw = 0.35 + b.length * 0.11;
-      slide.addShape("roundRect", { x: bx, y: 4.55, w: bw, h: 0.38, rectRadius: 0.19, fill: { color: i === 0 ? theme.primary : theme.panel2 }, line: { color: theme.panelBorder, width: 0.75 } });
-      text(slide, b, { x: bx, y: 4.55, w: bw, h: 0.38, fontSize: 11, bold: true, color: i === 0 ? "FFFFFF" : theme.primary, align: "center", valign: "middle" }, fonts);
-      bx += bw + 0.2;
-    });
-    slide.addShape("rect", { x: GRID.MX, y: 5.35, w: 2.2, h: 0.07, fill: { color: theme.accent }, line: { type: "none" } });
-    text(slide, "AI Interview • Premium Deck", { x: GRID.MX, y: 5.55, w: 6, h: 0.4, fontSize: 13, color: theme.mutedColor }, fonts);
-  },
-
-  // 🎬 CINEMATIC SECTION DIVIDER
-  section(slide, data, theme, fonts) {
-    slide.addShape("roundRect", { x: 2.4, y: 2.2, w: GRID.W - 4.8, h: 2.6, rectRadius: 0.18, fill: { color: theme.primary, transparency: theme.dark ? 15 : 0 }, line: { type: "none" }, shadow: { type: "outer", color: theme.primary, blur: 22, offset: 5, angle: 90, opacity: 0.4 } });
-    slide.addShape("roundRect", { x: 2.62, y: 2.42, w: GRID.W - 5.24, h: 2.16, rectRadius: 0.15, fill: { color: theme.dark ? theme.panel : "FFFFFF", transparency: 8 }, line: { color: theme.accent, width: 1.5 } });
-    text(slide, "SECTION", { x: 2.9, y: 2.75, w: 3, h: 0.35, fontSize: 12, bold: true, charSpacing: 4, color: theme.accent }, fonts);
-    text(slide, data.title, { x: 2.9, y: 3.15, w: GRID.W - 5.8, h: 1.2, fontSize: 30, bold: true, color: theme.titleColor, fontFace: fonts.heading }, fonts);
-  },
-
-  agenda(slide, data, theme, fonts) {
-    header(slide, theme, data.title, fonts, { kicker: "AGENDA" });
-    const items = (data.content || []).slice(0, 6);
-    const colW = (GRID.contentW - 0.3) / 2;
-    items.forEach((item, i) => {
-      const col = i % 2, row = Math.floor(i / 2);
-      const x = GRID.MX + col * (colW + 0.3);
-      const y = 2.15 + row * 1.35;
-      glassCard(slide, theme, { x, y, w: colW, h: 1.15 });
-      slide.addShape("ellipse", { x: x + 0.22, y: y + 0.32, w: 0.52, h: 0.52, fill: { color: i % 2 ? theme.secondary : theme.primary }, line: { type: "none" } });
-      text(slide, String(i + 1), { x: x + 0.22, y: y + 0.32, w: 0.52, h: 0.52, fontSize: 16, bold: true, color: "FFFFFF", align: "center", valign: "middle" }, fonts);
-      text(slide, item, { x: x + 0.95, y: y + 0.15, w: colW - 1.15, h: 0.85, fontSize: theme.bodySize, color: theme.textColor, valign: "middle" }, fonts);
-    });
-  },
-
-  bullets(slide, data, theme, fonts) {
-    header(slide, theme, data.title, fonts);
-    bulletsInto(slide, theme, data.content, { x: GRID.MX + 0.15, y: 2.3, w: GRID.contentW - 0.6, h: 3.9 }, fonts, { fontSize: theme.bodySize + 1 });
-  },
-
-  // ✨ GLASS PANEL CARDS
-  panelBullets(slide, data, theme, fonts) {
-    header(slide, theme, data.title, fonts);
-    const items = (data.content || []).slice(0, 4);
-    const n = items.length;
-    const gap = 0.25;
-    const cw = (GRID.contentW - gap * (n - 1)) / n;
-    items.forEach((item, i) => {
-      const x = GRID.MX + i * (cw + gap);
-      glassCard(slide, theme, { x, y: 2.25, w: cw, h: 3.6 });
-      slide.addShape("rect", { x: x + 0.25, y: 2.6, w: 0.7, h: 0.09, fill: { color: [theme.primary, theme.secondary, theme.accent, theme.accent2][i % 4] }, line: { type: "none" } });
-      text(slide, item, { x: x + 0.25, y: 2.9, w: cw - 0.5, h: 2.7, fontSize: theme.bodySize, color: theme.textColor, valign: "top" }, fonts);
-      text(slide, `0${i + 1}`, { x: x + cw - 0.85, y: 2.35, w: 0.6, h: 0.5, fontSize: 18, bold: true, color: theme.panelBorder, align: "right" }, fonts);
-    });
-  },
-
-  // 📊 KPI STAT CARDS
-  kpi(slide, data, theme, fonts) {
-    header(slide, theme, data.title, fonts, { kicker: "KEY METRICS" });
-    const kpis = (data.kpis || (data.content || []).map((c) => {
-      const m = String(c).match(/^(.+?)[::-–]\s*(.+)$/);
-      return m ? { label: m[1], value: m[2] } : { label: c, value: "" };
-    })).slice(0, 4);
-    const n = kpis.length || 1;
-    const gap = 0.3;
-    const cw = (GRID.contentW - gap * (n - 1)) / n;
-    kpis.forEach((k, i) => {
-      const x = GRID.MX + i * (cw + gap);
-      glassCard(slide, theme, { x, y: 2.35, w: cw, h: 2.6 });
-      slide.addShape("roundRect", { x: x + cw / 2 - 0.3, y: 2.6, w: 0.6, h: 0.1, rectRadius: 0.05, fill: { color: [theme.primary, theme.accent, theme.secondary, theme.accent2][i % 4] }, line: { type: "none" } });
-      text(slide, String(k.value || "—"), { x: x + 0.15, y: 2.95, w: cw - 0.3, h: 1.0, fontSize: 30, bold: true, color: theme.primary, align: "center", valign: "middle", fontFace: fonts.heading }, fonts);
-      text(slide, String(k.label || ""), { x: x + 0.15, y: 4.05, w: cw - 0.3, h: 0.75, fontSize: theme.bodySize - 1, color: theme.mutedColor, align: "center", valign: "top" }, fonts);
-    });
-    const extra = (data.content || []).slice(kpis.length);
-    if (extra.length) bulletsInto(slide, theme, extra, { x: GRID.MX + 0.15, y: 5.3, w: GRID.contentW - 0.6, h: 1.1 }, fonts, { fontSize: theme.bodySize - 1 });
-  },
-
-  // 🌐 PROCESS / DIAGRAM FLOW
-  process(slide, data, theme, fonts) {
-    header(slide, theme, data.title, fonts, { kicker: "PROCESS FLOW" });
-    const steps = (data.steps || (data.content || []).map((c) => ({ step: c, desc: "" }))).slice(0, 5);
-    const n = steps.length || 1;
-    const arrowW = 0.45;
-    const cw = (GRID.contentW - arrowW * (n - 1) - 0.2) / n;
-    steps.forEach((st, i) => {
-      const x = GRID.MX + 0.1 + i * (cw + arrowW);
-      const y = 2.5;
-      slide.addShape("roundRect", { x, y, w: cw, h: 2.3, rectRadius: 0.12, fill: { color: theme.panel }, line: { color: theme.panelBorder, width: 1 }, shadow: { type: "outer", color: "64748B", blur: 10, offset: 3, angle: 90, opacity: 0.22 } });
-      slide.addShape("ellipse", { x: x + cw / 2 - 0.3, y: y - 0.35, w: 0.6, h: 0.6, fill: { color: [theme.primary, theme.secondary, theme.accent, theme.accent2, theme.primary][i % 5] }, line: { color: theme.bg, width: 2.5 } });
-      text(slide, String(i + 1), { x: x + cw / 2 - 0.3, y: y - 0.35, w: 0.6, h: 0.6, fontSize: 16, bold: true, color: "FFFFFF", align: "center", valign: "middle" }, fonts);
-      text(slide, String(st.step || ""), { x: x + 0.15, y: y + 0.4, w: cw - 0.3, h: 0.75, fontSize: theme.bodySize, bold: true, color: theme.titleColor, align: "center" }, fonts);
-      if (st.desc) text(slide, String(st.desc), { x: x + 0.15, y: y + 1.2, w: cw - 0.3, h: 0.95, fontSize: theme.bodySize - 3, color: theme.mutedColor, align: "center" }, fonts);
-      if (i < n - 1) slide.addShape("rightArrow", { x: x + cw + 0.05, y: y + 0.9, w: arrowW - 0.1, h: 0.42, fill: { color: theme.accent, transparency: 25 }, line: { type: "none" } });
-    });
-    const extra = (data.content || []).slice(steps.length);
-    if (extra.length) bulletsInto(slide, theme, extra, { x: GRID.MX + 0.15, y: 5.35, w: GRID.contentW - 0.6, h: 1.05 }, fonts, { fontSize: theme.bodySize - 1 });
-  },
-
-  // 💬 QUOTE
-  quote(slide, data, theme, fonts) {
-    slide.addShape("roundRect", { x: 1.4, y: 1.9, w: GRID.W - 2.8, h: 3.4, rectRadius: 0.2, fill: { color: theme.panel }, line: { color: theme.accent, width: 1.5 }, shadow: { type: "outer", color: theme.primary, blur: 20, offset: 4, angle: 90, opacity: 0.28 } });
-    text(slide, "\u201C", { x: 1.7, y: 1.8, w: 1.2, h: 1.2, fontSize: 80, bold: true, color: theme.accent, fontFace: fonts.heading }, fonts);
-    text(slide, data.quote || data.content?.[0] || data.title, { x: 2.5, y: 2.5, w: GRID.W - 5.0, h: 1.9, fontSize: 22, italic: true, color: theme.titleColor, fontFace: fonts.heading, valign: "middle" }, fonts);
-    if (data.quoteBy) text(slide, `— ${data.quoteBy}`, { x: 2.5, y: 4.45, w: GRID.W - 5.0, h: 0.5, fontSize: 14, bold: true, color: theme.primary }, fonts);
-  },
-
-  // 🖼️ IMAGE + TEXT BALANCE
-  imageText(slide, data, theme, fonts, cfg, buf) {
-    header(slide, theme, data.title, fonts);
-    const imgW = 5.6;
-    if (buf) {
-      slide.addShape("roundRect", { x: GRID.W - GRID.MX - imgW - 0.15, y: 2.2, w: imgW + 0.3, h: 4.0, rectRadius: 0.15, fill: { color: theme.panel2 }, line: { color: theme.panelBorder, width: 1 }, shadow: { type: "outer", color: "64748B", blur: 12, offset: 4, angle: 90, opacity: 0.3 } });
-      slide.addImage({ data: buf, x: GRID.W - GRID.MX - imgW, y: 2.35, w: imgW, h: 3.7, sizing: { type: "cover", w: imgW, h: 3.7 } });
-    }
-    const tw = buf ? GRID.contentW - imgW - 0.6 : GRID.contentW - 0.4;
-    bulletsInto(slide, theme, data.content, { x: GRID.MX + 0.15, y: 2.4, w: tw - 0.2, h: 3.7 }, fonts, { fontSize: theme.bodySize });
-  },
-
-  textImage(slide, data, theme, fonts, cfg, buf) {
-    header(slide, theme, data.title, fonts);
-    const imgW = 5.6;
-    if (buf) {
-      slide.addShape("roundRect", { x: GRID.MX - 0.15, y: 2.2, w: imgW + 0.3, h: 4.0, rectRadius: 0.15, fill: { color: theme.panel2 }, line: { color: theme.panelBorder, width: 1 }, shadow: { type: "outer", color: "64748B", blur: 12, offset: 4, angle: 90, opacity: 0.3 } });
-      slide.addImage({ data: buf, x: GRID.MX, y: 2.35, w: imgW, h: 3.7, sizing: { type: "cover", w: imgW, h: 3.7 } });
-    }
-    const tx = buf ? GRID.MX + imgW + 0.55 : GRID.MX + 0.2;
-    const tw = buf ? GRID.contentW - imgW - 0.7 : GRID.contentW - 0.4;
-    bulletsInto(slide, theme, data.content, { x: tx, y: 2.4, w: tw, h: 3.7 }, fonts, { fontSize: theme.bodySize });
-  },
-
-  fullImage(slide, data, theme, fonts, cfg, buf) {
-    if (buf) {
-      slide.addImage({ data: buf, x: 0, y: 0, w: GRID.W, h: GRID.H, sizing: { type: "cover", w: GRID.W, h: GRID.H } });
-      slide.addShape("rect", { x: 0, y: 3.6, w: GRID.W, h: 3.9, fill: { color: "000000", transparency: 45 }, line: { type: "none" } });
-      text(slide, data.title, { x: GRID.MX, y: 5.4, w: GRID.contentW, h: 0.9, fontSize: 30, bold: true, color: "FFFFFF", fontFace: fonts.heading }, fonts);
-      const list = (data.content || []).slice(0, 2);
-      list.forEach((item, i) => {
-        text(slide, item, { x: GRID.MX + 0.1, y: 6.35 + i * 0.4, w: GRID.contentW - 0.6, h: 0.38, fontSize: 12, color: "E2E8F0" }, fonts);
-      });
-      return;
-    }
-    // image fail → designed text fallback (never blank)
-    RENDERERS.section(slide, data, theme, fonts);
-  },
-
-  twoColumn(slide, data, theme, fonts) {
-    header(slide, theme, data.title, fonts);
-    const colW = (GRID.contentW - 0.35) / 2;
-    glassCard(slide, theme, { x: GRID.MX, y: 2.2, w: colW, h: 4.0 });
-    glassCard(slide, theme, { x: GRID.MX + colW + 0.35, y: 2.2, w: colW, h: 4.0 });
-    slide.addShape("rect", { x: GRID.MX, y: 2.2, w: colW, h: 0.09, fill: { color: theme.primary }, line: { type: "none" } });
-    slide.addShape("rect", { x: GRID.MX + colW + 0.35, y: 2.2, w: colW, h: 0.09, fill: { color: theme.secondary }, line: { type: "none" } });
-    text(slide, data.leftTitle || "Overview", { x: GRID.MX + 0.25, y: 2.42, w: colW - 0.5, h: 0.5, fontSize: theme.bodySize + 1, bold: true, color: theme.primary }, fonts);
-    text(slide, data.rightTitle || "Details", { x: GRID.MX + colW + 0.6, y: 2.42, w: colW - 0.5, h: 0.5, fontSize: theme.bodySize + 1, bold: true, color: theme.secondary }, fonts);
-    bulletsInto(slide, theme, data.left || data.content, { x: GRID.MX + 0.3, y: 3.05, w: colW - 0.55, h: 2.9 }, fonts, { fontSize: theme.bodySize - 1 });
-    bulletsInto(slide, theme, data.right || [], { x: GRID.MX + colW + 0.65, y: 3.05, w: colW - 0.55, h: 2.9 }, fonts, { fontSize: theme.bodySize - 1 });
-  },
-
-  // 🆚 COMPARISON CARDS
-  comparison(slide, data, theme, fonts) {
-    header(slide, theme, data.title, fonts, { kicker: "COMPARISON" });
-    const colW = (GRID.contentW - 0.35) / 2;
-    const panels = [
-      { x: GRID.MX, color: theme.primary, title: data.leftTitle || "Option A", items: data.left || data.content },
-      { x: GRID.MX + colW + 0.35, color: theme.secondary, title: data.rightTitle || "Option B", items: data.right || [] },
-    ];
-    panels.forEach((p) => {
-      slide.addShape("roundRect", { x: p.x, y: 2.2, w: colW, h: 4.1, rectRadius: 0.14, fill: { color: theme.panel }, line: { color: p.color, width: 1.5 }, shadow: { type: "outer", color: p.color, blur: 14, offset: 3, angle: 90, opacity: 0.25 } });
-      slide.addShape("roundRect", { x: p.x + 0.25, y: 2.42, w: colW - 0.5, h: 0.5, rectRadius: 0.1, fill: { color: p.color }, line: { type: "none" } });
-      text(slide, p.title, { x: p.x + 0.35, y: 2.42, w: colW - 0.7, h: 0.5, fontSize: 13, bold: true, color: "FFFFFF", valign: "middle" }, fonts);
-      bulletsInto(slide, theme, p.items, { x: p.x + 0.3, y: 3.15, w: colW - 0.6, h: 2.9 }, fonts, { fontSize: theme.bodySize - 1 });
-    });
-  },
-
-  // 📊 NATIVE EDITABLE CHART
-  chart(slide, data, theme, fonts, cfg, buf, pres) {
-    header(slide, theme, data.title, fonts, { kicker: "DATA INSIGHT" });
-    const chartData = extractChartData(data);
-    if (!chartData) return RENDERERS.panelBullets(slide, data, theme, fonts, cfg, null);
-    const cd = [{ name: chartData.title || "Data", labels: chartData.labels, values: chartData.values }];
-    const opts = {
-      x: GRID.MX + 0.2, y: 2.25, w: GRID.contentW - 2.6, h: 4.0,
-      chartColors: [theme.primary, theme.accent, theme.secondary, theme.accent2],
-      showLegend: false, showValue: true, dataBorder: { pt: 0, color: theme.panel },
-      catAxisLabelColor: theme.mutedColor, valAxisLabelColor: theme.mutedColor,
-      catAxisLabelFontSize: 9, valAxisLabelFontSize: 9,
-      dataLabelColor: theme.textColor, dataLabelFontSize: 9,
-    };
-    try {
-      if (chartData.type === "line") slide.addChart(pres.charts.LINE, cd, opts);
-      else if (chartData.type === "pie") slide.addChart(pres.charts.PIE, cd, { ...opts, showLegend: true, legendPos: "r", legendColor: theme.textColor });
-      else if (chartData.type === "doughnut") slide.addChart(pres.charts.DOUGHNUT, cd, { ...opts, showLegend: true, legendPos: "r", legendColor: theme.textColor, holeSize: 60 });
-      else slide.addChart(pres.charts.BAR, cd, opts);
-    } catch (error) {
-      console.warn("[PPT] chart failed:", error.message);
-      return RENDERERS.panelBullets(slide, data, theme, fonts, cfg, null);
-    }
-    glassCard(slide, theme, { x: GRID.W - GRID.MX - 2.1, y: 2.25, w: 2.1, h: 4.0 });
-    text(slide, "Insight", { x: GRID.W - GRID.MX - 1.95, y: 2.45, w: 1.8, h: 0.4, fontSize: 12, bold: true, color: theme.primary }, fonts);
-    bulletsInto(slide, theme, (data.content || []).slice(0, 3), { x: GRID.W - GRID.MX - 1.95, y: 2.9, w: 1.85, h: 3.2 }, fonts, { fontSize: 10 });
-  },
-
-  thanks(slide, data, theme, fonts) {
-    slide.addShape("roundRect", { x: 2.2, y: 2.3, w: GRID.W - 4.4, h: 2.5, rectRadius: 0.2, fill: { color: theme.primary, transparency: theme.dark ? 12 : 0 }, line: { type: "none" }, shadow: { type: "outer", color: theme.primary, blur: 24, offset: 5, angle: 90, opacity: 0.4 } });
-    text(slide, data.title || "Thank You", { x: 2.5, y: 2.7, w: GRID.W - 5.0, h: 1.1, fontSize: 36, bold: true, color: "FFFFFF", align: "center", fontFace: fonts.heading }, fonts);
-    text(slide, (data.content || []).join(" • ") || "Questions & Discussion", { x: 2.5, y: 3.9, w: GRID.W - 5.0, h: 0.6, fontSize: 15, color: theme.dark ? theme.accent : "E8EDFB", align: "center" }, fonts);
-  },
+  title: renderTitle,
+  section: renderSection,
+  bullets: renderBullets,
+  twoColumn: renderTwoColumn,
+  threeCards: (s,d,t,f,c) => renderCards(s,d,t,f,3),
+  fourCards: (s,d,t,f,c) => renderCards(s,d,t,f,4),
+  fiveCards: (s,d,t,f,c) => renderCards(s,d,t,f,5),
+  comparison: renderComparison,
+  timeline: renderTimeline,
+  process: renderProcess,
+  stats: renderStats,
+  quote: renderQuote,
+  imageText: (s,d,t,f,c,b) => renderImageText(s,d,t,f,b,false),
+  textImage: (s,d,t,f,c,b) => renderImageText(s,d,t,f,b,true),
+  fullImage: renderFullImage,
+  flow: renderFlow,
+  grid: renderGrid,
+  problemSolution: renderProblemSolution,
+  beforeAfter: renderBeforeAfter,
+  prosCons: renderProsCons,
+  diagram: renderDiagram,
+  summary: renderSummary,
+  thanks: renderThanks,
 };
 
-// ------------------------------------------------------------
-// BUILD PPTX
-// ------------------------------------------------------------
-async function buildPPTX(content, cfg) {
-  const pres = new PptxGenJS();
-  const theme = getTheme(cfg.theme);
-  const fonts = theme.fontPair;
+// ============================================================
+// PPT BUILD
+// ============================================================
 
-  pres.defineLayout({ name: "WIDE", width: GRID.W, height: GRID.H });
-  pres.layout = "WIDE";
+async function buildPPTX(content, cfg) {
+  const theme = getTheme(cfg.theme);
+  const fonts = fontConfig(cfg, theme);
+  const pres = new PptxGenJS();
+  pres.layout = "LAYOUT_WIDE";
   pres.author = "AI Interview";
   pres.company = "AI Interview";
   pres.subject = content.title;
   pres.title = content.title;
   pres.lang = cfg.language === "Hindi" ? "hi-IN" : "en-US";
   pres.theme = { headFontFace: fonts.heading, bodyFontFace: fonts.body, lang: pres.lang };
+  if (typeof pres.defineSlideMaster === "function") {
+    // No master is required; intentional per-slide design avoids accidental theme overrides.
+  }
 
   const imageMap = await prepareImages(content, cfg);
   const total = content.slides.length;
@@ -561,42 +1009,42 @@ async function buildPPTX(content, cfg) {
   for (let i = 0; i < content.slides.length; i++) {
     const data = content.slides[i];
     const slide = pres.addSlide();
-    const layout = autoLayout(data, i, total, cfg);
-    addBackground(slide, theme, i, ["title", "section", "thanks", "fullImage"].includes(layout) ? "cinematic" : "content");
+    addBackground(slide, theme, i, total);
 
     const buffer = imageMap.get(i) || null;
-    const renderData = { ...data, layout, content: data.content || [] };
+    let layout = data.layout;
+    if (cfg.addImages && ["imageText", "textImage", "fullImage"].includes(layout) && !buffer) layout = safeLayoutForImageFailure(data);
 
     const renderer = RENDERERS[layout] || RENDERERS.bullets;
     try {
-      await Promise.resolve(renderer(slide, renderData, theme, fonts, cfg, buffer, pres));
+      await Promise.resolve(renderer(slide, { ...data, layout }, theme, fonts, cfg, buffer));
     } catch (error) {
       console.warn(`[PPT] renderer ${layout} failed on slide ${data.slideNumber}:`, error.message);
       try {
-        RENDERERS.bullets(slide, renderData, theme, fonts, cfg, null, pres);
+        renderBullets(slide, { ...data, layout: "bullets" }, theme, fonts, cfg);
       } catch (fallbackError) {
         console.warn(`[PPT] hard fallback failed on slide ${data.slideNumber}:`, fallbackError.message);
-        text(slide, data.title || `Slide ${data.slideNumber}`, { x: 0.7, y: 2.7, w: 11.8, h: 0.8, fontSize: 28, bold: true, align: "center", color: theme.titleColor, fontFace: fonts.heading }, fonts);
+        text(slide, data.title || `Slide ${data.slideNumber}`, { x: 0.7, y: 2.7, w: 11.8, h: 0.8, fontSize: 28, bold: true, align: "center", color: theme.titleColor, fontFace: fonts.heading, fit: "shrink" }, fonts);
       }
     }
 
     if (!["title", "section", "quote", "fullImage", "thanks"].includes(layout)) addFooter(slide, theme, data.slideNumber, total, fonts);
-
     if (cfg.speakerNotes !== false) {
-      const notes = [cfg.narration && data.narrationScript ? `\u{1F50A} NARRATION: ${data.narrationScript}` : "", data.speakerNotes || (data.content || []).join("\n")].filter(Boolean).join("\n\n");
+      const notes = [cfg.narration && data.narrationScript ? `NARRATION: ${data.narrationScript}` : "", data.speakerNotes || data.content.join("\n")].filter(Boolean).join("\n\n");
       if (notes && typeof slide.addNotes === "function") slide.addNotes(notes);
     }
   }
   return pres;
 }
 
-// ------------------------------------------------------------
-// MOTION / AUTO-ADVANCE (4.5–11s)
-// ------------------------------------------------------------
+// ============================================================
+// MOTION / AUTO-ADVANCE
+// ============================================================
+
 function getSlideAdvanceMs(data, cfg, index, total) {
-  if (!cfg || cfg.transitions === "Off") return 0;
+  if (!cfg || cfg.animations === "Off" || cfg.transitions === "Off") return 0;
   if (index === 0) return cfg.animations === "Professional" ? 6500 : 5500;
-  if (index === total - 1) return cfg.animations === "Professional" ? 9000 : 7000;
+  if (index === total - 1) return cfg.animations === "Professional" ? 8000 : 6500;
 
   const textLength = [data?.title, ...(data?.content || [])].join(" ").length;
   const hasChart = !!extractChartData(data);
@@ -608,12 +1056,19 @@ function getSlideAdvanceMs(data, cfg, index, total) {
   return Math.max(AUTO_ADVANCE_MIN_MS, Math.min(AUTO_ADVANCE_MAX_MS, ms));
 }
 
-// ------------------------------------------------------------
-// OOXML TRANSITIONS + ENTRANCE ANIMATIONS (fail-safe rollback)
-// ------------------------------------------------------------
+// ============================================================
+// OOXML TRANSITIONS / OPTIONAL ANIMATION
+// ============================================================
+
 function transitionXML(mode, index, advanceMs = 0) {
   if (mode === "Off") return "";
-  const advance = Number.isFinite(advanceMs) && advanceMs > 0 ? ` advClick="0" advTm="${Math.round(advanceMs)}"` : "";
+
+  const advance = Number.isFinite(advanceMs) && advanceMs > 0
+    ? ` advClick="0" advTm="${Math.round(advanceMs)}"`
+    : "";
+
+  // PowerPoint-native slide transitions. Dynamic intentionally rotates
+  // through different effects so consecutive slides do not feel identical.
   if (mode === "Dynamic") {
     const effects = [
       `<p:zoom dir="in"/>`,
@@ -624,8 +1079,8 @@ function transitionXML(mode, index, advanceMs = 0) {
     ];
     return `<p:transition spd="med"${advance}>${effects[index % effects.length]}</p:transition>`;
   }
-  const subtle = [`<p:fade/>`, `<p:wipe dir="r"/>`];
-  return `<p:transition spd="med"${advance}>${subtle[index % subtle.length]}</p:transition>`;
+
+  return `<p:transition spd="med"${advance}><p:fade/></p:transition>`;
 }
 
 function collectAnimatableShapeIds(xml) {
@@ -636,30 +1091,78 @@ function collectAnimatableShapeIds(xml) {
     const id = Number(match[1]);
     if (Number.isInteger(id) && id > 0 && !ids.includes(id)) ids.push(id);
   }
-  return ids.slice(0, 6);
+  return ids.slice(0, 8);
 }
 
 function buildEntranceAnimationXML(shapeIds, effect = "fade", duration = 420) {
   if (!Array.isArray(shapeIds) || !shapeIds.length) return "";
-  const safeEffect = ["fade", "wipe(right)", "blinds(horizontal)"].includes(effect) ? effect : "fade";
+
+  const safeEffect = ["fade", "fly(in)", "blinds(horizontal)", "wipe(right)"].includes(effect)
+    ? effect
+    : "fade";
 
   let nextId = 3;
   const rows = shapeIds.map((spid, index) => {
-    const outer = nextId, inner = nextId + 1, behavior = nextId + 2;
-    const delay = index === 0 ? 0 : Math.min(900, index * 120);
+    const outer = nextId;
+    const inner = nextId + 1;
+    const behavior = nextId + 2;
+    const delay = index === 0 ? 0 : Math.min(900, index * 110);
     nextId += 4;
-    return `<p:par><p:cTn id="${outer}" fill="hold"><p:stCondLst><p:cond delay="${delay}"/></p:stCondLst><p:childTnLst><p:par><p:cTn id="${inner}" fill="hold"><p:childTnLst><p:animEffect transition="in" filter="${safeEffect}"><p:cBhvr><p:cTn id="${behavior}" dur="${duration}" fill="hold"/><p:tgtEl><p:spTgt spid="${spid}"/></p:tgtEl></p:cBhvr></p:animEffect></p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:par>`;
-  }).join("");
 
-  return `<p:timing><p:tnLst><p:par><p:cTn id="1" dur="indefinite" restart="never" nodeType="tmRoot"><p:childTnLst><p:seq concurrent="1" nextAc="seek"><p:cTn id="2" dur="indefinite" nodeType="mainSeq"><p:childTnLst>${rows}</p:childTnLst><p:prevCondLst><p:cond evt="onPrev" delay="0"><p:tgtEl><p:sldTgt/></p:tgtEl></p:cond></p:prevCondLst><p:nextCondLst><p:cond evt="onNext" delay="0"><p:tgtEl><p:sldTgt/></p:tgtEl></p:cond></p:nextCondLst></p:cTn></p:seq></p:childTnLst></p:cTn></p:par></p:tnLst><p:bldLst/></p:timing>`;
+    return `
+      <p:par>
+        <p:cTn id="${outer}" fill="hold">
+          <p:stCondLst><p:cond delay="${delay}"/></p:stCondLst>
+          <p:childTnLst>
+            <p:par>
+              <p:cTn id="${inner}" fill="hold">
+                <p:childTnLst>
+                  <p:animEffect transition="in" filter="${safeEffect}">
+                    <p:cBhvr>
+                      <p:cTn id="${behavior}" dur="${duration}" fill="hold"/>
+                      <p:tgtEl><p:spTgt spid="${spid}"/></p:tgtEl>
+                    </p:cBhvr>
+                  </p:animEffect>
+                </p:childTnLst>
+              </p:cTn>
+            </p:par>
+          </p:childTnLst>
+        </p:cTn>
+      </p:par>`;
+  }).join("\n");
+
+  return `
+  <p:timing>
+    <p:tnLst>
+      <p:par>
+        <p:cTn id="1" dur="indefinite" restart="never" nodeType="tmRoot">
+          <p:childTnLst>
+            <p:seq concurrent="1" nextAc="seek">
+              <p:cTn id="2" dur="indefinite" nodeType="mainSeq">
+                <p:childTnLst>
+                  ${rows}
+                </p:childTnLst>
+                <p:prevCondLst>
+                  <p:cond evt="onPrev" delay="0"><p:tgtEl><p:sldTgt/></p:tgtEl></p:cond>
+                </p:prevCondLst>
+                <p:nextCondLst>
+                  <p:cond evt="onNext" delay="0"><p:tgtEl><p:sldTgt/></p:tgtEl></p:cond>
+                </p:nextCondLst>
+              </p:cTn>
+            </p:seq>
+          </p:childTnLst>
+        </p:cTn>
+      </p:par>
+    </p:tnLst>
+    <p:bldLst/>
+  </p:timing>`;
 }
 
 function isSlideXmlSane(xml) {
   return typeof xml === "string" &&
     xml.includes("<p:sld") &&
     xml.includes("</p:sld>") &&
-    !xml.includes("<p:transition><p:transition>") &&
-    !xml.includes("<p:timing><p:timing>");
+    !xml.includes("<p:transition><p:transition>");
 }
 
 async function postProcessPPTX(filePath, options) {
@@ -680,28 +1183,34 @@ async function postProcessPPTX(filePath, options) {
     const slideData = options.content?.slides?.[i];
     const advanceMs = getSlideAdvanceMs(slideData, options, i, slideFiles.length);
 
-    // idempotent: strip old motion first
+    // Remove previously injected motion so repeated processing stays idempotent.
     xml = xml.replace(/<p:transition\b[\s\S]*?<\/p:transition>/g, "");
     xml = xml.replace(/<p:timing>[\s\S]*?<\/p:timing>/g, "");
 
-    const transition = needTransitions ? transitionXML(options.transitions, i, advanceMs) : "";
+    const transition = needTransitions
+      ? transitionXML(options.transitions, i, advanceMs)
+      : "";
+
     let candidate = xml;
     const clr = "</p:clrMapOvr>";
     const end = "</p:sld>";
+    const clrPos = xml.indexOf(clr);
 
     if (transition) {
-      const clrPos = candidate.indexOf(clr);
       if (clrPos >= 0) {
         const at = clrPos + clr.length;
-        candidate = candidate.slice(0, at) + transition + candidate.slice(at);
+        candidate = xml.slice(0, at) + transition + xml.slice(at);
       } else {
-        const at = candidate.lastIndexOf(end);
-        if (at >= 0) candidate = candidate.slice(0, at) + transition + candidate.slice(at);
+        const at = xml.lastIndexOf(end);
+        if (at >= 0) candidate = xml.slice(0, at) + transition + xml.slice(at);
       }
     }
 
     if (needAnimations) {
       const ids = collectAnimatableShapeIds(candidate);
+      // Use a small number of entrance targets to keep the animation pane
+      // elegant and the file lightweight. Background/chrome are skipped by
+      // limiting to the first content objects generated by the renderer.
       if (ids.length) {
         const effect = options.animations === "Professional"
           ? ["fade", "wipe(right)", "blinds(horizontal)"][i % 3]
@@ -715,45 +1224,59 @@ async function postProcessPPTX(filePath, options) {
     if (isSlideXmlSane(candidate)) {
       xml = candidate;
     } else {
-      console.warn(`[PPT] Motion XML rejected for ${name}; rollback to original.`);
+      // Roll back the entire post-processing operation for this slide.
+      console.warn(`[PPT] Motion XML rejected for ${name}; keeping original slide XML.`);
       xml = originalXml;
     }
+
     zip.file(name, xml);
   }
 
-  const output = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+  const output = await zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+  });
   fs.writeFileSync(filePath, output);
 }
 
-// ------------------------------------------------------------
-// QUALITY CONTROL (blank-slide QC + rebuild guarantee)
-// ------------------------------------------------------------
+// ============================================================
+// QUALITY CONTROL
+// ============================================================
+
 async function validateOutput(filePath, content) {
   const issues = [];
   if (!fs.existsSync(filePath)) return ["file-missing"];
   try {
-    if (fs.statSync(filePath).size < 10 * 1024) issues.push("file-too-small");
+    const stat = fs.statSync(filePath);
+    if (stat.size < 10 * 1024) issues.push("file-too-small");
   } catch { issues.push("file-stat-failed"); }
 
   try {
     const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
-    const slideFiles = Object.keys(zip.files).filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n));
+    const slideFiles = Object.keys(zip.files).filter((name) => /^ppt\/slides\/slide\d+\.xml$/.test(name)).sort((a,b) => Number(a.match(/\d+/)[0]) - Number(b.match(/\d+/)[0]));
     if (slideFiles.length !== content.slides.length) issues.push("slide-count-mismatch");
+
     for (let i = 0; i < slideFiles.length; i++) {
       const xml = await zip.file(slideFiles[i]).async("string");
       if (!isSlideXmlSane(xml)) issues.push(`slide-xml-invalid-${i + 1}`);
-      if (!/<p:(sp|pic|graphicFrame)\b/.test(xml)) issues.push(`blank-slide-${i + 1}`);
+      const hasVisibleShape = /<p:(sp|pic|graphicFrame)\b/.test(xml);
+      if (!hasVisibleShape) issues.push(`blank-slide-${i + 1}`);
+      const hasTextOrVisual = /<a:(t|blip|graphic)/.test(xml);
+      if (!hasTextOrVisual) issues.push(`content-missing-${i + 1}`);
     }
   } catch (error) {
     issues.push(`zip-invalid:${String(error.message || "").slice(0, 100)}`);
+  }
+
+  for (const slide of content.slides) {
+    if (!slide.title || !Array.isArray(slide.content) || !slide.content.length) issues.push(`empty-slide-${slide.slideNumber}`);
+    if (String(slide.title).length > 120) issues.push(`long-title-${slide.slideNumber}`);
+    for (const item of slide.content || []) if (String(item).length > 160) issues.push(`long-content-${slide.slideNumber}`);
   }
   if (issues.length) console.warn("[PPT] QC:", issues.join(", "));
   return issues;
 }
 
-// ------------------------------------------------------------
-// FILE UTILS
-// ------------------------------------------------------------
 function makeFileName(userId) {
   const safeUser = String(userId || "user").replace(/[^A-Za-z0-9-]/g, "").slice(0, 80) || "user";
   return `ppt_${safeUser}_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.pptx`;
@@ -767,7 +1290,8 @@ async function cleanOldPPTFiles() {
   try {
     if (!fs.existsSync(PPT_DIR)) return;
     const cutoff = Date.now() - TTL_HOURS * 3600 * 1000;
-    for (const file of await fs.promises.readdir(PPT_DIR)) {
+    const files = await fs.promises.readdir(PPT_DIR);
+    for (const file of files) {
       if (!file.toLowerCase().endsWith(".pptx")) continue;
       const full = path.join(PPT_DIR, file);
       try {
@@ -778,12 +1302,13 @@ async function cleanOldPPTFiles() {
   } catch (error) { console.warn("[PPT] cleanup failed:", error.message); }
 }
 
-// ------------------------------------------------------------
+// ============================================================
 // MAIN API
-// ------------------------------------------------------------
+// ============================================================
+
 async function generatePPT(opts, userId) {
   const { errors, clean } = validatePPTOptions(opts);
-  if (errors.length) { const e = new Error(errors.join(", ")); e.statusCode = 400; throw e; }
+  if (errors.length) { const error = new Error(errors.join(", ")); error.statusCode = 400; throw error; }
 
   await cleanOldPPTFiles();
   const content = await generatePPTContent(clean);
@@ -796,39 +1321,40 @@ async function generatePPT(opts, userId) {
   const presentation = await buildPPTX(content, clean);
   await presentation.writeFile({ fileName: filePath });
 
-  try { await postProcessPPTX(filePath, { ...clean, content }); }
-  catch (error) { console.warn("[PPT] motion post-process skipped:", error.message); }
+  // Transitions are optional and isolated. A failure never destroys a valid PPT.
+  try { await postProcessPPTX(filePath, { ...clean, content }); } catch (error) { console.warn("[PPT] transition/motion post-process skipped:", error.message); }
 
   let issues = await validateOutput(filePath, content);
-  const fatal = issues.some((x) => x === "file-missing" || x.startsWith("zip-invalid") || x.startsWith("blank-slide") || x.startsWith("slide-xml-invalid") || x.startsWith("slide-count-mismatch"));
+  const fatal = issues.some((x) => x === "file-missing" || x.startsWith("zip-invalid") || x.startsWith("blank-slide") || x.startsWith("content-missing") || x.startsWith("slide-xml-invalid"));
 
   if (fatal) {
-    console.warn("[PPT] QC fatal; rebuilding clean PPTX without post-processing.");
-    const cleanPres = await buildPPTX(content, { ...clean, transitions: "Off", animations: "Off" });
-    await cleanPres.writeFile({ fileName: filePath });
+    console.warn("[PPT] QC found a fatal issue; rebuilding clean PPTX without post-processing.");
+    const cleanPresentation = await buildPPTX(content, { ...clean, transitions: "Off" });
+    await cleanPresentation.writeFile({ fileName: filePath });
     issues = await validateOutput(filePath, content);
   }
 
-  if (issues.some((x) => x === "file-missing" || x.startsWith("zip-invalid") || x.startsWith("blank-slide") || x.startsWith("slide-xml-invalid"))) {
+  if (issues.some((x) => x === "file-missing" || x.startsWith("zip-invalid") || x.startsWith("blank-slide") || x.startsWith("content-missing") || x.startsWith("slide-xml-invalid"))) {
     throw new Error("PPT file valid nahi bani. Thodi der baad try karo.");
   }
 
   const preview = {
     title: content.title,
     subtitle: content.subtitle,
-    slides: content.slides.map((s) => ({
-      slideNumber: s.slideNumber,
-      title: s.title,
-      layout: s.layout,
-      content: s.content,
-      hasChart: clean.charts === "Auto" && !!extractChartData(s),
-      narrationScript: clean.narration ? s.narrationScript : "",
-      autoAdvanceMs: getSlideAdvanceMs(s, clean, s.slideNumber - 1, content.slides.length),
+    slides: content.slides.map((slide) => ({
+      slideNumber: slide.slideNumber,
+      title: slide.title,
+      layout: slide.layout,
+      content: slide.content,
+      imagePrompt: clean.addImages ? slide.imagePrompt : "",
+      hasChart: clean.charts === "Auto" && !!extractChartData(slide),
+      narrationScript: clean.narration ? slide.narrationScript : "",
+      autoAdvanceMs: getSlideAdvanceMs(slide, clean, slide.slideNumber - 1, content.slides.length),
     })),
   };
 
   const stat = fs.statSync(filePath);
-  console.log(`[PPT] Premium generated ${fileName} | ${content.slides.length} slides | ${Math.round(stat.size / 1024)} KB | theme=${clean.theme}`);
+  console.log(`[PPT] Premium generated ${fileName} | ${content.slides.length} slides | ${Math.round(stat.size / 1024)} KB | theme=${clean.theme} | images=${clean.addImages}`);
 
   return { fileName, filePath, slideCount: content.slides.length, content, preview, cfg: clean };
 }
