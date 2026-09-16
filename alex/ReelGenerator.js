@@ -1,13 +1,14 @@
 // ============================================================
-// ALEX REEL GENERATOR — v2.1
-// Pipeline:
-// PLAN → VOICE → VISUALS → SYNC → RENDER → VERIFY → METADATA
+// ALEX REEL GENERATOR — v2.2
+// Pipeline: PLAN → VOICE → VISUALS → SYNC → RENDER → VERIFY → METADATA
 //
-// Rules:
-// - success:true ONLY when final.mp4 exists and is valid
-// - FFmpeg / FFprobe bundled support for local + Render
-// - Real failure cause is returned
-// - No false success
+// Fixes:
+// - FFmpeg drawtext "Both text and text file provided" fixed
+// - Bundled ffmpeg-static / ffprobe-static supported
+// - Windows + Linux paths handled safely
+// - 1080x1920 vertical output
+// - Voice failure does NOT falsely fail the whole reel
+// - Final success ONLY when final.mp4 is verified
 // ============================================================
 
 const fs = require("fs");
@@ -16,9 +17,6 @@ const { execFile } = require("child_process");
 const { promisify } = require("util");
 
 const execFileAsync = promisify(execFile);
-
-const ffmpegStatic = require("ffmpeg-static");
-const ffprobeStatic = require("ffprobe-static");
 
 const { getAlexGeminiClient } = require("../config/geminiClient");
 
@@ -32,9 +30,8 @@ const WIDTH = 1080;
 const HEIGHT = 1920;
 const FPS = 30;
 
-// ============================================================
-// RESOLVE FFMPEG / FFPROBE
-// ============================================================
+const ffmpegStatic = require("ffmpeg-static");
+const ffprobeStatic = require("ffprobe-static");
 
 const FFMPEG_PATH =
   process.env.FFMPEG_PATH ||
@@ -45,9 +42,6 @@ const FFPROBE_PATH =
   process.env.FFPROBE_PATH ||
   ffprobeStatic?.path ||
   "ffprobe";
-
-console.log("🎬 [REEL] FFmpeg:", FFMPEG_PATH);
-console.log("🔍 [REEL] FFprobe:", FFPROBE_PATH);
 
 // ============================================================
 // HELPERS
@@ -106,21 +100,13 @@ async function fileExists(filePath) {
 }
 
 // ============================================================
-// TOOL DETECTION
+// FFmpeg DETECTION
 // ============================================================
 
 async function detectBinary(name, executable) {
-  if (!executable) {
-    return {
-      ok: false,
-      path: null,
-      reason: `${name} executable nahi mila`,
-    };
-  }
-
   try {
     await execFileAsync(executable, ["-version"], {
-      timeout: 10000,
+      timeout: 15000,
     });
 
     return {
@@ -132,22 +118,22 @@ async function detectBinary(name, executable) {
       ok: false,
       path: executable,
       reason:
-        err?.code === "ENOENT"
-          ? `${name} executable nahi mila`
-          : `${name} check failed: ${err?.message || "unknown error"}`,
+        err.code === "ENOENT"
+          ? `${name} install nahi hai`
+          : `${name} check failed: ${err.message}`,
     };
   }
 }
 
 // ============================================================
-// STEP 1 — PLAN
+// STEP 1 — AI PLAN
 // ============================================================
 
 function buildPlanPrompt(reelPrompt) {
   return (
-    "You are a short-form video director. Create a complete plan for a vertical 9:16 reel (Instagram/YouTube Shorts).\n\n" +
+    "You are a short-form video director. Create a complete plan for a vertical 9:16 reel for Instagram/YouTube Shorts.\n\n" +
     `USER REQUEST: ${reelPrompt}\n\n` +
-    "Return ONLY a JSON object with EXACTLY this shape (no markdown, no explanation):\n" +
+    "Return ONLY a JSON object with EXACTLY this shape:\n" +
     "{\n" +
     '  "topic": "string",\n' +
     '  "audience": "string",\n' +
@@ -157,10 +143,16 @@ function buildPlanPrompt(reelPrompt) {
     '  "hook": "first 2-3 seconds punch line",\n' +
     '  "cta": "call to action line",\n' +
     '  "scenes": [\n' +
-    '    { "text": "on-screen caption (max 60 chars)", "narration": "voiceover line (max 25 words)" }\n' +
+    '    { "text": "on-screen caption", "narration": "voiceover line" }\n' +
     "  ]\n" +
     "}\n\n" +
-    "Rules: 4 to 6 scenes. language must match user request style (default hinglish). Only valid JSON."
+    "Rules:\n" +
+    "- 4 to 6 scenes\n" +
+    "- Keep captions short\n" +
+    "- Keep narration natural\n" +
+    "- language should match user request style\n" +
+    "- default language is hinglish\n" +
+    "- ONLY valid JSON"
   );
 }
 
@@ -194,10 +186,21 @@ function validatePlan(plan) {
     )
   );
 
-  plan.topic = String(plan.topic || "AI Reel").slice(0, 120);
-  plan.language = String(plan.language || "hinglish").slice(0, 40);
-  plan.tone = String(plan.tone || "energetic").slice(0, 60);
-  plan.audience = String(plan.audience || "general").slice(0, 120);
+  plan.topic = String(
+    plan.topic || "AI Reel"
+  ).slice(0, 120);
+
+  plan.language = String(
+    plan.language || "hinglish"
+  ).slice(0, 40);
+
+  plan.tone = String(
+    plan.tone || "energetic"
+  ).slice(0, 60);
+
+  plan.audience = String(
+    plan.audience || "general"
+  ).slice(0, 120);
 
   plan.hook = String(
     plan.hook || plan.scenes[0].text
@@ -211,7 +214,9 @@ function validatePlan(plan) {
 }
 
 function buildLocalFallbackPlan(reelPrompt) {
-  const topic = String(reelPrompt || "AI Reel").slice(0, 120);
+  const topic = String(
+    reelPrompt || "AI Reel"
+  ).slice(0, 120);
 
   return {
     topic,
@@ -219,33 +224,38 @@ function buildLocalFallbackPlan(reelPrompt) {
     durationSeconds: 30,
     tone: "energetic",
     language: "hinglish",
-    hook: "Ruko! Ye 30 second tumhari life badal sakte hain",
-    cta: "Follow karo for more!",
+
+    hook:
+      "Ruko! Ye 30 second tumhari interview preparation improve kar sakte hain.",
+
+    cta:
+      "Follow karo for more interview tips!",
+
     scenes: [
       {
         text: topic,
         narration:
-          `${topic} — ye topic sabko confuse karta hai, but aaj clear ho jayega.`,
+          `${topic} — ye topic important hai, aur aaj ise simple way mein samjhenge.`,
       },
       {
         text: "Point 1: Basics clear karo",
         narration:
-          "Sabse pehle basics strong karo. Bina basics ke advanced kuch nahi hoga.",
+          "Sabse pehle basics strong karo. Strong foundation se confidence improve hota hai.",
       },
       {
         text: "Point 2: Practice daily",
         narration:
-          "Roz thoda practice karo. Consistency beats talent, har baar.",
+          "Roz thoda practice karo. Consistency se answers aur communication dono better hote hain.",
       },
       {
-        text: "Point 3: Real examples",
+        text: "Point 3: Real questions",
         narration:
-          "Real examples dekho, sirf theory nahi. Samajh tab aata hai jab apply karo.",
+          "Real interview questions practice karo, sirf theory padhne se preparation complete nahi hoti.",
       },
       {
         text: "Start aaj hi!",
         narration:
-          "Toh der mat karo, aaj se shuru karo. All the best!",
+          "Toh wait mat karo. Aaj se preparation start karo aur apna confidence build karo.",
       },
     ],
   };
@@ -254,7 +264,7 @@ function buildLocalFallbackPlan(reelPrompt) {
 async function stepPlan(reelPrompt, log) {
   const client = getAlexGeminiClient();
 
-  if (!client || !client.isAvailable()) {
+  if (!client.isAvailable()) {
     log.push(
       "⚠️ Gemini unavailable — local fallback plan use kar rahe hain"
     );
@@ -266,10 +276,6 @@ async function stepPlan(reelPrompt, log) {
   }
 
   const prompt = buildPlanPrompt(reelPrompt);
-
-  // ==========================================================
-  // GEMINI JSON ATTEMPTS
-  // ==========================================================
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     const res = await client.call(prompt, {
@@ -295,7 +301,7 @@ async function stepPlan(reelPrompt, log) {
       }
 
       log.push(
-        `⚠️ Attempt ${attempt}: Gemini text aaya but valid JSON plan nahi bana`
+        `⚠️ Attempt ${attempt}: Gemini response valid JSON plan nahi tha`
       );
     } else if (res.error) {
       log.push(
@@ -305,10 +311,6 @@ async function stepPlan(reelPrompt, log) {
 
     await sleep(1000 * attempt);
   }
-
-  // ==========================================================
-  // PLAIN TEXT FALLBACK
-  // ==========================================================
 
   const res2 = await client.call(
     prompt +
@@ -345,10 +347,6 @@ async function stepPlan(reelPrompt, log) {
     );
   }
 
-  // ==========================================================
-  // LOCAL FALLBACK
-  // ==========================================================
-
   log.push(
     "⚠️ Gemini se plan nahi bana — local fallback plan use kar rahe hain"
   );
@@ -375,7 +373,7 @@ async function stepVoice(plan, jobDir, log) {
 
   if (!apiKey) {
     log.push(
-      "ℹ️ ELEVENLABS_API_KEY nahi hai — voiceover skip, text-only reel banegi"
+      "ℹ️ ELEVENLABS_API_KEY nahi hai — text-only reel banegi"
     );
 
     return {
@@ -390,7 +388,7 @@ async function stepVoice(plan, jobDir, log) {
   for (let i = 0; i < plan.scenes.length; i++) {
     const narration =
       (i === 0 ? plan.hook + " " : "") +
-      String(plan.scenes[i].narration || "");
+      String(plan.scenes[i].narration || "").trim();
 
     const outPath = path.join(
       jobDir,
@@ -398,47 +396,58 @@ async function stepVoice(plan, jobDir, log) {
     );
 
     try {
-      const res = await fetch(
+      const response = await fetch(
         `${ELEVEN_URL}/${voiceId}`,
         {
           method: "POST",
+
           headers: {
             "xi-api-key": apiKey,
             "Content-Type": "application/json",
+            Accept: "audio/mpeg",
           },
+
           body: JSON.stringify({
             text: narration,
             model_id: "eleven_multilingual_v2",
+
             voice_settings: {
               stability: 0.5,
               similarity_boost: 0.75,
             },
           }),
+
           signal: AbortSignal.timeout(30000),
         }
       );
 
-      if (!res.ok) {
-        await res.text().catch(() => "");
+      if (!response.ok) {
+        const body = await response.text().catch(() => "");
 
         log.push(
-          `⚠️ ElevenLabs scene ${i + 1} HTTP ${res.status} — is scene ka audio skip`
+          `⚠️ ElevenLabs scene ${i + 1} HTTP ${response.status}` +
+            (body ? ` — ${body.slice(0, 300)}` : "")
         );
 
         continue;
       }
 
-      const buf = Buffer.from(await res.arrayBuffer());
+      const buffer = Buffer.from(
+        await response.arrayBuffer()
+      );
 
-      if (buf.length < 1000) {
+      if (buffer.length < 1000) {
         log.push(
-          `⚠️ ElevenLabs scene ${i + 1}: audio too small, skip`
+          `⚠️ ElevenLabs scene ${i + 1}: audio too small`
         );
 
         continue;
       }
 
-      await fs.promises.writeFile(outPath, buf);
+      await fs.promises.writeFile(
+        outPath,
+        buffer
+      );
 
       sceneAudios.push({
         index: i,
@@ -450,16 +459,14 @@ async function stepVoice(plan, jobDir, log) {
       );
     } catch (err) {
       log.push(
-        `⚠️ ElevenLabs scene ${i + 1} failed: ${
-          err?.message || "unknown error"
-        } — skip`
+        `⚠️ ElevenLabs scene ${i + 1} failed: ${err.message}`
       );
     }
   }
 
   if (sceneAudios.length === 0) {
     log.push(
-      "⚠️ Koi bhi voiceover nahi bana — text-only reel banegi"
+      "⚠️ Koi voiceover nahi bana — text-only reel banegi"
     );
 
     return {
@@ -477,10 +484,13 @@ async function stepVoice(plan, jobDir, log) {
 }
 
 // ============================================================
-// STEP 3+4 — VISUALS + SYNC
+// AUDIO DURATION
 // ============================================================
 
-async function getAudioDuration(ffprobe, filePath) {
+async function getAudioDuration(
+  ffprobe,
+  filePath
+) {
   try {
     const { stdout } = await execFileAsync(
       ffprobe,
@@ -498,15 +508,73 @@ async function getAudioDuration(ffprobe, filePath) {
       }
     );
 
-    const duration = parseFloat(stdout.trim());
+    const duration = parseFloat(
+      stdout.trim()
+    );
 
-    return Number.isFinite(duration) && duration > 0
+    return Number.isFinite(duration) &&
+      duration > 0
       ? duration
       : null;
   } catch {
     return null;
   }
 }
+
+// ============================================================
+// TEXT HELPERS
+// ============================================================
+
+function wrapCaption(text, maxChars = 22) {
+  const words = String(text || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const lines = [];
+
+  let current = "";
+
+  for (const word of words) {
+    const next =
+      current.length > 0
+        ? `${current} ${word}`
+        : word;
+
+    if (next.length > maxChars) {
+      if (current) {
+        lines.push(current);
+      }
+
+      current = word;
+    } else {
+      current = next;
+    }
+  }
+
+  if (current) {
+    lines.push(current);
+  }
+
+  return lines
+    .slice(0, 4)
+    .join("\n");
+}
+
+// ============================================================
+// FFmpeg DRAW TEXT ESCAPING
+// ============================================================
+
+function escapeDrawTextFile(filePath) {
+  return String(filePath)
+    .replace(/\\/g, "/")
+    .replace(/:/g, "\\:")
+    .replace(/'/g, "\\'");
+}
+
+// ============================================================
+// STEP 3 + 4 — VISUALS + SYNC
+// ============================================================
 
 async function stepVisualsSync(
   plan,
@@ -520,61 +588,55 @@ async function stepVisualsSync(
 
   const sceneDurations = [];
 
-  // ==========================================================
-  // DURATIONS
-  // ==========================================================
-
   if (voice.enabled) {
     for (let i = 0; i < sceneCount; i++) {
-      const audio = voice.sceneAudios.find(
-        (item) => item.index === i
-      );
-
-      if (audio) {
-        const duration = await getAudioDuration(
-          ffprobe,
-          audio.path
+      const audio =
+        voice.sceneAudios.find(
+          (item) => item.index === i
         );
 
+      if (audio) {
+        const duration =
+          await getAudioDuration(
+            ffprobe,
+            audio.path
+          );
+
         sceneDurations.push(
-          duration ? duration + 0.4 : 6
+          duration
+            ? duration + 0.4
+            : 6
         );
       } else {
         sceneDurations.push(6);
       }
     }
   } else {
-    const per = Math.max(
-      3,
-      plan.durationSeconds / sceneCount
-    );
+    const perScene =
+      Math.max(
+        3,
+        plan.durationSeconds / sceneCount
+      );
 
     for (let i = 0; i < sceneCount; i++) {
-      sceneDurations.push(per);
+      sceneDurations.push(perScene);
     }
   }
 
-  // ==========================================================
-  // BACKGROUNDS
-  // ==========================================================
-
   const gradients = [
-    "0x0f0c29:0x302b63",
-    "0x134e5e:0x71b280",
-    "0x41295a:0x2f0743",
-    "0x1a2980:0x26d0ce",
-    "0x360033:0x0b8793",
-    "0x16222a:0x3a6073",
+    ["0x0f0c29", "0x302b63"],
+    ["0x134e5e", "0x71b280"],
+    ["0x41295a", "0x2f0743"],
+    ["0x1a2980", "0x26d0ce"],
+    ["0x360033", "0x0b8793"],
+    ["0x16222a", "0x3a6073"],
   ];
 
   const clips = [];
 
-  // ==========================================================
-  // SCENE RENDER
-  // ==========================================================
-
   for (let i = 0; i < sceneCount; i++) {
-    const duration = Number(sceneDurations[i]).toFixed(2);
+    const duration =
+      Number(sceneDurations[i]).toFixed(2);
 
     const clipPath = path.join(
       jobDir,
@@ -587,67 +649,52 @@ async function stepVisualsSync(
     );
 
     // --------------------------------------------------------
-    // Caption wrapping
+    // Caption file
     // --------------------------------------------------------
 
-    const words = String(
-      plan.scenes[i].text || ""
-    )
-      .trim()
-      .split(/\s+/);
-
-    const lines = [];
-
-    let line = "";
-
-    for (const word of words) {
-      if (
-        (line + " " + word).trim().length > 22
-      ) {
-        if (line.trim()) {
-          lines.push(line.trim());
-        }
-
-        line = word;
-      } else {
-        line = (line + " " + word).trim();
-      }
-    }
-
-    if (line.trim()) {
-      lines.push(line.trim());
-    }
+    const caption = wrapCaption(
+      plan.scenes[i].text,
+      22
+    );
 
     await fs.promises.writeFile(
       txtFile,
-      lines.slice(0, 4).join("\n"),
+      caption,
       "utf8"
     );
 
     // --------------------------------------------------------
-    // Gradient
+    // IMPORTANT:
+    // Do NOT use `text=` together with `textfile=`.
+    // Only `textfile=` is used here.
     // --------------------------------------------------------
 
-    const grad =
-      gradients[i % gradients.length].split(":");
+    const safeTextFile =
+      escapeDrawTextFile(txtFile);
 
-    const fontSize = Math.floor(WIDTH / 12);
-
-    const escapedTxtFile = txtFile
-      .replace(/\\/g, "\\\\")
-      .replace(/'/g, "\\'");
+    const fontSize =
+      Math.floor(WIDTH / 12);
 
     const vf =
-      `drawtext=textfile='${escapedTxtFile}'` +
+      `drawtext=` +
+      `textfile='${safeTextFile}'` +
       `:fontcolor=white` +
       `:fontsize=${fontSize}` +
-      `:font='Arial'` +
       `:x=(w-text_w)/2` +
       `:y=(h-text_h)/2` +
       `:line_spacing=${Math.floor(fontSize / 4)}` +
       `:box=1` +
       `:boxcolor=black@0.35` +
       `:boxborderw=24`;
+
+    const gradient =
+      gradients[i % gradients.length];
+
+    const inputFilter =
+      `gradients=s=${WIDTH}x${HEIGHT}` +
+      `:c0=${gradient[0]}` +
+      `:c1=${gradient[1]}` +
+      `:d=${duration}`;
 
     const args = [
       "-y",
@@ -656,7 +703,7 @@ async function stepVisualsSync(
       "lavfi",
 
       "-i",
-      `gradients=s=${WIDTH}x${HEIGHT}:c0=${grad[0]}:c1=${grad[1]}:d=${duration}`,
+      inputFilter,
 
       "-vf",
       vf,
@@ -680,13 +727,18 @@ async function stepVisualsSync(
     ];
 
     try {
-      await execFileAsync(ffmpeg, args, {
-        timeout: 120000,
-      });
+      await execFileAsync(
+        ffmpeg,
+        args,
+        {
+          timeout: 120000,
+          maxBuffer: 10 * 1024 * 1024,
+        }
+      );
 
       if (!(await fileExists(clipPath))) {
         throw new Error(
-          "FFmpeg completed but scene file create nahi hui"
+          "Scene output file create nahi hua"
         );
       }
 
@@ -697,15 +749,13 @@ async function stepVisualsSync(
       );
     } catch (err) {
       throw new Error(
-        `Scene ${i + 1} render failed (FFmpeg): ${
-          err?.message || "unknown error"
-        }`
+        `Scene ${i + 1} render failed (FFmpeg): ${err.message}`
       );
     }
   }
 
   // ==========================================================
-  // CONCAT
+  // CONCATENATE SCENES
   // ==========================================================
 
   if (clips.length === 0) {
@@ -722,7 +772,9 @@ async function stepVisualsSync(
   const listContent = clips
     .map(
       (clip) =>
-        `file '${clip.replace(/\\/g, "/")}'`
+        `file '${clip
+          .replace(/\\/g, "/")
+          .replace(/'/g, "'\\''")}'`
     )
     .join("\n");
 
@@ -754,19 +806,18 @@ async function stepVisualsSync(
       ],
       {
         timeout: 120000,
+        maxBuffer: 10 * 1024 * 1024,
       }
     );
   } catch (err) {
     throw new Error(
-      `Scene concat failed: ${
-        err?.message || "unknown error"
-      }`
+      `Scene concatenation failed: ${err.message}`
     );
   }
 
   if (!(await fileExists(videoOnly))) {
     throw new Error(
-      "FFmpeg concat ke baad video_noaudio.mp4 nahi bani"
+      "video_noaudio.mp4 create nahi hua"
     );
   }
 
@@ -796,27 +847,23 @@ async function stepRender(
     "final.mp4"
   );
 
-  if (!(await fileExists(videoOnly))) {
-    throw new Error(
-      "Render start nahi ho sakta — video_noaudio.mp4 missing"
-    );
-  }
-
   if (voice.enabled) {
-    // --------------------------------------------------------
-    // Audio list
-    // --------------------------------------------------------
-
     const audioList = path.join(
       jobDir,
       "audio_list.txt"
     );
 
-    const content = voice.sceneAudios
-      .sort((a, b) => a.index - b.index)
+    const orderedAudio =
+      [...voice.sceneAudios].sort(
+        (a, b) => a.index - b.index
+      );
+
+    const content = orderedAudio
       .map(
         (audio) =>
-          `file '${audio.path.replace(/\\/g, "/")}'`
+          `file '${audio.path
+            .replace(/\\/g, "/")
+            .replace(/'/g, "'\\''")}'`
       )
       .join("\n");
 
@@ -830,10 +877,6 @@ async function stepRender(
       jobDir,
       "narration.mp3"
     );
-
-    // --------------------------------------------------------
-    // Concatenate narration
-    // --------------------------------------------------------
 
     try {
       await execFileAsync(
@@ -852,19 +895,21 @@ async function stepRender(
         ],
         {
           timeout: 60000,
+          maxBuffer: 10 * 1024 * 1024,
         }
       );
     } catch (err) {
-      throw new Error(
-        `Voiceover concat failed: ${
-          err?.message || "unknown error"
-        }`
+      log.push(
+        `⚠️ Voice concat failed — silent reel fallback: ${err.message}`
+      );
+
+      return renderSilentVideo(
+        videoOnly,
+        finalPath,
+        ffmpeg,
+        log
       );
     }
-
-    // --------------------------------------------------------
-    // Mux
-    // --------------------------------------------------------
 
     try {
       await execFileAsync(
@@ -884,6 +929,9 @@ async function stepRender(
           "-preset",
           "veryfast",
 
+          "-pix_fmt",
+          "yuv420p",
+
           "-c:a",
           "aac",
 
@@ -899,75 +947,101 @@ async function stepRender(
         ],
         {
           timeout: 300000,
+          maxBuffer: 10 * 1024 * 1024,
         }
       );
-    } catch (err) {
-      throw new Error(
-        `Final video + voice mux failed: ${
-          err?.message || "unknown error"
-        }`
+
+      log.push(
+        "🔊 Voiceover mixed into final video"
       );
-    }
+    } catch (err) {
+      log.push(
+        `⚠️ Voice mix failed — silent reel fallback: ${err.message}`
+      );
 
-    log.push(
-      "🔊 Voiceover mixed into final video"
-    );
-  } else {
-    // --------------------------------------------------------
-    // Silent audio track
-    // --------------------------------------------------------
-
-    try {
-      await execFileAsync(
+      return renderSilentVideo(
+        videoOnly,
+        finalPath,
         ffmpeg,
-        [
-          "-y",
-
-          "-i",
-          videoOnly,
-
-          "-f",
-          "lavfi",
-
-          "-i",
-          "anullsrc=channel_layout=stereo:sample_rate=44100",
-
-          "-c:v",
-          "libx264",
-
-          "-preset",
-          "veryfast",
-
-          "-c:a",
-          "aac",
-
-          "-shortest",
-
-          "-movflags",
-          "+faststart",
-
-          finalPath,
-        ],
-        {
-          timeout: 300000,
-        }
-      );
-    } catch (err) {
-      throw new Error(
-        `Silent audio render failed: ${
-          err?.message || "unknown error"
-        }`
+        log
       );
     }
-
-    log.push(
-      "🔇 No voiceover — silent audio track added"
+  } else {
+    return renderSilentVideo(
+      videoOnly,
+      finalPath,
+      ffmpeg,
+      log
     );
   }
 
   if (!(await fileExists(finalPath))) {
     throw new Error(
-      "FFmpeg render complete hua lekin final.mp4 create nahi hui"
+      "Final MP4 create nahi hua"
+    );
+  }
+
+  return {
+    finalPath,
+  };
+}
+
+// ============================================================
+// SILENT AUDIO FALLBACK
+// ============================================================
+
+async function renderSilentVideo(
+  videoOnly,
+  finalPath,
+  ffmpeg,
+  log
+) {
+  await execFileAsync(
+    ffmpeg,
+    [
+      "-y",
+
+      "-i",
+      videoOnly,
+
+      "-f",
+      "lavfi",
+
+      "-i",
+      "anullsrc=channel_layout=stereo:sample_rate=44100",
+
+      "-c:v",
+      "libx264",
+
+      "-preset",
+      "veryfast",
+
+      "-pix_fmt",
+      "yuv420p",
+
+      "-c:a",
+      "aac",
+
+      "-shortest",
+
+      "-movflags",
+      "+faststart",
+
+      finalPath,
+    ],
+    {
+      timeout: 300000,
+      maxBuffer: 10 * 1024 * 1024,
+    }
+  );
+
+  log.push(
+    "🔇 Silent audio track added"
+  );
+
+  if (!(await fileExists(finalPath))) {
+    throw new Error(
+      "Silent final.mp4 create nahi hua"
     );
   }
 
@@ -993,58 +1067,49 @@ async function verifyFinalVideo(
     };
   }
 
-  let stat;
-
-  try {
-    stat = await fs.promises.stat(
-      finalPath
-    );
-  } catch (err) {
-    return {
-      ok: false,
-      reason:
-        `final.mp4 stat failed: ${
-          err?.message || "unknown error"
-        }`,
-    };
-  }
+  const stat =
+    await fs.promises.stat(finalPath);
 
   if (stat.size < 10000) {
     return {
       ok: false,
       reason:
-        `final.mp4 too small (${stat.size} bytes) — corrupted render`,
+        `final.mp4 too small (${stat.size} bytes)`,
     };
   }
 
   try {
-    const { stdout } = await execFileAsync(
-      ffprobe,
-      [
-        "-v",
-        "error",
+    const { stdout } =
+      await execFileAsync(
+        ffprobe,
+        [
+          "-v",
+          "error",
 
-        "-select_streams",
-        "v:0",
+          "-show_entries",
+          "stream=index,codec_type,width,height,duration",
 
-        "-show_entries",
-        "stream=width,height,duration",
+          "-of",
+          "json",
 
-        "-of",
-        "json",
+          finalPath,
+        ],
+        {
+          timeout: 15000,
+          maxBuffer: 5 * 1024 * 1024,
+        }
+      );
 
-        finalPath,
-      ],
-      {
-        timeout: 15000,
-      }
-    );
+    const info =
+      JSON.parse(stdout);
 
-    const info = JSON.parse(stdout);
+    const videoStream =
+      info?.streams?.find(
+        (stream) =>
+          stream.codec_type === "video"
+      );
 
-    const stream = info?.streams?.[0];
-
-    if (!stream) {
+    if (!videoStream) {
       return {
         ok: false,
         reason:
@@ -1052,9 +1117,14 @@ async function verifyFinalVideo(
       };
     }
 
-    const width = Number(stream.width);
-    const height = Number(stream.height);
-    const duration = Number(stream.duration);
+    const width =
+      Number(videoStream.width);
+
+    const height =
+      Number(videoStream.height);
+
+    const duration =
+      Number(videoStream.duration);
 
     if (
       width !== WIDTH ||
@@ -1063,7 +1133,7 @@ async function verifyFinalVideo(
       return {
         ok: false,
         reason:
-          `Video resolution ${width}x${height} hai, expected ${WIDTH}x${HEIGHT}`,
+          `Wrong resolution: ${width}x${height}. Expected ${WIDTH}x${HEIGHT}`,
       };
     }
 
@@ -1079,11 +1149,7 @@ async function verifyFinalVideo(
     }
 
     log.push(
-      `🔍 Verified: ${width}x${height}, ${Math.round(
-        duration
-      )}s, ${(stat.size / 1024 / 1024).toFixed(
-        2
-      )} MB`
+      `🔍 Verified: ${width}x${height}, ${Math.round(duration)}s, ${(stat.size / 1024 / 1024).toFixed(2)} MB`
     );
 
     return {
@@ -1097,9 +1163,7 @@ async function verifyFinalVideo(
     return {
       ok: false,
       reason:
-        `ffprobe verification failed: ${
-          err?.message || "unknown error"
-        }`,
+        `ffprobe verification failed: ${err.message}`,
     };
   }
 }
@@ -1116,21 +1180,21 @@ async function stepMetadata(
   downloadBase,
   log
 ) {
-  const topicWords = plan.topic
-    .toLowerCase()
-    .split(/\s+/)
-    .filter(
-      (word) => word.length > 3
-    )
-    .slice(0, 3);
-
   const hashtags = [
     "#reels",
     "#shorts",
     "#viral",
-    ...topicWords.map(
-      (word) => `#${word.replace(/[^a-z0-9]/g, "")}`
-    ),
+
+    ...plan.topic
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(
+        (word) => word.length > 3
+      )
+      .slice(0, 3)
+      .map(
+        (word) => `#${word.replace(/[^a-z0-9]/g, "")}`
+      ),
   ];
 
   const metadata = {
@@ -1154,9 +1218,7 @@ async function stepMetadata(
       plan.durationSeconds,
 
     resolution:
-      `${verify.width || WIDTH}x${
-        verify.height || HEIGHT
-      }`,
+      `${verify.width || WIDTH}x${verify.height || HEIGHT}`,
 
     sizeBytes:
       verify.sizeBytes,
@@ -1175,7 +1237,10 @@ async function stepMetadata(
   };
 
   await fs.promises.writeFile(
-    path.join(jobDir, "metadata.json"),
+    path.join(
+      jobDir,
+      "metadata.json"
+    ),
     JSON.stringify(
       metadata,
       null,
@@ -1192,7 +1257,7 @@ async function stepMetadata(
 }
 
 // ============================================================
-// MAIN ENTRY
+// MAIN GENERATOR
 // ============================================================
 
 async function generate(reelPrompt) {
@@ -1204,14 +1269,14 @@ async function generate(reelPrompt) {
   if (!prompt) {
     return {
       success: false,
+
       error:
         "Reel prompt khali hai — batao reel kis topic par chahiye.",
-      log,
     };
   }
 
   // ==========================================================
-  // TOOL DETECTION
+  // BINARY CHECK
   // ==========================================================
 
   const ffmpegCheck =
@@ -1225,6 +1290,26 @@ async function generate(reelPrompt) {
       "FFprobe",
       FFPROBE_PATH
     );
+
+  if (!ffmpegCheck.ok) {
+    log.push(
+      `❌ FFmpeg: ${ffmpegCheck.reason}`
+    );
+  } else {
+    log.push(
+      "✅ FFmpeg available"
+    );
+  }
+
+  if (!ffprobeCheck.ok) {
+    log.push(
+      `❌ FFprobe: ${ffprobeCheck.reason}`
+    );
+  } else {
+    log.push(
+      "✅ FFprobe available"
+    );
+  }
 
   if (
     !ffmpegCheck.ok ||
@@ -1242,25 +1327,15 @@ async function generate(reelPrompt) {
       .filter(Boolean)
       .join(" and ");
 
-    log.push(
-      `❌ ${missing}`
-    );
-
     return {
       success: false,
+
       error:
         `Reel generate nahi ho sakti — ${missing}`,
+
       log,
     };
   }
-
-  log.push(
-    "✅ FFmpeg available"
-  );
-
-  log.push(
-    "✅ FFprobe available"
-  );
 
   // ==========================================================
   // JOB DIRECTORY
@@ -1288,7 +1363,7 @@ async function generate(reelPrompt) {
     );
 
     // ========================================================
-    // STEP 1 — PLAN
+    // PLAN
     // ========================================================
 
     const {
@@ -1300,25 +1375,12 @@ async function generate(reelPrompt) {
         log
       );
 
-    if (
-      !plan ||
-      !validatePlan(plan)
-    ) {
-      return {
-        success: false,
-        error:
-          "Valid reel plan generate nahi hua.",
-        jobId,
-        log,
-      };
-    }
-
     log.push(
       `📋 Plan: "${plan.topic}" — ${plan.scenes.length} scenes (${source})`
     );
 
     // ========================================================
-    // STEP 2 — VOICE
+    // VOICE
     // ========================================================
 
     const voice =
@@ -1329,7 +1391,7 @@ async function generate(reelPrompt) {
       );
 
     // ========================================================
-    // STEP 3+4 — VISUALS + SYNC
+    // VISUALS
     // ========================================================
 
     const {
@@ -1345,7 +1407,7 @@ async function generate(reelPrompt) {
       );
 
     // ========================================================
-    // STEP 5 — RENDER
+    // FINAL RENDER
     // ========================================================
 
     const {
@@ -1360,7 +1422,7 @@ async function generate(reelPrompt) {
       );
 
     // ========================================================
-    // STEP 6 — VERIFY
+    // VERIFY
     // ========================================================
 
     const verify =
@@ -1377,15 +1439,18 @@ async function generate(reelPrompt) {
 
       return {
         success: false,
+
         error:
           `Reel render hui but verification fail — ${verify.reason}`,
+
         jobId,
+
         log,
       };
     }
 
     // ========================================================
-    // STEP 7 — METADATA
+    // METADATA
     // ========================================================
 
     const backendUrl =
@@ -1406,31 +1471,12 @@ async function generate(reelPrompt) {
       );
 
     // ========================================================
-    // FINAL SAFETY CHECK
+    // SUCCESS
     // ========================================================
-
-    const finalExists =
-      await fileExists(
-        finalPath
-      );
-
-    if (!finalExists) {
-      return {
-        success: false,
-        error:
-          "Final safety check failed — final.mp4 missing.",
-        jobId,
-        log,
-      };
-    }
 
     log.push(
       "✅ Reel pipeline completed and verified"
     );
-
-    // ========================================================
-    // REAL SUCCESS
-    // ========================================================
 
     return {
       success: true,
@@ -1461,35 +1507,18 @@ async function generate(reelPrompt) {
       hadVoiceover:
         voice.enabled,
 
-      videoPath:
-        finalPath,
-
-      metadataPath:
-        path.join(
-          jobDir,
-          "metadata.json"
-        ),
-
       log,
     };
   } catch (err) {
-    // ========================================================
-    // REAL FAILURE
-    // ========================================================
-
-    const reason =
-      err?.message ||
-      "Unknown reel pipeline error";
-
     log.push(
-      `❌ Pipeline error: ${reason}`
+      `❌ Pipeline error: ${err.message}`
     );
 
     return {
       success: false,
 
       error:
-        `Reel generation fail hui — ${reason}`,
+        `Reel generation fail hui — ${err.message}`,
 
       jobId,
 
@@ -1511,16 +1540,20 @@ function getReelGenerator() {
     };
 
     console.log(
-      "🎬 [ALEX] ReelGenerator v2.1 ready"
+      "🎬 [ALEX] ReelGenerator v2.2 ready"
+    );
+
+    console.log(
+      `🎬 [REEL] FFmpeg: ${FFMPEG_PATH}`
+    );
+
+    console.log(
+      `🎬 [REEL] FFprobe: ${FFPROBE_PATH}`
     );
   }
 
   return instance;
 }
-
-// ============================================================
-// EXPORTS
-// ============================================================
 
 module.exports = {
   ReelGenerator: {
