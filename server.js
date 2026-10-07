@@ -2,6 +2,9 @@
 // AI INTERVIEW BACKEND — PRODUCTION SERVER
 // WITH ALEX MULTI-AGENT SYSTEM + OWNER CHAT
 // FIXED: shared Gemini key pool + startup diagnostics + build id ✅
+// FIXED v2.1: duplicate questionBankRoutes mount removed ✅
+//             CORS tightened (no wildcard *.vercel.app) ✅
+//             DB connect retry logic added ✅
 // ============================================================
 
 require("dotenv").config();
@@ -61,6 +64,11 @@ const practiceRoutes = require("./routes/practice");
 const resumeRoutes = require("./routes/resume");
 const adminRoutes = require("./routes/admin");
 const questionBankRoutes = require("./routes/questionBankRoutes");
+const {
+  createAgentAssistantRouter,
+} = require("./alex/AgentAssistantRoutes");
+
+const { ownerAuth } = require("./middleware/ownerAuth");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -69,15 +77,26 @@ app.set("trust proxy", 1);
 // MIDDLEWARE
 // =======================
 
+// CORS — explicit origins only. Regexes limited to your own infra.
+const ALLOWED_ORIGINS = new Set([
+  'https://ai-mock-interview-frontend-alpha.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:4173',
+  'http://localhost:3000',
+]);
+
 app.use(cors({
-  origin: [
-    'https://ai-mock-interview-frontend-alpha.vercel.app',
-    'http://localhost:5173',
-    'http://localhost:4173',
-    'http://localhost:3000',
-    /\.railway\.app$/,
-    /\.vercel\.app$/,
-  ],
+  origin: (origin, callback) => {
+    // Allow same-origin/no-origin (curl, mobile apps, health checks)
+    if (!origin || ALLOWED_ORIGINS.has(origin)) return callback(null, true);
+    // Your own Railway deployments only (NOT all of vercel.app)
+    if (/\.railway\.app$/.test(origin)) return callback(null, true);
+    // Your specific vercel projects only — add more as needed:
+    if (/^https:\/\/ai-mock-interview-frontend(-[a-z0-9-]+)?\.vercel\.app$/.test(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error("Not allowed by CORS"));
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-admin-key'],
@@ -144,7 +163,8 @@ app.use("/api/image-editor", imageEditorRoutes);
 app.use("/api/question-banks", questionBankRoutes);
 app.use("/api/ppt", pptRoutes);
 app.get("/api/ai-status", (req, res) => res.json(keyManager.stats()));
-app.use("/api/question-banks", questionBankRoutes);
+// NOTE: duplicate "/api/question-banks" mount REMOVED — it ran every
+// questionBankRoutes middleware twice per request.
 app.use("/api/bank-status", questionBankRoutes);
 
 // ============================================================
@@ -154,6 +174,28 @@ const alexChatRoutes = require("./routes/alexChat");
 app.use("/api/alex", alexChatRoutes);
 console.log("💬 ALEX Chat routes ready at POST /api/alex/chat");
 
+// ============================================================
+// 🤖 ALEX AGENT ASSISTANT — UNIFIED AGENT API
+// ============================================================
+
+try {
+  const alexAssistantRouter = createAgentAssistantRouter();
+
+  app.use(
+    "/api/alex/assistant",
+    ownerAuth,
+    alexAssistantRouter
+  );
+
+  console.log(
+    "🧠 ALEX Agent Assistant ready at /api/alex/assistant"
+  );
+} catch (err) {
+  console.error(
+    "⚠️ ALEX Agent Assistant setup failed:",
+    err.message
+  );
+}
 // =======================
 // 🚀 ALEX DASHBOARD ROUTES — Mounted AFTER chat routes
 // =======================
@@ -201,6 +243,13 @@ app.use("/api/owner", (req, res, next) => {
   }
 });
 
+
+// =======================
+// 🎬 GENERATED REELS — STATIC FILES
+// =======================
+
+app.use("/reels", express.static(path.join(__dirname, "reels")));
+
 // =======================
 // HOME
 // =======================
@@ -209,7 +258,7 @@ app.get("/", (req, res) => {
   res.json({
     success: true,
     message: "AI Interview Backend Running",
-    version: "2.0",
+    version: "2.1",
     build: APP_BUILD,
     voiceRoutes: true,
     alexSystem: true,
@@ -264,6 +313,10 @@ app.use((req, res) => {
 // =======================
 
 app.use((err, req, res, next) => {
+  // CORS rejections arrive here as errors — handle cleanly
+  if (err && err.message === "Not allowed by CORS") {
+    return res.status(403).json({ success: false, message: "Origin not allowed" });
+  }
   console.error('❌ Server error:', err.message);
   res.status(500).json({
     success: false,
@@ -286,24 +339,47 @@ app.listen(PORT, () => {
 });
 
 // =======================
-// BACKGROUND INIT
+// BACKGROUND INIT — with DB connect retry
 // =======================
 
 (async () => {
-  try {
-    await connectDB();
-    startBankRefreshCron();
+  // DB connect with retry — transient network glitches on Render/Railway
+  // should not leave the server permanently disconnected.
+  const MAX_DB_RETRIES = 5;
+  let connected = false;
+  for (let attempt = 1; attempt <= MAX_DB_RETRIES; attempt++) {
     try {
-      const { initAlex } = require("./alex/index");
-      await initAlex();
-      console.log("🤖 ALEX is now running — monitoring all systems");
-    } catch (alexErr) {
-      console.error("⚠️ ALEX init warning (server continues):", alexErr.message);
+      await connectDB();
+      connected = true;
+      break;
+    } catch (err) {
+      console.error(`⚠️ DB connect attempt ${attempt}/${MAX_DB_RETRIES} failed: ${err.message}`);
+      if (attempt < MAX_DB_RETRIES) await new Promise(r => setTimeout(r, 5000 * attempt));
     }
+  }
+  if (!connected) {
+    console.error("❌ DB connect failed after retries — server running WITHOUT database. Routes needing DB will fail until restart.");
+  }
+
+  try {
+    startBankRefreshCron();
+  } catch (err) {
+    console.error("⚠️ Cron setup warning:", err.message);
+  }
+
+  try {
+    const { initAlex } = require("./alex/index");
+    await initAlex();
+    console.log("🤖 ALEX is now running — monitoring all systems");
+  } catch (alexErr) {
+    console.error("⚠️ ALEX init warning (server continues):", alexErr.message);
+  }
+
+  try {
     const filePath = path.join(__dirname, "uploads", "questions.json");
     await bulkUploader(filePath);
     console.log("Upload Completed");
-  } catch (error) {
-    console.error("⚠️ Background setup issue:", error.message);
+  } catch (err) {
+    console.error("⚠️ Bulk upload warning:", err.message);
   }
 })();
