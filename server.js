@@ -64,9 +64,6 @@ const practiceRoutes = require("./routes/practice");
 const resumeRoutes = require("./routes/resume");
 const adminRoutes = require("./routes/admin");
 const questionBankRoutes = require("./routes/questionBankRoutes");
-const {
-  createAgentAssistantRouter,
-} = require("./alex/AgentAssistantRoutes");
 
 const { ownerAuth } = require("./middleware/ownerAuth");
 
@@ -177,8 +174,16 @@ console.log("💬 ALEX Chat routes ready at POST /api/alex/chat");
 // ============================================================
 // 🤖 ALEX AGENT ASSISTANT — UNIFIED AGENT API
 // ============================================================
+// OPTIONAL MODULE:
+// AgentAssistantRoutes.js agar available ho to load hoga.
+// File missing hone par normal ALEX chat/server crash nahi karega.
+// ============================================================
 
 try {
+  const {
+    createAgentAssistantRouter,
+  } = require("./alex/AgentAssistantRoutes");
+
   const alexAssistantRouter = createAgentAssistantRouter();
 
   app.use(
@@ -192,8 +197,11 @@ try {
   );
 } catch (err) {
   console.error(
-    "⚠️ ALEX Agent Assistant setup failed:",
+    "⚠️ ALEX Agent Assistant unavailable:",
     err.message
+  );
+  console.log(
+    "ℹ️ Normal ALEX Chat will continue at /api/alex/chat"
   );
 }
 // =======================
