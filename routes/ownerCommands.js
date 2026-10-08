@@ -5,11 +5,14 @@
 
 const express = require("express");
 const { ownerAuth } = require("../middleware/ownerAuth");
-const { getOwnerCommandHandler } = require("../alex/OwnerCommandHandler");
+const {
+  getOwnerCommandHandler,
+} = require("../alex/OwnerCommandHandler");
 const { getIncidentManager } = require("../alex/IncidentManager");
 const { getAuditLogger } = require("../alex/AuditLogger");
 const { getAlexController } = require("../alex/AlexController");
 const { CommandAllowlist } = require("../alex/CommandAllowlist");
+const { getReelGenerator } = require("../alex/ReelGenerator");
 
 async function createOwnerRouter() {
   const router = express.Router();
@@ -227,6 +230,38 @@ async function createOwnerRouter() {
     } catch (err) {
       console.error("❌ Owner fix-loop error:", err.message);
       return res.status(500).json({ success: false, message: "Fix-loop processing failed." });
+    }
+  });
+
+  // ============================================
+  // POST /api/owner/reel/generate
+  // ============================================
+  router.post("/reel/generate", async (req, res) => {
+    try {
+      const { prompt } = req.body;
+
+      if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
+        return res.status(400).json({
+          success: false,
+          message: "Reel prompt is required."
+        });
+      }
+
+      const reelGenerator = getReelGenerator();
+      const result = await reelGenerator.generate(prompt.trim());
+
+      return res.json({
+        success: true,
+        data: result
+      });
+    } catch (err) {
+      console.error("❌ Reel generation error:", err.message);
+
+      return res.status(500).json({
+        success: false,
+        message: "Reel generation failed.",
+        error: err.message
+      });
     }
   });
 

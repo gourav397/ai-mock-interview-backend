@@ -11,6 +11,16 @@ const config = {
   systemName: "ALEX",
   version: "1.0.0",
 
+  // ============================================
+  // 🌐 SERVER CONFIGURATION
+  // ============================================
+  server: {
+    backendUrl:
+      process.env.BACKEND_URL ||
+      process.env.RENDER_EXTERNAL_URL ||
+      `http://localhost:${process.env.PORT || 5000}`,
+  },
+
   agents: {
     security: { enabled: true },
     employee: { enabled: true },

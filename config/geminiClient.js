@@ -1,265 +1,596 @@
 // ============================================================
-// geminiClient.js — Gemini REST client with:
-//  - NEW-FORMAT keys (AQ.Ab8...) sent via x-goog-api-key HEADER
-//  - Old-format keys (AIza...) still work (also via header)
-//  - Key rotation (keyManager, object-or-string keys)
-//  - MODEL fallback on 404 / 503 — keys NOT killed
-//  - 400("API key not valid") / 401 / 403 → key invalid
-//
-// FIXES (is version mein):
-//  - maxOutputTokens ab 16384 (env: GEMINI_MAX_OUTPUT_TOKENS) — bilingual
-//    JSON batches truncate nahi hote
-//  - Success par working model PIN hota hai — har call galat model se
-//    shuru nahi hoti
-//  - 400 "model not found" ab MODEL fallback (key invalid NAHI)
-//  - 429 par daily-quota sniff (perDay) → key aaj ke liye off, warna cooldown
-//  - reportSuccess/reportFailure ab geminiKeys ke adapter methods use karte
-//    hain (call counts + cooldowns ab sach mein kaam karte hain)
+// ALEX Gemini Client — Production
+// Uses centralized geminiKeys.js for key rotation/state
 // ============================================================
 
-require("dotenv").config();
+const {
+  keyManager,
+  envStatus,
+} = require("./geminiKeys");
 
-const { keyManager } = require("./geminiKeys");
+class AlexGeminiClient {
+  constructor() {
+    this.model =
+      process.env.ALEX_GEMINI_MODEL ||
+      process.env.GEMINI_MODEL ||
+      "gemini-3.5-flash";
 
-const MODEL_CHAIN = [
-  process.env.GEMINI_MODEL || "gemini-3.6-flash",
-  "gemini-3.5-flash",
-  "gemini-flash-latest",
-].filter((m, i, a) => a.indexOf(m) === i);
+    this.available = envStatus.count > 0;
 
-const MAX_OUTPUT_TOKENS = (() => {
-  const t = parseInt(process.env.GEMINI_MAX_OUTPUT_TOKENS || "16384", 10);
-  return Number.isFinite(t) && t > 0 ? Math.min(t, 65536) : 16384;
-})();
-
-let currentModelIndex = 0;
-
-function currentModel() {
-  return MODEL_CHAIN[currentModelIndex];
-}
-
-function nextModel() {
-  currentModelIndex = (currentModelIndex + 1) % MODEL_CHAIN.length;
-  console.log(`🔄 [GEMINI] Switching model → ${currentModel()}`);
-  return currentModel();
-}
-
-function pinModel(model) {
-  const idx = MODEL_CHAIN.indexOf(model);
-  if (idx !== -1) currentModelIndex = idx;
-}
-
-// keyManager keys object ho sakte hain — raw key string nikaalo
-function rawKey(k) {
-  if (!k) return null;
-  if (typeof k === "string") return k.trim();
-  return String(k.key || k.apiKey || k.value || k.api_key || "").trim() || null;
-}
-
-function keyIndex(k) {
-  try {
-    const rk = rawKey(k);
-    const idx = (keyManager.keys || []).findIndex((x) => rawKey(x) === rk);
-    return idx === -1 ? "?" : idx + 1;
-  } catch {
-    return "?";
+    console.log(
+      `🤖 [ALEX] Gemini client ready — model: ${this.model} | keys: ${envStatus.count}`
+    );
   }
-}
 
-function sanitizeTimeout(t) {
-  if (typeof t === "number" && isFinite(t) && t > 0) return t;
-  if (t && typeof t === "object" && isFinite(Number(t.timeoutMs))) return Number(t.timeoutMs);
-  return 30000;
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function extractJSON(text) {
-  if (!text) return null;
-  let t = String(text).trim();
-  t = t.replace(/^```(?:json)?\s*/i, "").replace(/```$/, "").trim();
-  try {
-    return JSON.parse(t);
-  } catch (_) {}
-  const start = t.search(/[\[{]/);
-  if (start === -1) return null;
-  const open = t[start];
-  const close = open === "[" ? "]" : "}";
-  const end = t.lastIndexOf(close);
-  if (end <= start) return null;
-  const slice = t.slice(start, end + 1);
-  try {
-    return JSON.parse(slice);
-  } catch (_) {}
-  try {
-    const { jsonrepair } = require("jsonrepair");
-    return JSON.parse(jsonrepair(slice));
-  } catch (_) {
-    return null;
+  isAvailable() {
+    return this.available && keyManager.usableCount() > 0;
   }
-}
 
-async function callWithKey(keyObj, prompt, model, timeoutMs) {
-  const key = rawKey(keyObj);
-  if (!key) throw Object.assign(new Error("Empty API key"), { status: 400 });
+  async _sleep(ms) {
+    if (!ms || ms <= 0) return;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          // NAYI format keys (AQ.Ab8...) ke liye HEADER auth zaroori hai — AUTH UNCHANGED
-          "x-goog-api-key": key,
-        },
-        signal: controller.signal,
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.85,
-            maxOutputTokens: MAX_OUTPUT_TOKENS,
-            responseMimeType: "application/json",
-          },
-        }),
+    await new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  _getRetryDelay(attempt, response = null) {
+    // Respect Gemini/server Retry-After if available
+    try {
+      const retryAfter =
+        response?.headers?.get?.("retry-after");
+
+      if (retryAfter) {
+        const seconds = Number(retryAfter);
+
+        if (Number.isFinite(seconds) && seconds > 0) {
+          return Math.min(seconds * 1000, 15000);
+        }
       }
+    } catch {
+      // Ignore header parsing errors
+    }
+
+    // Exponential backoff:
+    // attempt 0 -> 1000ms
+    // attempt 1 -> 2000ms
+    // attempt 2 -> 4000ms
+    // attempt 3 -> 8000ms
+    // attempt 4 -> 10000ms max
+
+    const base = Math.min(
+      1000 * Math.pow(2, attempt),
+      10000
     );
 
-    const bodyText = await res.text();
+    // Small jitter prevents synchronized retries
+    const jitter = Math.floor(Math.random() * 500);
 
-    if (!res.ok) {
-      const err = new Error(`Gemini HTTP ${res.status}: ${bodyText.slice(0, 300)}`);
-      err.status = res.status;
-      err.body = bodyText;
-      throw err;
+    return base + jitter;
+  }
+
+  async call(prompt, options = {}) {
+    if (!this.available || envStatus.count === 0) {
+      return {
+        error: true,
+        message: "No Gemini API keys configured",
+        aiUnavailable: true,
+      };
     }
 
-    let data;
-    try {
-      data = JSON.parse(bodyText);
-    } catch (_) {
-      throw new Error("Gemini: invalid JSON response body");
+    const chatMode = options.chatMode === true;
+
+    const temperature =
+      typeof options.temperature === "number"
+        ? options.temperature
+        : chatMode
+          ? 0.8
+          : 0.3;
+
+    const timeoutMs =
+      typeof options.timeoutMs === "number"
+        ? options.timeoutMs
+        : chatMode
+          ? 15000
+          : 60000;
+
+    const maxOutputTokens =
+      typeof options.maxOutputTokens === "number"
+        ? options.maxOutputTokens
+        : chatMode
+          ? 2000
+          : 4096;
+
+    const maxRetries =
+      typeof options.retries === "number"
+        ? Math.max(1, options.retries)
+        : chatMode
+          ? 3
+          : Math.min(
+              5,
+              Math.max(3, keyManager.count)
+            );
+
+    const responseMimeType =
+      options.responseMimeType ||
+      (chatMode
+        ? "text/plain"
+        : "application/json");
+
+    const model =
+      options.model || this.model;
+
+    const safePrompt = String(prompt || "");
+
+    if (!safePrompt.trim()) {
+      return {
+        error: true,
+        message: "Gemini prompt is empty",
+      };
     }
 
-    const parts = data?.candidates?.[0]?.content?.parts;
-    const text = Array.isArray(parts)
-      ? parts.map((p) => p.text || "").join("")
-      : "";
+    const truncatedPrompt =
+      safePrompt.length > 12000
+        ? safePrompt.slice(0, 12000) +
+          "\n...[truncated]"
+        : safePrompt;
 
-    if (!text) {
-      const finishReason = data?.candidates?.[0]?.finishReason || "UNKNOWN";
-      const err = new Error(`Gemini: empty response (finishReason=${finishReason})`);
-      err.status = 0;
-      err.finishReason = finishReason;
-      throw err;
+    let lastError = null;
+
+    for (
+      let attempt = 0;
+      attempt < maxRetries;
+      attempt++
+    ) {
+      const keyObj = keyManager.nextKey();
+
+      if (!keyObj) {
+        const waitMs =
+          keyManager.minWaitMs();
+
+        if (
+          waitMs !== null &&
+          waitMs > 0 &&
+          waitMs < 15000
+        ) {
+          console.log(
+            `⏳ [ALEX] Waiting ${waitMs}ms for an available Gemini key`
+          );
+
+          await this._sleep(waitMs);
+
+          continue;
+        }
+
+        return {
+          error: true,
+          message:
+            "All Gemini API keys are temporarily unavailable",
+          aiUnavailable: true,
+        };
+      }
+
+      const controller =
+        new AbortController();
+
+      const timer = setTimeout(() => {
+        controller.abort();
+      }, timeoutMs);
+
+      try {
+        // ----------------------------------------------------
+        // CORRECT GEMINI URL
+        // ----------------------------------------------------
+
+        const url =
+          `https://generativelanguage.googleapis.com/v1beta/models/` +
+          `${encodeURIComponent(model)}:generateContent`;
+
+        const body = {
+          contents: [
+            {
+              parts: [
+                {
+                  text: truncatedPrompt,
+                },
+              ],
+            },
+          ],
+
+          generationConfig: {
+            temperature,
+            topP: 0.95,
+            maxOutputTokens,
+            responseMimeType,
+          },
+        };
+
+        console.log(
+          `🤖 [ALEX] Gemini request — attempt ${attempt + 1}/${maxRetries} | model: ${model} | key #${keyObj.index + 1}`
+        );
+
+        const res = await fetch(url, {
+          method: "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json",
+            "x-goog-api-key": keyObj.key,
+          },
+
+          body: JSON.stringify(body),
+
+          signal: controller.signal,
+        });
+
+        clearTimeout(timer);
+
+        let responseBody = null;
+        let responseText = "";
+
+        try {
+          responseText = await res.text();
+
+          if (responseText) {
+            responseBody =
+              JSON.parse(responseText);
+          }
+        } catch {
+          responseBody = null;
+        }
+
+        // ----------------------------------------------------
+        // SUCCESS
+        // ----------------------------------------------------
+
+        if (res.ok) {
+          const candidates =
+            Array.isArray(
+              responseBody?.candidates
+            )
+              ? responseBody.candidates
+              : [];
+
+          const candidate =
+            candidates[0];
+
+          const parts =
+            Array.isArray(
+              candidate?.content?.parts
+            )
+              ? candidate.content.parts
+              : [];
+
+          const text = parts
+            .map((part) =>
+              typeof part?.text === "string"
+                ? part.text
+                : ""
+            )
+            .join("")
+            .trim();
+
+          if (text) {
+            keyManager.reportSuccess(
+              keyObj
+            );
+
+            console.log(
+              `✅ [ALEX] Gemini response received — ${text.length} chars`
+            );
+
+            return {
+              error: false,
+              text,
+            };
+          }
+
+          const finishReason =
+            candidate?.finishReason ||
+            "UNKNOWN";
+
+          const blockReason =
+            responseBody
+              ?.promptFeedback
+              ?.blockReason || null;
+
+          console.log(
+            "⚠️ [ALEX] Gemini returned no text:",
+            JSON.stringify({
+              finishReason,
+              blockReason,
+              candidates:
+                candidates.length,
+            })
+          );
+
+          lastError = new Error(
+            blockReason
+              ? `Gemini blocked response: ${blockReason}`
+              : `Gemini returned no text. Finish reason: ${finishReason}`
+          );
+
+          keyManager.reportFailure(
+            keyObj,
+            "soft"
+          );
+
+          continue;
+        }
+
+        // ----------------------------------------------------
+        // 429 — RATE LIMIT / QUOTA
+        // ----------------------------------------------------
+
+        if (res.status === 429) {
+          const lowerBody =
+            responseText.toLowerCase();
+
+          const isDaily =
+            /per day|daily|requests per day|rpd|quota/i.test(
+              lowerBody
+            );
+
+          console.log(
+            `⏸️ [ALEX] Gemini 429 — key #${
+              keyObj.index + 1
+            } — ${
+              isDaily
+                ? "daily quota"
+                : "rate limit"
+            }`
+          );
+
+          keyManager.reportFailure(
+            keyObj,
+            "quota",
+            {
+              isDaily,
+            }
+          );
+
+          lastError = new Error(
+            isDaily
+              ? "Gemini daily quota exhausted"
+              : "Gemini rate limited"
+          );
+
+          if (attempt < maxRetries - 1) {
+            const delay =
+              this._getRetryDelay(
+                attempt,
+                res
+              );
+
+            console.log(
+              `⏳ [ALEX] 429 retry in ${delay}ms`
+            );
+
+            await this._sleep(delay);
+          }
+
+          continue;
+        }
+
+        // ----------------------------------------------------
+        // 401 / 403 — INVALID KEY
+        // ----------------------------------------------------
+
+        if (
+          res.status === 401 ||
+          res.status === 403
+        ) {
+          console.log(
+            `🚫 [ALEX] Gemini key #${
+              keyObj.index + 1
+            } rejected (${res.status})`
+          );
+
+          keyManager.reportFailure(
+            keyObj,
+            "keyInvalid",
+            {
+              detail: `HTTP ${res.status}`,
+            }
+          );
+
+          lastError = new Error(
+            `Gemini API key rejected (${res.status})`
+          );
+
+          // No delay needed — immediately try
+          // another key.
+          continue;
+        }
+
+        // ----------------------------------------------------
+        // 404 — MODEL NOT FOUND
+        // ----------------------------------------------------
+
+        if (res.status === 404) {
+          console.log(
+            `⚠️ [ALEX] Gemini model not found: ${model}`
+          );
+
+          keyManager.reportFailure(
+            keyObj,
+            "model404"
+          );
+
+          lastError = new Error(
+            `Gemini model "${model}" not found`
+          );
+
+          // Model problem will not be fixed by
+          // rotating keys.
+          break;
+        }
+
+        // ----------------------------------------------------
+        // 5xx — GEMINI SERVER ERROR
+        // ----------------------------------------------------
+
+        if (res.status >= 500) {
+          console.log(
+            `🔴 [ALEX] Gemini server error ${res.status} — attempt ${
+              attempt + 1
+            }/${maxRetries}`
+          );
+
+          console.log(
+            responseText.slice(0, 500)
+          );
+
+          keyManager.reportFailure(
+            keyObj,
+            "serverError"
+          );
+
+          lastError = new Error(
+            `Gemini HTTP ${res.status}`
+          );
+
+          if (attempt < maxRetries - 1) {
+            const delay =
+              this._getRetryDelay(
+                attempt,
+                res
+              );
+
+            console.log(
+              `⏳ [ALEX] ${res.status} retry in ${delay}ms`
+            );
+
+            await this._sleep(delay);
+          }
+
+          continue;
+        }
+
+        // ----------------------------------------------------
+        // OTHER HTTP ERROR
+        // ----------------------------------------------------
+
+        const errorMessage =
+          responseBody?.error?.message ||
+          responseText.slice(0, 500) ||
+          `Gemini HTTP ${res.status}`;
+
+        lastError =
+          new Error(errorMessage);
+
+        keyManager.reportFailure(
+          keyObj,
+          "soft"
+        );
+
+      } catch (error) {
+        clearTimeout(timer);
+
+        lastError = error;
+
+        // ----------------------------------------------------
+        // TIMEOUT
+        // ----------------------------------------------------
+
+        if (
+          error?.name === "AbortError"
+        ) {
+          console.log(
+            `⏱️ [ALEX] Gemini timeout (${timeoutMs}ms) — attempt ${
+              attempt + 1
+            }/${maxRetries}`
+          );
+
+          keyManager.reportFailure(
+            keyObj,
+            "timeout"
+          );
+
+          if (attempt < maxRetries - 1) {
+            const delay =
+              this._getRetryDelay(
+                attempt
+              );
+
+            console.log(
+              `⏳ [ALEX] Timeout retry in ${delay}ms`
+            );
+
+            await this._sleep(delay);
+          }
+
+          continue;
+        }
+
+        // ----------------------------------------------------
+        // NETWORK / FETCH ERROR
+        // ----------------------------------------------------
+
+        console.log(
+          "🔴 [ALEX] Gemini request error:",
+          error?.message || error
+        );
+
+        keyManager.reportFailure(
+          keyObj,
+          "soft"
+        );
+
+        if (attempt < maxRetries - 1) {
+          const delay =
+            this._getRetryDelay(
+              attempt
+            );
+
+          console.log(
+            `⏳ [ALEX] Network retry in ${delay}ms`
+          );
+
+          await this._sleep(delay);
+        }
+
+        continue;
+      }
     }
 
-    return text;
-  } finally {
-    clearTimeout(timer);
+    // --------------------------------------------------------
+    // FINAL FAILURE
+    // --------------------------------------------------------
+
+    console.log(
+      `❌ [ALEX] Gemini failed after ${maxRetries} attempts: ${
+        lastError?.message ||
+        "unknown error"
+      }`
+    );
+
+    return {
+      error: true,
+      message:
+        lastError?.message ||
+        "Gemini call failed after retries",
+      aiUnavailable: true,
+    };
   }
 }
 
-/**
- * geminiGenerate(prompt, timeoutMs | options)
- * Returns: STRING on success, NULL on total failure.
- */
-async function geminiGenerate(prompt, timeoutMsOrOptions = 30000) {
-  const timeoutMs = sanitizeTimeout(timeoutMsOrOptions);
-  const totalKeys = (keyManager.keys || []).length || 1;
-  const MAX_ATTEMPTS = totalKeys * 2 + MODEL_CHAIN.length;
+// ============================================================
+// SINGLETON
+// ============================================================
 
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const keyObj = typeof keyManager.nextKey === "function" ? keyManager.nextKey() : null;
-    if (!keyObj || !rawKey(keyObj)) {
-      console.log("🔴 [GEMINI] No usable keys right now (cooldown/exhausted)");
-      await sleep(3000);
-      continue;
-    }
+let instance = null;
 
-    const modelUsed = currentModel();
-
-    try {
-      const text = await callWithKey(keyObj, prompt, modelUsed, timeoutMs);
-      // Working model PIN karo — agli calls isi se shuru hongi
-      pinModel(modelUsed);
-      if (typeof keyManager.reportSuccess === "function") keyManager.reportSuccess(keyObj);
-      return text;
-    } catch (err) {
-      const status = err.status;
-      const label = `Key #${keyIndex(keyObj)}`;
-      const body = err.body || "";
-
-      if (err.name === "AbortError" || err.code === "ABORT_ERR") {
-        console.log(`⏱️ [GEMINI] Timeout (${timeoutMs}ms) on ${label} — next key`);
-        if (typeof keyManager.reportFailure === "function") keyManager.reportFailure(keyObj, "timeout");
-        continue;
-      }
-
-      // 400 with "API key not valid" = invalid key; other 400s = request/model problem
-      if (status === 400 && body.includes("API key not valid")) {
-        console.log(`🔴 [GEMINI] ${label} INVALID (HTTP 400 — key not valid)`);
-        if (typeof keyManager.reportFailure === "function") {
-          keyManager.reportFailure(keyObj, "keyInvalid", { detail: "API key not valid" });
-        }
-        continue;
-      }
-
-      // 400 model problem — model fallback karo, KEY KO INVALID MAT KARO
-      if (status === 400 && /models?\/[\w.\-]+\s+is\s+not\s+found|not\s+found\s+for\s+api\s+version|is\s+not\s+supported/i.test(body)) {
-        console.log(`🔄 [GEMINI] HTTP 400 model problem (${modelUsed}) — falling back`);
-        if (typeof keyManager.reportFailure === "function") keyManager.reportFailure(keyObj, "model404");
-        nextModel();
-        continue;
-      }
-
-      if (status === 401 || status === 403) {
-        console.log(`🔴 [GEMINI] ${label} INVALID (HTTP ${status})`);
-        if (typeof keyManager.reportFailure === "function") {
-          keyManager.reportFailure(keyObj, "keyInvalid", { detail: `HTTP ${status}` });
-        }
-        continue;
-      }
-
-      if (status === 404) {
-        console.log(`🔄 [GEMINI] Model ${modelUsed} not available (404) — falling back`);
-        if (typeof keyManager.reportFailure === "function") keyManager.reportFailure(keyObj, "model404");
-        nextModel();
-        continue;
-      }
-
-      if (status === 503 || status === 500) {
-        console.log(`🔴 [GEMINI] HTTP ${status} (model: ${modelUsed}) — trying alternate model`);
-        if (typeof keyManager.reportFailure === "function") keyManager.reportFailure(keyObj, "serverError");
-        nextModel();
-        continue;
-      }
-
-      if (status === 429) {
-        // Daily quota vs short-term rate limit sniff karo
-        const isDaily = /perDay|per\s+day|ResourceExhausted[\s\S]*perDay|limit:\s*0/i.test(body);
-        console.log(`⏳ [GEMINI] ${label} quota hit — ${isDaily ? "DAILY exhausted" : "short cooldown"}`);
-        if (typeof keyManager.reportFailure === "function") {
-          keyManager.reportFailure(keyObj, "quota", { isDaily });
-        }
-        continue;
-      }
-
-      console.log(`⚠️ [GEMINI] Soft failure: ${String(err.message).slice(0, 120)}`);
-      if (typeof keyManager.reportFailure === "function") keyManager.reportFailure(keyObj, "soft");
-    }
+function getAlexGeminiClient() {
+  if (!instance) {
+    instance =
+      new AlexGeminiClient();
   }
 
-  console.log("🔴 [GEMINI] All attempts failed — giving up this call");
-  return null;
+  return instance;
 }
 
 module.exports = {
-  geminiGenerate,
-  extractJSON,
-  currentModel,
-  MODEL_CHAIN,
-  MAX_OUTPUT_TOKENS,
+  AlexGeminiClient,
+  getAlexGeminiClient,
 };

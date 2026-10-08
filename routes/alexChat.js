@@ -79,11 +79,94 @@ function isReelRequest(msg) {
 
 const sessions = new Map();
 
-const SESSION_TTL_MS =
-  24 * 60 * 60 * 1000;
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const SESSION_CLEANUP_MS = 60 * 60 * 1000;
 
-const SESSION_CLEANUP_MS =
-  60 * 60 * 1000;
+function generateSessionId() {
+  return `alex_chat_${Date.now()}_${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
+}
+
+function createAlexSession(actor) {
+  const sessionId = generateSessionId();
+
+  const now = Date.now();
+
+  const session = {
+    id: sessionId,
+
+    userId: actor.userId
+      ? String(actor.userId)
+      : null,
+
+    role: actor.role || "student",
+
+    isOwner: Boolean(actor.isOwner),
+    isAdmin: Boolean(actor.isAdmin),
+
+    createdAt: now,
+    lastActivity: now,
+
+    messages: [],
+
+    metrics: {
+      messagesSent: 0,
+      commandsExecuted: 0,
+      startedAt: new Date(now).toISOString(),
+    },
+
+    context: {
+      user: {
+        userId: actor.userId,
+        id: actor.userId,
+        email: actor.email,
+        role: actor.role,
+        isOwner: actor.isOwner,
+        isAdmin: actor.isAdmin,
+      },
+
+      alexAccess: actor.isOwner
+        ? "full"
+        : "user",
+
+      alexMode: actor.isOwner
+        ? "full"
+        : "user",
+
+      authenticated: true,
+    },
+  };
+
+  sessions.set(sessionId, session);
+
+  return session;
+}
+
+function getSessionForActor(sessionId, actor) {
+  if (!sessionId) {
+    return null;
+  }
+
+  const session = sessions.get(String(sessionId));
+
+  if (!session) {
+    return null;
+  }
+
+  // Session sirf usi authenticated user ki honi chahiye.
+  if (
+    !actor.userId ||
+    !session.userId ||
+    String(session.userId) !== String(actor.userId)
+  ) {
+    return null;
+  }
+
+  session.lastActivity = Date.now();
+
+  return session;
+}
 
 setInterval(() => {
   const now = Date.now();
@@ -98,7 +181,6 @@ setInterval(() => {
     }
   }
 }, SESSION_CLEANUP_MS);
-
 // ============================================================
 // SESSION ID
 // ============================================================

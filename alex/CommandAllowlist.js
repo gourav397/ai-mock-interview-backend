@@ -5,12 +5,24 @@
 
 const path = require("path");
 
-const PROJECT_ROOT = path.resolve(__dirname, "..");
+const PROJECT_ROOT = path.resolve(__dirname, "../..");
 
 const ALLOWED_ACTIONS = {
   // ============================================================
   // READ / INSPECTION
   // ============================================================
+
+  chat: {
+    allowed: true,
+    requiresConfirmation: false,
+    description: "Casual conversation — greetings and small talk (no command)",
+  },
+
+  "general-chat": {
+    allowed: true,
+    requiresConfirmation: false,
+    description: "General conversation — answer any question like ChatGPT (no project modification)",
+  },
 
   inspect: {
     allowed: true,
@@ -41,6 +53,12 @@ const ALLOWED_ACTIONS = {
     requiresConfirmation: false,
     description: "Check ALEX/backend health",
   },
+
+  "system-control": {
+  allowed: true,
+  requiresConfirmation: false,
+  description: "Authorized owner laptop/system information and safe system controls",
+},
 
   "check-database": {
     allowed: true,
@@ -113,8 +131,8 @@ const ALLOWED_ACTIONS = {
 
   "fix-bugs": {
     allowed: true,
-    requiresConfirmation: false,
-    description: "Find and fix code bugs",
+    requiresConfirmation: true,
+    description: "Find and fix code bugs (owner confirmation + backup required)",
   },
 
   "improve-code": {
@@ -150,6 +168,12 @@ const ALLOWED_ACTIONS = {
     requiresConfirmation: false,
     description: "Run an approved development command",
   },
+
+  "generate-reel": {
+  allowed: true,
+  requiresConfirmation: false,
+  description: "Generate a Reel from an owner-provided prompt",
+},
 
   "prepare-deploy": {
     allowed: true,
@@ -515,4 +539,3 @@ module.exports = {
   BLOCKED_PATTERNS,
   PROTECTED_PATHS,
 };
-

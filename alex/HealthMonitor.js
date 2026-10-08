@@ -22,8 +22,19 @@ class HealthMonitor {
     this.consecutiveSuccesses = 0;
   }
 
-  async init(serverUrl = "http://localhost:5000") {
-    this.serverUrl = serverUrl;
+  async init(serverUrl = null) {
+  this.serverUrl =
+    serverUrl ||
+    process.env.BACKEND_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    `http://localhost:${process.env.PORT || 5000}`;
+
+  this.ready = true;
+
+  console.log(
+    "💚 ALEX HealthMonitor: Ready (server:",
+    this.serverUrl + ")"
+  );
     this.ready = true;
     console.log("💚 ALEX HealthMonitor: Ready (server:", serverUrl + ")");
   }
