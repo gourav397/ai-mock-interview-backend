@@ -26,10 +26,42 @@
 
 "use strict";
 
-const {
-  callAgent,
-} = require("../windowsAgentTool");
 
+let callAgent = null;
+let windowsAgentLoadError = null;
+
+function getCallAgent() {
+  if (typeof callAgent === "function") {
+    return callAgent;
+  }
+
+  try {
+    const windowsAgentTool =
+      require("../windowsAgentTool");
+
+    if (
+      typeof windowsAgentTool?.callAgent !==
+      "function"
+    ) {
+      windowsAgentLoadError =
+        new Error(
+          "windowsAgentTool.callAgent is not available."
+        );
+
+      return null;
+    }
+
+    callAgent =
+      windowsAgentTool.callAgent;
+
+    windowsAgentLoadError = null;
+
+    return callAgent;
+  } catch (error) {
+    windowsAgentLoadError = error;
+    return null;
+  }
+}
 // ============================================================
 // CONSTANTS
 // ============================================================
@@ -932,8 +964,8 @@ class AgentToolRegistry {
       REGISTRY_VERSION;
 
     this.callAgentFn =
-      options.callAgent ||
-      callAgent;
+  options.callAgent ||
+  getCallAgent();
 
     this.tools = {
       ...TOOL_DEFINITIONS,
@@ -1069,14 +1101,36 @@ class AgentToolRegistry {
 
     let result;
 
-    try {
-      result =
-        await this.callAgentFn(
-          name,
-          validatedArgs,
-          agentToken
-        );
-    } catch (error) {
+const agentCaller =
+  this.callAgentFn ||
+  getCallAgent();
+
+if (
+  typeof agentCaller !==
+  "function"
+) {
+  throw new Error(
+    "WindowsAgent is unavailable on this server. Windows-only ALEX agent tools cannot run on Render/Linux." +
+      (windowsAgentLoadError?.message
+        ? ` ${windowsAgentLoadError.message}`
+        : "")
+  );
+}
+
+try {
+  result =
+    await agentCaller(
+      name,
+      validatedArgs,
+      agentToken
+    );
+} catch (error) {
+  throw new Error(
+    `ALEX agent tool '${name}' failed: ${
+      error?.message ||
+      String(error)
+    }`
+  );
       throw new Error(
         `ALEX agent tool '${name}' failed: ${
           error?.message ||
