@@ -9,7 +9,7 @@ const { getAlexGeminiClient } = require("../../config/geminiClient");
 const MODEL =
   process.env.ALEX_GEMINI_MODEL ||
   process.env.GEMINI_MODEL ||
-  "gemini-2.0-flash";
+  "gemini-3.8-flash";
 
 console.log(
   `🤖 [ALEX] Gemini utility loaded — model: ${MODEL} | ${envStatus.summary}`
@@ -83,6 +83,10 @@ async function callGemini(prompt, options = {}) {
 
   // Client.call returns { error: true, message } on failure
   if (!result || result.error) {
+    console.error(
+  "❌ [ALEX] Gemini client error:",
+  result?.message || "Unknown Gemini error"
+);
   // --------------------------------------------------------
   // CHAT MODE:
   // Gemini temporarily unavailable/timeout ho to chat ko
