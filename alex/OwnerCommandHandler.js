@@ -75,7 +75,33 @@ const {
 } = require("./utils/gemini");
 
 const config = require("./config");
-const { callAgent } = require("../windowsAgentTool");
+// WindowsAgent is optional at server startup.
+// Render/Linux par normal ALEX chat ke liye ye module required nahi hai.
+let callAgent = null;
+let windowsAgentLoadError = null;
+
+function getCallAgent() {
+  if (typeof callAgent === "function") return callAgent;
+
+  try {
+    const windowsAgentTool = require("../windowsAgentTool");
+
+    if (typeof windowsAgentTool?.callAgent !== "function") {
+      windowsAgentLoadError = new Error(
+        "windowsAgentTool.callAgent is not available."
+      );
+      return null;
+    }
+
+    callAgent = windowsAgentTool.callAgent;
+    windowsAgentLoadError = null;
+
+    return callAgent;
+  } catch (error) {
+    windowsAgentLoadError = error;
+    return null;
+  }
+}
 const {
   getAutonomousTaskService,
 } = require("./AutonomousTaskService");
@@ -132,29 +158,8 @@ class OwnerCommandHandler {
   // ============================================================
 
   _ownerIdOf(owner) {
-  const rawId =
-    owner?.userId ??
-    owner?.id ??
-    owner?._id ??
-    owner?.ownerId ??
-    null;
-
-  if (rawId !== null && rawId !== undefined) {
-    const value = String(rawId).trim();
-
-    if (value && value !== "null" && value !== "undefined") {
-      return value;
-    }
+    return String(owner?.userId || owner?.method || "anonymous");
   }
-
-  // Admin-key authentication has no database user id.
-  // Keep a stable owner identity for that authenticated session.
-  if (owner?.authenticated === true && owner?.method === "admin_key") {
-    return "admin-key-owner";
-  }
-
-  return "anonymous";
-}
 
   _ownerKey(owner, sessionId) {
     return `${this._ownerIdOf(owner)}:${String(sessionId || "default")}`;
@@ -1235,11 +1240,29 @@ const finalExecutionStatus = executionProcessing
 
         delete cleanParams.agentToken;
 
-        const result = await callAgent(
-          agentTool,
-          cleanParams,
-          agentToken
-        );
+        const agentCaller = getCallAgent();
+
+if (!agentCaller) {
+  return {
+    success: false,
+    source: "windows-agent",
+    systemAction,
+    error:
+      "WindowsAgent is unavailable on this server. " +
+      "Normal ALEX chat can continue, but Windows-only controls " +
+      "require the WindowsAgent bridge on a Windows machine.",
+    code: "WINDOWS_AGENT_UNAVAILABLE",
+    details:
+      windowsAgentLoadError?.message ||
+      "WindowsAgent bridge not loaded.",
+  };
+}
+
+const result = await agentCaller(
+  agentTool,
+  cleanParams,
+  agentToken
+);
 
         return {
           success: result?.status === "ok",
