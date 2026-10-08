@@ -18,8 +18,36 @@
 
 const fs = require("fs");
 const path = require("path");
-const { callAgent } = require("../windowsAgentTool");
+// WindowsAgent is optional.
+// Render/Linux par ALEX server startup ke time Windows bridge
+// available hona zaroori nahi hai.
+let callAgent = null;
+let windowsAgentLoadError = null;
 
+function getCallAgent() {
+  if (typeof callAgent === "function") {
+    return callAgent;
+  }
+
+  try {
+    const windowsAgentTool = require("../windowsAgentTool");
+
+    if (typeof windowsAgentTool?.callAgent !== "function") {
+      windowsAgentLoadError = new Error(
+        "windowsAgentTool.callAgent is not available."
+      );
+      return null;
+    }
+
+    callAgent = windowsAgentTool.callAgent;
+    windowsAgentLoadError = null;
+
+    return callAgent;
+  } catch (error) {
+    windowsAgentLoadError = error;
+    return null;
+  }
+}
 const { callGemini } = require("./utils/gemini");
 const { CommandAllowlist } = require("./CommandAllowlist");
 const { SystemControl } = require("./SystemControl");
@@ -1494,21 +1522,44 @@ async function systemInfoStep(
     };
   }
 
+  const agentCaller =
+    getCallAgent();
+
+  if (!agentCaller) {
+    return {
+      success: false,
+      action:
+        "system-info",
+      error:
+        "WindowsAgent is unavailable on this server. This Windows-only action cannot run on Render/Linux.",
+      code:
+        "WINDOWS_AGENT_UNAVAILABLE",
+      details:
+        windowsAgentLoadError?.message ||
+        "WindowsAgent bridge could not be loaded.",
+    };
+  }
+
   const result =
-    await callAgent(
+    await agentCaller(
       "system-info",
       {},
       token
     );
 
   return {
-    success: true,
+    success: result?.status === "ok",
     action:
       "system-info",
-    result,
+    result:
+      result?.result ?? result,
+    error:
+      result?.status !== "ok"
+        ? result?.reason ||
+          "WindowsAgent system-info action failed."
+        : undefined,
   };
 }
-
 // ============================================================
 // VERIFY FILE
 // ============================================================
