@@ -1,6 +1,14 @@
 // ============================================================
-// ALEX Gemini Client — Production
+// ALEX Gemini Client — Production / High Reliability
 // Uses centralized geminiKeys.js for key rotation/state
+//
+// IMPORTANT:
+// - Gemini 3.8 compatible request
+// - No deprecated temperature/topP sampling params
+// - Automatic API-key rotation
+// - Automatic retry / backoff
+// - Handles 429 / 401 / 403 / 5xx / timeout / network errors
+// - Preserves centralized keyManager state
 // ============================================================
 
 const {
@@ -10,10 +18,11 @@ const {
 
 class AlexGeminiClient {
   constructor() {
-   this.model =
-  process.env.ALEX_GEMINI_MODEL ||
-  process.env.GEMINI_MODEL ||
-  "gemini-3.8-flash";
+    this.model =
+      process.env.ALEX_GEMINI_MODEL ||
+      process.env.GEMINI_MODEL ||
+      "gemini-3.8-flash";
+
     this.available = envStatus.count > 0;
 
     console.log(
@@ -22,7 +31,15 @@ class AlexGeminiClient {
   }
 
   isAvailable() {
-    return this.available && keyManager.usableCount() > 0;
+    try {
+      return (
+        this.available &&
+        envStatus.count > 0 &&
+        keyManager.usableCount() > 0
+      );
+    } catch {
+      return this.available && envStatus.count > 0;
+    }
   }
 
   async _sleep(ms) {
@@ -34,7 +51,6 @@ class AlexGeminiClient {
   }
 
   _getRetryDelay(attempt, response = null) {
-    // Respect Gemini/server Retry-After if available
     try {
       const retryAfter =
         response?.headers?.get?.("retry-after");
@@ -42,73 +58,138 @@ class AlexGeminiClient {
       if (retryAfter) {
         const seconds = Number(retryAfter);
 
-        if (Number.isFinite(seconds) && seconds > 0) {
-          return Math.min(seconds * 1000, 15000);
+        if (
+          Number.isFinite(seconds) &&
+          seconds > 0
+        ) {
+          return Math.min(
+            seconds * 1000,
+            15000
+          );
         }
       }
     } catch {
-      // Ignore header parsing errors
+      // Ignore Retry-After parsing errors
     }
-
-    // Exponential backoff:
-    // attempt 0 -> 1000ms
-    // attempt 1 -> 2000ms
-    // attempt 2 -> 4000ms
-    // attempt 3 -> 8000ms
-    // attempt 4 -> 10000ms max
 
     const base = Math.min(
       1000 * Math.pow(2, attempt),
-      10000
+      8000
     );
 
-    // Small jitter prevents synchronized retries
-    const jitter = Math.floor(Math.random() * 500);
+    const jitter = Math.floor(
+      Math.random() * 500
+    );
 
     return base + jitter;
   }
 
+   _getMaxAttempts(chatMode, options) {
+    const keyCount = Math.max(
+      1,
+      Number(keyManager.count) || 1
+    );
+
+    /*
+     * IMPORTANT:
+     *
+     * options.retries caller ki retry preference hai.
+     * Ye available Gemini keys ki total attempts
+     * ko kam nahi karega.
+     *
+     * Example:
+     *
+     * 15 Gemini keys + retries: 4
+     *        ↓
+     * ALEX can still use up to 15 attempts.
+     *
+     * Isse AgentGoalRouter ka retries: 4
+     * accidentally 4 total attempts nahi banega.
+     */
+
+    if (chatMode) {
+      return Math.min(
+        15,
+        Math.max(
+          5,
+          keyCount
+        )
+      );
+    }
+
+    const requestedRetries =
+      typeof options.retries === "number"
+        ? Math.max(1, options.retries)
+        : 0;
+
+    return Math.min(
+      15,
+      Math.max(
+        requestedRetries,
+        Math.min(5, keyCount)
+      )
+    );
+  }
+
+  _buildGenerationConfig({
+    chatMode,
+    maxOutputTokens,
+    responseMimeType,
+  }) {
+    /*
+     * Gemini 3.8:
+     * Do NOT send deprecated sampling parameters
+     * such as temperature/topP/topK.
+     *
+     * Keep only supported output controls.
+     */
+    const config = {
+      maxOutputTokens,
+    };
+
+    if (responseMimeType) {
+      config.responseMimeType =
+        responseMimeType;
+    }
+
+    return config;
+  }
+
   async call(prompt, options = {}) {
-    if (!this.available || envStatus.count === 0) {
+    if (
+      !this.available ||
+      envStatus.count === 0
+    ) {
       return {
         error: true,
-        message: "No Gemini API keys configured",
+        message:
+          "Gemini API is not configured",
         aiUnavailable: true,
       };
     }
 
-    const chatMode = options.chatMode === true;
-
-    const temperature =
-      typeof options.temperature === "number"
-        ? options.temperature
-        : chatMode
-          ? 0.8
-          : 0.3;
+    const chatMode =
+      options.chatMode === true;
 
     const timeoutMs =
       typeof options.timeoutMs === "number"
-        ? options.timeoutMs
+        ? Math.max(
+            5000,
+            options.timeoutMs
+          )
         : chatMode
-          ? 15000
+          ? 30000
           : 60000;
 
     const maxOutputTokens =
       typeof options.maxOutputTokens === "number"
-        ? options.maxOutputTokens
+        ? Math.max(
+            128,
+            options.maxOutputTokens
+          )
         : chatMode
           ? 2000
           : 4096;
-
-    const maxRetries =
-      typeof options.retries === "number"
-        ? Math.max(1, options.retries)
-        : chatMode
-          ? 3
-          : Math.min(
-              5,
-              Math.max(3, keyManager.count)
-            );
 
     const responseMimeType =
       options.responseMimeType ||
@@ -117,14 +198,18 @@ class AlexGeminiClient {
         : "application/json");
 
     const model =
-      options.model || this.model;
+      options.model ||
+      this.model;
 
-    const safePrompt = String(prompt || "");
+    const safePrompt =
+      String(prompt || "").trim();
 
-    if (!safePrompt.trim()) {
+    if (!safePrompt) {
       return {
         error: true,
-        message: "Gemini prompt is empty",
+        message:
+          "Gemini prompt is empty",
+        aiUnavailable: false,
       };
     }
 
@@ -134,53 +219,92 @@ class AlexGeminiClient {
           "\n...[truncated]"
         : safePrompt;
 
+    const maxAttempts =
+      this._getMaxAttempts(
+        chatMode,
+        options
+      );
+
     let lastError = null;
+
+    let consecutiveNoKeyAttempts = 0;
 
     for (
       let attempt = 0;
-      attempt < maxRetries;
+      attempt < maxAttempts;
       attempt++
     ) {
-      const keyObj = keyManager.nextKey();
+      let keyObj = null;
 
+      try {
+        keyObj =
+          keyManager.nextKey();
+      } catch (keyError) {
+        lastError = keyError;
+      }
+
+      /*
+       * No currently usable key.
+       * Wait for key cooldown if possible instead
+       * of immediately failing.
+       */
       if (!keyObj) {
-        const waitMs =
-          keyManager.minWaitMs();
+        consecutiveNoKeyAttempts++;
+
+        let waitMs = null;
+
+        try {
+          waitMs =
+            keyManager.minWaitMs();
+        } catch {
+          waitMs = null;
+        }
 
         if (
           waitMs !== null &&
-          waitMs > 0 &&
-          waitMs < 15000
+          Number.isFinite(waitMs) &&
+          waitMs > 0
         ) {
+          const safeWait =
+            Math.min(waitMs, 10000);
+
           console.log(
-            `⏳ [ALEX] Waiting ${waitMs}ms for an available Gemini key`
+            `⏳ [ALEX] Waiting ${safeWait}ms for Gemini key availability`
           );
 
-          await this._sleep(waitMs);
+          await this._sleep(
+            safeWait
+          );
 
           continue;
         }
 
-        return {
-          error: true,
-          message:
-            "All Gemini API keys are temporarily unavailable",
-          aiUnavailable: true,
-        };
+        /*
+         * Small recovery wait before another
+         * key-manager attempt.
+         */
+        if (
+          consecutiveNoKeyAttempts <
+          maxAttempts
+        ) {
+          await this._sleep(1000);
+          continue;
+        }
+
+        break;
       }
+
+      consecutiveNoKeyAttempts = 0;
 
       const controller =
         new AbortController();
 
-      const timer = setTimeout(() => {
-        controller.abort();
-      }, timeoutMs);
+      const timer =
+        setTimeout(() => {
+          controller.abort();
+        }, timeoutMs);
 
       try {
-        // ----------------------------------------------------
-        // CORRECT GEMINI URL
-        // ----------------------------------------------------
-
         const url =
           `https://generativelanguage.googleapis.com/v1beta/models/` +
           `${encodeURIComponent(model)}:generateContent`;
@@ -196,51 +320,62 @@ class AlexGeminiClient {
             },
           ],
 
-          generationConfig: {
-            temperature,
-            topP: 0.95,
-            maxOutputTokens,
-            responseMimeType,
-          },
+          generationConfig:
+            this._buildGenerationConfig({
+              chatMode,
+              maxOutputTokens,
+              responseMimeType,
+            }),
         };
 
         console.log(
-          `🤖 [ALEX] Gemini request — attempt ${attempt + 1}/${maxRetries} | model: ${model} | key #${keyObj.index + 1}`
+          `🤖 [ALEX] Gemini request — attempt ${
+            attempt + 1
+          }/${maxAttempts} | model: ${model} | key #${
+            keyObj.index + 1
+          }`
         );
 
-        const res = await fetch(url, {
-          method: "POST",
+        const res =
+          await fetch(url, {
+            method: "POST",
 
-          headers: {
-            "Content-Type":
-              "application/json",
-            "x-goog-api-key": keyObj.key,
-          },
+            headers: {
+              "Content-Type":
+                "application/json",
+              "x-goog-api-key":
+                keyObj.key,
+            },
 
-          body: JSON.stringify(body),
+            body:
+              JSON.stringify(body),
 
-          signal: controller.signal,
-        });
+            signal:
+              controller.signal,
+          });
 
         clearTimeout(timer);
 
-        let responseBody = null;
         let responseText = "";
+        let responseBody = null;
 
         try {
-          responseText = await res.text();
+          responseText =
+            await res.text();
 
           if (responseText) {
             responseBody =
-              JSON.parse(responseText);
+              JSON.parse(
+                responseText
+              );
           }
         } catch {
           responseBody = null;
         }
 
-        // ----------------------------------------------------
+        // ====================================================
         // SUCCESS
-        // ----------------------------------------------------
+        // ====================================================
 
         if (res.ok) {
           const candidates =
@@ -260,19 +395,25 @@ class AlexGeminiClient {
               ? candidate.content.parts
               : [];
 
-          const text = parts
-            .map((part) =>
-              typeof part?.text === "string"
-                ? part.text
-                : ""
-            )
-            .join("")
-            .trim();
+          const text =
+            parts
+              .map((part) =>
+                typeof part?.text ===
+                "string"
+                  ? part.text
+                  : ""
+              )
+              .join("")
+              .trim();
 
           if (text) {
-            keyManager.reportSuccess(
-              keyObj
-            );
+            try {
+              keyManager.reportSuccess(
+                keyObj
+              );
+            } catch {
+              // Response is already successful.
+            }
 
             console.log(
               `✅ [ALEX] Gemini response received — ${text.length} chars`
@@ -291,35 +432,52 @@ class AlexGeminiClient {
           const blockReason =
             responseBody
               ?.promptFeedback
-              ?.blockReason || null;
+              ?.blockReason ||
+            null;
+
+          lastError =
+            new Error(
+              blockReason
+                ? `Gemini blocked response: ${blockReason}`
+                : `Gemini returned no text. Finish reason: ${finishReason}`
+            );
 
           console.log(
-            "⚠️ [ALEX] Gemini returned no text:",
-            JSON.stringify({
-              finishReason,
-              blockReason,
-              candidates:
-                candidates.length,
-            })
+            `⚠️ [ALEX] Gemini returned no usable text — attempt ${
+              attempt + 1
+            }/${maxAttempts}`
           );
 
-          lastError = new Error(
-            blockReason
-              ? `Gemini blocked response: ${blockReason}`
-              : `Gemini returned no text. Finish reason: ${finishReason}`
-          );
+          try {
+            keyManager.reportFailure(
+              keyObj,
+              "soft"
+            );
+          } catch {
+            // Ignore key-manager reporting failure.
+          }
 
-          keyManager.reportFailure(
-            keyObj,
-            "soft"
-          );
+          /*
+           * Try another key/request rather than
+           * returning an error immediately.
+           */
+          if (
+            attempt <
+            maxAttempts - 1
+          ) {
+            await this._sleep(
+              this._getRetryDelay(
+                attempt
+              )
+            );
+          }
 
           continue;
         }
 
-        // ----------------------------------------------------
+        // ====================================================
         // 429 — RATE LIMIT / QUOTA
-        // ----------------------------------------------------
+        // ====================================================
 
         if (res.status === 429) {
           const lowerBody =
@@ -340,40 +498,43 @@ class AlexGeminiClient {
             }`
           );
 
-          keyManager.reportFailure(
-            keyObj,
-            "quota",
-            {
-              isDaily,
-            }
-          );
+          try {
+            keyManager.reportFailure(
+              keyObj,
+              "quota",
+              {
+                isDaily,
+              }
+            );
+          } catch {
+            // Ignore key-manager reporting failure.
+          }
 
-          lastError = new Error(
-            isDaily
-              ? "Gemini daily quota exhausted"
-              : "Gemini rate limited"
-          );
+          lastError =
+            new Error(
+              isDaily
+                ? "Gemini daily quota exhausted"
+                : "Gemini rate limited"
+            );
 
-          if (attempt < maxRetries - 1) {
-            const delay =
+          if (
+            attempt <
+            maxAttempts - 1
+          ) {
+            await this._sleep(
               this._getRetryDelay(
                 attempt,
                 res
-              );
-
-            console.log(
-              `⏳ [ALEX] 429 retry in ${delay}ms`
+              )
             );
-
-            await this._sleep(delay);
           }
 
           continue;
         }
 
-        // ----------------------------------------------------
-        // 401 / 403 — INVALID KEY
-        // ----------------------------------------------------
+        // ====================================================
+        // 401 / 403 — INVALID / REJECTED KEY
+        // ====================================================
 
         if (
           res.status === 401 ||
@@ -385,182 +546,233 @@ class AlexGeminiClient {
             } rejected (${res.status})`
           );
 
-          keyManager.reportFailure(
-            keyObj,
-            "keyInvalid",
-            {
-              detail: `HTTP ${res.status}`,
-            }
-          );
+          try {
+            keyManager.reportFailure(
+              keyObj,
+              "keyInvalid",
+              {
+                detail:
+                  `HTTP ${res.status}`,
+              }
+            );
+          } catch {
+            // Ignore key-manager reporting failure.
+          }
 
-          lastError = new Error(
-            `Gemini API key rejected (${res.status})`
-          );
+          lastError =
+            new Error(
+              `Gemini API key rejected (${res.status})`
+            );
 
-          // No delay needed — immediately try
-          // another key.
+          /*
+           * Immediately rotate to another key.
+           */
           continue;
         }
 
-        // ----------------------------------------------------
+        // ====================================================
         // 404 — MODEL NOT FOUND
-        // ----------------------------------------------------
+        // ====================================================
 
         if (res.status === 404) {
           console.log(
             `⚠️ [ALEX] Gemini model not found: ${model}`
           );
 
-          keyManager.reportFailure(
-            keyObj,
-            "model404"
-          );
+          try {
+            keyManager.reportFailure(
+              keyObj,
+              "model404"
+            );
+          } catch {
+            // Ignore key-manager reporting failure.
+          }
 
-          lastError = new Error(
-            `Gemini model "${model}" not found`
-          );
+          lastError =
+            new Error(
+              `Gemini model "${model}" not found`
+            );
 
-          // Model problem will not be fixed by
-          // rotating keys.
+          /*
+           * Rotating API keys cannot fix a missing
+           * model. Stop this attempt cleanly.
+           */
           break;
         }
 
-        // ----------------------------------------------------
+        // ====================================================
         // 5xx — GEMINI SERVER ERROR
-        // ----------------------------------------------------
+        // ====================================================
 
         if (res.status >= 500) {
           console.log(
-            `🔴 [ALEX] Gemini server error ${res.status} — attempt ${
+            `🔴 [ALEX] Gemini server error ${
+              res.status
+            } — attempt ${
               attempt + 1
-            }/${maxRetries}`
+            }/${maxAttempts}`
           );
 
-          console.log(
-            responseText.slice(0, 500)
-          );
+          try {
+            keyManager.reportFailure(
+              keyObj,
+              "serverError"
+            );
+          } catch {
+            // Ignore key-manager reporting failure.
+          }
 
-          keyManager.reportFailure(
-            keyObj,
-            "serverError"
-          );
+          lastError =
+            new Error(
+              `Gemini HTTP ${res.status}`
+            );
 
-          lastError = new Error(
-            `Gemini HTTP ${res.status}`
-          );
-
-          if (attempt < maxRetries - 1) {
-            const delay =
+          if (
+            attempt <
+            maxAttempts - 1
+          ) {
+            await this._sleep(
               this._getRetryDelay(
                 attempt,
                 res
-              );
-
-            console.log(
-              `⏳ [ALEX] ${res.status} retry in ${delay}ms`
+              )
             );
-
-            await this._sleep(delay);
           }
 
           continue;
         }
 
-        // ----------------------------------------------------
+        // ====================================================
         // OTHER HTTP ERROR
-        // ----------------------------------------------------
+        // ====================================================
 
         const errorMessage =
-          responseBody?.error?.message ||
-          responseText.slice(0, 500) ||
+          responseBody?.error
+            ?.message ||
+          responseText.slice(
+            0,
+            500
+          ) ||
           `Gemini HTTP ${res.status}`;
 
-        lastError =
-          new Error(errorMessage);
-
-        keyManager.reportFailure(
-          keyObj,
-          "soft"
+        console.log(
+          `⚠️ [ALEX] Gemini HTTP ${res.status} — rotating/retrying`
         );
 
+        lastError =
+          new Error(
+            errorMessage
+          );
+
+        try {
+          keyManager.reportFailure(
+            keyObj,
+            "soft"
+          );
+        } catch {
+          // Ignore key-manager reporting failure.
+        }
+
+        if (
+          attempt <
+          maxAttempts - 1
+        ) {
+          await this._sleep(
+            this._getRetryDelay(
+              attempt,
+              res
+            )
+          );
+        }
+
+        continue;
       } catch (error) {
         clearTimeout(timer);
 
         lastError = error;
 
-        // ----------------------------------------------------
+        // ====================================================
         // TIMEOUT
-        // ----------------------------------------------------
+        // ====================================================
 
         if (
-          error?.name === "AbortError"
+          error?.name ===
+          "AbortError"
         ) {
           console.log(
             `⏱️ [ALEX] Gemini timeout (${timeoutMs}ms) — attempt ${
               attempt + 1
-            }/${maxRetries}`
+            }/${maxAttempts}`
           );
 
-          keyManager.reportFailure(
-            keyObj,
-            "timeout"
-          );
+          try {
+            keyManager.reportFailure(
+              keyObj,
+              "timeout"
+            );
+          } catch {
+            // Ignore key-manager reporting failure.
+          }
 
-          if (attempt < maxRetries - 1) {
-            const delay =
+          if (
+            attempt <
+            maxAttempts - 1
+          ) {
+            await this._sleep(
               this._getRetryDelay(
                 attempt
-              );
-
-            console.log(
-              `⏳ [ALEX] Timeout retry in ${delay}ms`
+              )
             );
-
-            await this._sleep(delay);
           }
 
           continue;
         }
 
-        // ----------------------------------------------------
+        // ====================================================
         // NETWORK / FETCH ERROR
-        // ----------------------------------------------------
+        // ====================================================
 
         console.log(
-          "🔴 [ALEX] Gemini request error:",
-          error?.message || error
+          `🔴 [ALEX] Gemini network error — attempt ${
+            attempt + 1
+          }/${maxAttempts}`
         );
 
-        keyManager.reportFailure(
-          keyObj,
-          "soft"
-        );
+        try {
+          keyManager.reportFailure(
+            keyObj,
+            "soft"
+          );
+        } catch {
+          // Ignore key-manager reporting failure.
+        }
 
-        if (attempt < maxRetries - 1) {
-          const delay =
+        if (
+          attempt <
+          maxAttempts - 1
+        ) {
+          await this._sleep(
             this._getRetryDelay(
               attempt
-            );
-
-          console.log(
-            `⏳ [ALEX] Network retry in ${delay}ms`
+            )
           );
-
-          await this._sleep(delay);
         }
 
         continue;
       }
     }
 
-    // --------------------------------------------------------
-    // FINAL FAILURE
-    // --------------------------------------------------------
+    // ========================================================
+    // FINAL INTERNAL FAILURE
+    //
+    // Do NOT pretend that an AI answer was generated.
+    // The caller can decide how to recover gracefully.
+    // ========================================================
 
     console.log(
-      `❌ [ALEX] Gemini failed after ${maxRetries} attempts: ${
+      `❌ [ALEX] Gemini exhausted recovery attempts: ${
         lastError?.message ||
-        "unknown error"
+        "unknown Gemini failure"
       }`
     );
 
@@ -568,8 +780,9 @@ class AlexGeminiClient {
       error: true,
       message:
         lastError?.message ||
-        "Gemini call failed after retries",
+        "Gemini service temporarily unavailable",
       aiUnavailable: true,
+      retryable: true,
     };
   }
 }
