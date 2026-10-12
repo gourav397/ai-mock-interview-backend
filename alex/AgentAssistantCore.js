@@ -17,52 +17,12 @@
  *   • Autonomous tasks
  *   • Project/system operations
  *   • Capability inspection
- *
- * ARCHITECTURE
- * ------------
- *
- * USER
- *   ↓
- * AgentAssistantCore
- *   ↓
- * AgentConversationGateway
- *   ↓
- * AgentGoalRouter
- *   ├── CHAT
- *   ├── MEMORY
- *   ├── TOOL
- *   ├── RESEARCH
- *   └── AUTONOMOUS
- *          ↓
- * Existing ALEX infrastructure
- *
- * ACCESS MODEL
- * ------------
- *
- * NORMAL USER
- *   ├── CHAT             ✅
- *   ├── MEMORY           ✅
- *   ├── RESEARCH         ✅
- *   └── OWNER ACTIONS    ❌
- *
- * OWNER / ADMIN
- *   ├── CHAT             ✅
- *   ├── MEMORY           ✅
- *   ├── RESEARCH         ✅
- *   ├── COMPUTER         ✅
- *   └── AUTONOMOUS       ✅
+ *   • Live weather (read-only)
  *
  * IMPORTANT
  * ---------
- * This file does not bypass:
- *
- *   • authentication
- *   • permissions
- *   • allowlists
- *   • runtime checks
- *   • WindowsAgent authentication
- *
- * It is an orchestration layer only.
+ * This file does not bypass authentication, permissions,
+ * allowlists, runtime checks, or WindowsAgent authentication.
  *
  * ============================================================
  */
@@ -89,37 +49,21 @@ const VERSION = "2.0.0";
 
 const STATUS = Object.freeze({
   COMPLETED: "completed",
-
   PROCESSING: "processing",
-
   FAILED: "failed",
-
-  NEEDS_CONFIRMATION:
-    "waiting_confirmation",
-
-  NEEDS_CLARIFICATION:
-    "needs_clarification",
-
+  NEEDS_CONFIRMATION: "waiting_confirmation",
+  NEEDS_CLARIFICATION: "needs_clarification",
   PLANNED: "planned",
-
-  UNAVAILABLE:
-    "capability_unavailable",
+  UNAVAILABLE: "capability_unavailable",
 });
 
 const ROUTES = Object.freeze({
   CHAT: "chat",
-
   MEMORY: "memory",
-
   TOOL: "tool",
-
   RESEARCH: "research",
-
   AUTONOMOUS: "autonomous",
-
-  CLARIFICATION:
-    "clarification",
-
+  CLARIFICATION: "clarification",
   UNKNOWN: "unknown",
 });
 
@@ -154,47 +98,27 @@ function getErrorMessage(error) {
   return (
     error?.message ||
     error?.reason ||
-    String(
-      error ||
-      "Unknown error"
-    )
+    String(error || "Unknown error")
   );
 }
 
-function hasMethod(
-  target,
-  method
-) {
+function hasMethod(target, method) {
   return Boolean(
     target &&
-    typeof target[method] ===
-      "function"
+    typeof target[method] === "function"
   );
 }
 
 function normalizeRole(value) {
-  return stringValue(value)
-    .toLowerCase();
+  return stringValue(value).toLowerCase();
 }
 
-function isOwnerContext(
-  context = {}
-) {
-  const user =
-    context?.user || {};
+function isOwnerContext(context = {}) {
+  const user = context?.user || {};
+  const owner = context?.owner || {};
 
-  const owner =
-    context?.owner || {};
-
-  const userRole =
-    normalizeRole(
-      user.role
-    );
-
-  const ownerRole =
-    normalizeRole(
-      owner.role
-    );
+  const userRole = normalizeRole(user.role);
+  const ownerRole = normalizeRole(owner.role);
 
   return (
     user.isOwner === true ||
@@ -208,28 +132,568 @@ function isOwnerContext(
   );
 }
 
-function getAccessMode(
-  context = {}
-) {
-  return isOwnerContext(
-    context
-  )
+function getAccessMode(context = {}) {
+  return isOwnerContext(context)
     ? "owner"
     : "user";
 }
 
-function normalizeSessionId(
-  sessionId
-) {
-  const value =
-    stringValue(
-      sessionId
-    );
+function normalizeSessionId(sessionId) {
+  const value = stringValue(sessionId);
 
   return (
     value ||
     `alex-session-${Date.now()}`
   );
+}
+
+// ============================================================
+// LIVE WEATHER HELPERS
+// Read-only public weather data from Open-Meteo.
+// Does not execute computer or owner-only actions.
+// ============================================================
+
+function isWeatherRequest(message) {
+  const text = stringValue(message);
+
+  if (!text) {
+    return false;
+  }
+
+  return (
+    /\bweather\b/i.test(text) ||
+    /\bforecast\b/i.test(text) ||
+    /\btemp(?:erature|ature)?\b/i.test(text) ||
+    /\bmausam\b/i.test(text) ||
+    /\btaapman\b/i.test(text) ||
+    /\btapman\b/i.test(text) ||
+    /\bhumidity\b/i.test(text) ||
+    /\brainfall\b/i.test(text) ||
+    /\bbarish\b/i.test(text) ||
+    /\bbaarish\b/i.test(text) ||
+    /तापमान|मौसम|बारिश|बरसात/.test(text)
+  );
+}
+
+function extractWeatherLocation(message) {
+  const text = stringValue(message);
+
+  /*
+   * Words that indicate the location phrase has ended.
+   */
+  const stopWords = new Set([
+    "ka",
+    "ki",
+    "ke",
+    "hai",
+    "hain",
+    "h",
+    "batao",
+    "btao",
+    "batana",
+    "bta",
+    "kitna",
+    "kitni",
+    "kya",
+    "abhi",
+    "aaj",
+    "kal",
+    "today",
+    "tomorrow",
+    "now",
+    "currently",
+    "right",
+    "please",
+    "weather",
+    "forecast",
+    "temperature",
+    "temp",
+    "tempature",
+    "humidity",
+    "rain",
+    "rainfall",
+    "mausam",
+    "tapman",
+    "taapman",
+    "barish",
+    "baarish",
+    "degree",
+    "degrees",
+    "celsius",
+    "fahrenheit",
+    "bta",
+    "dikhao",
+    "bata",
+    "kitne",
+    "kaisa",
+    "kaisi",
+    "kesa",
+    "kesi",
+    "me",
+    "mein",
+    "and",
+    "or",
+  ]);
+
+  /*
+   * Match common location phrases:
+   *   weather in Bhiwani
+   *   temperature at New Delhi
+   *   Haryana me Bhiwani ka temperature
+   *
+   * Using the last valid location phrase helps the
+   * "Haryana me Bhiwani..." format resolve to Bhiwani.
+   */
+  const pattern =
+    /(?:\bin\b|\bat\b|\bfor\b|\bme\b|\bmein\b)\s+([a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ'’-]*(?:\s+[a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ'’-]*){0,4})/gi;
+
+  let match;
+  let selectedLocation = "";
+
+  while ((match = pattern.exec(text)) !== null) {
+    const words = stringValue(match[1])
+      .split(/\s+/)
+      .filter(Boolean);
+
+    const locationWords = [];
+
+    for (const word of words) {
+      const normalized = word
+        .toLowerCase()
+        .replace(/[.,!?;:]+$/g, "");
+
+      if (
+        !normalized ||
+        stopWords.has(normalized)
+      ) {
+        break;
+      }
+
+      locationWords.push(word);
+    }
+
+    const candidate = locationWords
+      .join(" ")
+      .replace(/[.,!?;:]+$/g, "")
+      .trim();
+
+    if (candidate) {
+      selectedLocation = candidate;
+    }
+  }
+
+  /*
+   * Handle messages that mention a city without "in/me/at":
+   * "Bhiwani ka temperature batao".
+   */
+  if (!selectedLocation) {
+    const withoutWeatherWords = text
+      .replace(
+        /\b(what|whats|what's|is|the|weather|forecast|temperature|tempature|temp|humidity|rainfall|rain|today|tomorrow|now|currently|right|please|tell|me|batao|btao|batana|bta|kitna|kitni|kitne|ka|ki|ke|hai|hain|h|abhi|aaj|kaisa|kaisi|degree|degrees|celsius|fahrenheit|mausam|tapman|taapman|barish|baarish)\b/gi,
+        " "
+      )
+      .replace(/[?.,!;:]+/g, " ")
+      .trim();
+
+    const words = withoutWeatherWords
+      .split(/\s+/)
+      .filter(Boolean);
+
+    const knownStates = new Set([
+      "haryana",
+      "punjab",
+      "rajasthan",
+      "delhi",
+      "uttar",
+      "pradesh",
+      "himachal",
+      "uttarakhand",
+      "bihar",
+      "jharkhand",
+      "gujarat",
+      "maharashtra",
+      "goa",
+      "karnataka",
+      "kerala",
+      "tamil",
+      "nadu",
+      "telangana",
+      "andhra",
+      "odisha",
+      "assam",
+      "sikkim",
+      "manipur",
+      "mizoram",
+      "nagaland",
+      "tripura",
+      "meghalaya",
+      "arunachal",
+      "chhattisgarh",
+      "madhya",
+      "west",
+      "bengal",
+      "uttaranchal",
+    ]);
+
+    const filtered = words.filter(
+      (word) =>
+        !knownStates.has(
+          word.toLowerCase()
+        )
+    );
+
+    if (filtered.length > 0) {
+      selectedLocation = filtered
+        .slice(0, 3)
+        .join(" ");
+    }
+  }
+
+  return selectedLocation.trim();
+}
+
+function getWeatherDescription(code) {
+  const descriptions = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Depositing rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    56: "Light freezing drizzle",
+    57: "Dense freezing drizzle",
+    61: "Slight rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    66: "Light freezing rain",
+    67: "Heavy freezing rain",
+    71: "Slight snowfall",
+    73: "Moderate snowfall",
+    75: "Heavy snowfall",
+    77: "Snow grains",
+    80: "Slight rain showers",
+    81: "Moderate rain showers",
+    82: "Violent rain showers",
+    85: "Slight snow showers",
+    86: "Heavy snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with slight hail",
+    99: "Thunderstorm with heavy hail",
+  };
+
+  return descriptions[Number(code)] ||
+    "Weather condition unavailable";
+}
+
+async function fetchLiveWeather(location) {
+  const normalizedLocation =
+    stringValue(location);
+
+  if (!normalizedLocation) {
+    throw new Error(
+      "City or location is required."
+    );
+  }
+
+  if (typeof fetch !== "function") {
+    throw new Error(
+      "This Node.js runtime does not support fetch."
+    );
+  }
+
+  /*
+   * Step 1: Find coordinates using Open-Meteo geocoding.
+   */
+  const geocodingUrl = new URL(
+    "https://geocoding-api.open-meteo.com/v1/search"
+  );
+
+  geocodingUrl.searchParams.set(
+    "name",
+    normalizedLocation
+  );
+
+  geocodingUrl.searchParams.set(
+    "count",
+    "5"
+  );
+
+  geocodingUrl.searchParams.set(
+    "language",
+    "en"
+  );
+
+  geocodingUrl.searchParams.set(
+    "format",
+    "json"
+  );
+
+  const geocodingResponse = await fetch(
+    geocodingUrl.toString(),
+    {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+      signal: AbortSignal.timeout(12000),
+    }
+  );
+
+  if (!geocodingResponse.ok) {
+    throw new Error(
+      `Weather location lookup failed (HTTP ${geocodingResponse.status}).`
+    );
+  }
+
+  const geocodingData =
+    await geocodingResponse.json();
+
+  const results = Array.isArray(
+    geocodingData?.results
+  )
+    ? geocodingData.results
+    : [];
+
+  if (results.length === 0) {
+    throw new Error(
+      `Location "${normalizedLocation}" was not found. Please provide a city name.`
+    );
+  }
+
+  /*
+   * Prefer a result in India when multiple matches exist.
+   */
+  const place =
+    results.find(
+      (item) =>
+        stringValue(item?.country_code)
+          .toUpperCase() === "IN"
+    ) || results[0];
+
+  const latitude = Number(place.latitude);
+  const longitude = Number(place.longitude);
+
+  if (
+    !Number.isFinite(latitude) ||
+    !Number.isFinite(longitude)
+  ) {
+    throw new Error(
+      "The selected location has invalid coordinates."
+    );
+  }
+
+  /*
+   * Step 2: Fetch current conditions for the coordinates.
+   */
+  const forecastUrl = new URL(
+    "https://api.open-meteo.com/v1/forecast"
+  );
+
+  forecastUrl.searchParams.set(
+    "latitude",
+    String(latitude)
+  );
+
+  forecastUrl.searchParams.set(
+    "longitude",
+    String(longitude)
+  );
+
+  forecastUrl.searchParams.set(
+    "current",
+    [
+      "temperature_2m",
+      "relative_humidity_2m",
+      "apparent_temperature",
+      "is_day",
+      "precipitation",
+      "rain",
+      "weather_code",
+      "wind_speed_10m",
+      "wind_direction_10m",
+    ].join(",")
+  );
+
+  forecastUrl.searchParams.set(
+    "timezone",
+    "auto"
+  );
+
+  const forecastResponse = await fetch(
+    forecastUrl.toString(),
+    {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+      signal: AbortSignal.timeout(12000),
+    }
+  );
+
+  if (!forecastResponse.ok) {
+    throw new Error(
+      `Live weather service failed (HTTP ${forecastResponse.status}).`
+    );
+  }
+
+  const forecastData =
+    await forecastResponse.json();
+
+  const current =
+    objectValue(forecastData?.current);
+
+  if (
+    current.temperature_2m === undefined ||
+    current.temperature_2m === null
+  ) {
+    throw new Error(
+      "The weather service did not return a current temperature."
+    );
+  }
+
+  return {
+    location: {
+      name: stringValue(place.name),
+      region: stringValue(place.admin1),
+      country: stringValue(place.country),
+      latitude,
+      longitude,
+    },
+
+    current: {
+      temperatureC: Number(
+        current.temperature_2m
+      ),
+
+      feelsLikeC:
+        current.apparent_temperature === undefined
+          ? null
+          : Number(
+              current.apparent_temperature
+            ),
+
+      humidity:
+        current.relative_humidity_2m === undefined
+          ? null
+          : Number(
+              current.relative_humidity_2m
+            ),
+
+      isDay:
+        current.is_day === undefined
+          ? null
+          : Number(current.is_day) === 1,
+
+      precipitationMm:
+        current.precipitation === undefined
+          ? null
+          : Number(
+              current.precipitation
+            ),
+
+      rainMm:
+        current.rain === undefined
+          ? null
+          : Number(current.rain),
+
+      weatherCode:
+        current.weather_code === undefined
+          ? null
+          : Number(current.weather_code),
+
+      windSpeedKmh:
+        current.wind_speed_10m === undefined
+          ? null
+          : Number(
+              current.wind_speed_10m
+            ),
+
+      windDirection:
+        current.wind_direction_10m === undefined
+          ? null
+          : Number(
+              current.wind_direction_10m
+            ),
+
+      time: stringValue(
+        current.time
+      ),
+
+      timezone: stringValue(
+        forecastData?.timezone
+      ),
+    },
+  };
+}
+
+function formatLiveWeatherReply(weather) {
+  const location = weather.location;
+  const current = weather.current;
+
+  const placeName = [
+    location.name,
+    location.region,
+    location.country,
+  ]
+    .filter(Boolean)
+    .join(", ");
+
+  const lines = [
+    `🌦️ **${placeName} ka live weather**`,
+    "",
+    `🌡️ Temperature: ${current.temperatureC}°C`,
+  ];
+
+  if (current.feelsLikeC !== null) {
+    lines.push(
+      `🤔 Feels like: ${current.feelsLikeC}°C`
+    );
+  }
+
+  if (current.humidity !== null) {
+    lines.push(
+      `💧 Humidity: ${current.humidity}%`
+    );
+  }
+
+  if (current.weatherCode !== null) {
+    lines.push(
+      `☁️ Condition: ${getWeatherDescription(current.weatherCode)}`
+    );
+  }
+
+  if (current.windSpeedKmh !== null) {
+    lines.push(
+      `💨 Wind speed: ${current.windSpeedKmh} km/h`
+    );
+  }
+
+  if (current.precipitationMm !== null) {
+    lines.push(
+      `🌧️ Precipitation: ${current.precipitationMm} mm`
+    );
+  }
+
+  if (current.time) {
+    lines.push(
+      "",
+      `🕒 Weather data time: ${current.time}${
+        current.timezone
+          ? ` (${current.timezone})`
+          : ""
+      }`
+    );
+  }
+
+  lines.push(
+    "",
+    "_Source: Open-Meteo live weather API._"
+  );
+
+  return lines.join("\n");
 }
 
 // ============================================================
@@ -258,23 +722,14 @@ class AgentAssistantCore {
 
     this.stats = {
       total: 0,
-
       messages: 0,
-
       chat: 0,
-
       memory: 0,
-
       tools: 0,
-
       research: 0,
-
       autonomous: 0,
-
       clarification: 0,
-
       failures: 0,
-
       confirmations: 0,
     };
   }
@@ -285,25 +740,16 @@ class AgentAssistantCore {
 
   async ask({
     ownerId = null,
-
     ownerKey = null,
-
     sessionId = null,
-
     message = "",
-
     context = {},
-
     execute = true,
-
     confirmed = false,
-
     confirmationReason = "",
-
     useBrain = true,
   } = {}) {
     this.stats.total += 1;
-
     this.stats.messages += 1;
 
     const text =
@@ -313,9 +759,7 @@ class AgentAssistantCore {
       objectValue(context);
 
     const resolvedSession =
-      normalizeSessionId(
-        sessionId
-      );
+      normalizeSessionId(sessionId);
 
     // --------------------------------------------------------
     // EMPTY MESSAGE
@@ -326,19 +770,84 @@ class AgentAssistantCore {
 
       return {
         success: true,
-
-        status:
-          STATUS.NEEDS_CLARIFICATION,
-
-        route:
-          ROUTES.CLARIFICATION,
-
+        status: STATUS.NEEDS_CLARIFICATION,
+        route: ROUTES.CLARIFICATION,
         message:
           "ALEX ko message nahi mila. Batao kya karna hai.",
-
-        sessionId:
-          resolvedSession,
+        sessionId: resolvedSession,
       };
+    }
+
+    // --------------------------------------------------------
+    // LIVE WEATHER
+    // Read-only information; no owner action is performed.
+    // --------------------------------------------------------
+
+    if (isWeatherRequest(text)) {
+      const location =
+        extractWeatherLocation(text);
+
+      if (!location) {
+        this.stats.clarification += 1;
+
+        return {
+          success: true,
+          status: STATUS.NEEDS_CLARIFICATION,
+          route: ROUTES.CLARIFICATION,
+          sessionId: resolvedSession,
+          reply:
+            "Kis city ka live weather chahiye? City ka naam batao, jaise: Bhiwani ka temperature abhi kitna hai?",
+          message:
+            "Please provide a city or location for the weather report.",
+        };
+      }
+
+      try {
+        const weather =
+          await fetchLiveWeather(location);
+
+        const reply =
+          formatLiveWeatherReply(weather);
+
+        const weatherResult = {
+          success: true,
+          status: STATUS.COMPLETED,
+          route: ROUTES.CHAT,
+          sessionId: resolvedSession,
+          reply,
+          message: reply,
+          result: {
+            type: "live_weather",
+            provider: "Open-Meteo",
+            data: weather,
+          },
+        };
+
+        this._recordResult(
+          weatherResult
+        );
+
+        return weatherResult;
+      } catch (error) {
+        this.stats.failures += 1;
+
+        console.error(
+          "[ALEX] Live weather request failed:",
+          error?.message || error
+        );
+
+        return {
+          success: false,
+          status: STATUS.FAILED,
+          route: ROUTES.CHAT,
+          sessionId: resolvedSession,
+          reply:
+            "Abhi live weather data fetch nahi ho paaya. Network ya weather service unavailable ho sakti hai. Thodi der baad dobara try karo.",
+          message:
+            "Live weather data could not be fetched.",
+          error: getErrorMessage(error),
+        };
+      }
     }
 
     // --------------------------------------------------------
@@ -346,9 +855,7 @@ class AgentAssistantCore {
     // --------------------------------------------------------
 
     const accessMode =
-      getAccessMode(
-        safeContext
-      );
+      getAccessMode(safeContext);
 
     // --------------------------------------------------------
     // BUILD SAFE CONTEXT
@@ -360,9 +867,7 @@ class AgentAssistantCore {
       accessMode,
 
       isOwner:
-        isOwnerContext(
-          safeContext
-        ),
+        isOwnerContext(safeContext),
 
       sessionId:
         resolvedSession,
@@ -374,17 +879,13 @@ class AgentAssistantCore {
     /*
      * ConversationGateway is the primary path.
      *
-     * Isse:
-     *
-     *   USER
-     *     ↓
-     *   CORE
-     *     ↓
-     *   GATEWAY
-     *     ↓
-     *   GOAL ROUTER
-     *
-     * architecture consistent rehta hai.
+     * USER
+     *   ↓
+     * CORE
+     *   ↓
+     * GATEWAY
+     *   ↓
+     * GOAL ROUTER
      */
 
     if (
@@ -397,7 +898,6 @@ class AgentAssistantCore {
         const result =
           await this.conversation.handleMessage({
             ownerId,
-
             ownerKey,
 
             sessionId:
@@ -424,9 +924,7 @@ class AgentAssistantCore {
               useBrain !== false,
           });
 
-        this._recordResult(
-          result
-        );
+        this._recordResult(result);
 
         return {
           success:
@@ -476,26 +974,15 @@ class AgentAssistantCore {
 
         console.error(
           "[ALEX] Conversation gateway failed:",
-          error?.message ||
-            error
+          error?.message || error
         );
 
         return {
           success: false,
-
-          status:
-            STATUS.FAILED,
-
-          route:
-            ROUTES.UNKNOWN,
-
-          sessionId:
-            resolvedSession,
-
-          error:
-            getErrorMessage(
-              error
-            ),
+          status: STATUS.FAILED,
+          route: ROUTES.UNKNOWN,
+          sessionId: resolvedSession,
+          error: getErrorMessage(error),
         };
       }
     }
@@ -503,26 +990,14 @@ class AgentAssistantCore {
     // --------------------------------------------------------
     // SAFETY FALLBACK
     // --------------------------------------------------------
-    //
-    // Gateway unavailable ho to ALEX fake success nahi
-    // batayega.
-    //
-    // --------------------------------------------------------
 
     this.stats.failures += 1;
 
     return {
       success: false,
-
-      status:
-        STATUS.UNAVAILABLE,
-
-      route:
-        ROUTES.UNKNOWN,
-
-      sessionId:
-        resolvedSession,
-
+      status: STATUS.UNAVAILABLE,
+      route: ROUTES.UNKNOWN,
+      sessionId: resolvedSession,
       error:
         "ALEX conversation gateway is unavailable.",
     };
@@ -534,13 +1009,9 @@ class AgentAssistantCore {
 
   async plan({
     ownerId = null,
-
     ownerKey = null,
-
     sessionId = null,
-
     message = "",
-
     context = {},
   } = {}) {
     const text =
@@ -549,15 +1020,9 @@ class AgentAssistantCore {
     if (!text) {
       return {
         success: false,
-
-        status:
-          STATUS.NEEDS_CLARIFICATION,
-
-        route:
-          ROUTES.CLARIFICATION,
-
-        error:
-          "Message is required.",
+        status: STATUS.NEEDS_CLARIFICATION,
+        route: ROUTES.CLARIFICATION,
+        error: "Message is required.",
       };
     }
 
@@ -569,25 +1034,19 @@ class AgentAssistantCore {
     ) {
       return {
         success: false,
-
-        status:
-          STATUS.UNAVAILABLE,
-
+        status: STATUS.UNAVAILABLE,
         error:
           "AgentGoalRouter is unavailable.",
       };
     }
 
     const resolvedSession =
-      normalizeSessionId(
-        sessionId
-      );
+      normalizeSessionId(sessionId);
 
     try {
       const result =
         await this.goalRouter.route({
           ownerId,
-
           ownerKey,
 
           sessionId:
@@ -643,14 +1102,8 @@ class AgentAssistantCore {
 
       return {
         success: false,
-
-        status:
-          STATUS.FAILED,
-
-        error:
-          getErrorMessage(
-            error
-          ),
+        status: STATUS.FAILED,
+        error: getErrorMessage(error),
       };
     }
   }
@@ -661,7 +1114,6 @@ class AgentAssistantCore {
 
   async inspect({
     message = "",
-
     context = {},
   } = {}) {
     const text =
@@ -670,12 +1122,8 @@ class AgentAssistantCore {
     if (!text) {
       return {
         success: false,
-
-        status:
-          STATUS.NEEDS_CLARIFICATION,
-
-        error:
-          "Message is required.",
+        status: STATUS.NEEDS_CLARIFICATION,
+        error: "Message is required.",
       };
     }
 
@@ -690,21 +1138,16 @@ class AgentAssistantCore {
     ) {
       try {
         return await this.goalRouter.inspect({
-          message:
-            text,
+          message: text,
 
           context: {
             ...safeContext,
 
             accessMode:
-              getAccessMode(
-                safeContext
-              ),
+              getAccessMode(safeContext),
 
             isOwner:
-              isOwnerContext(
-                safeContext
-              ),
+              isOwnerContext(safeContext),
           },
         });
       } catch (error) {
@@ -712,24 +1155,15 @@ class AgentAssistantCore {
 
         return {
           success: false,
-
-          status:
-            STATUS.FAILED,
-
-          error:
-            getErrorMessage(
-              error
-            ),
+          status: STATUS.FAILED,
+          error: getErrorMessage(error),
         };
       }
     }
 
     return this.plan({
-      message:
-        text,
-
-      context:
-        safeContext,
+      message: text,
+      context: safeContext,
     });
   }
 
@@ -739,11 +1173,8 @@ class AgentAssistantCore {
 
   async research({
     question = "",
-
     urls = [],
-
     discover = false,
-
     options = {},
   } = {}) {
     if (
@@ -754,22 +1185,15 @@ class AgentAssistantCore {
     ) {
       return {
         success: false,
-
-        status:
-          STATUS.UNAVAILABLE,
-
-        route:
-          ROUTES.RESEARCH,
-
+        status: STATUS.UNAVAILABLE,
+        route: ROUTES.RESEARCH,
         error:
           "Research capability is unavailable.",
       };
     }
 
     const normalizedQuestion =
-      stringValue(
-        question
-      );
+      stringValue(question);
 
     if (
       !normalizedQuestion &&
@@ -778,13 +1202,8 @@ class AgentAssistantCore {
     ) {
       return {
         success: false,
-
-        status:
-          STATUS.NEEDS_CLARIFICATION,
-
-        route:
-          ROUTES.RESEARCH,
-
+        status: STATUS.NEEDS_CLARIFICATION,
+        route: ROUTES.RESEARCH,
         error:
           "Research question or URL is required.",
       };
@@ -805,14 +1224,10 @@ class AgentAssistantCore {
             discover === true,
 
           options:
-            objectValue(
-              options
-            ),
+            objectValue(options),
         });
 
-      this._recordResult(
-        result
-      );
+      this._recordResult(result);
 
       return result;
     } catch (error) {
@@ -820,17 +1235,9 @@ class AgentAssistantCore {
 
       return {
         success: false,
-
-        status:
-          STATUS.FAILED,
-
-        route:
-          ROUTES.RESEARCH,
-
-        error:
-          getErrorMessage(
-            error
-          ),
+        status: STATUS.FAILED,
+        route: ROUTES.RESEARCH,
+        error: getErrorMessage(error),
       };
     }
   }
@@ -841,15 +1248,10 @@ class AgentAssistantCore {
 
   async runTask({
     goal = "",
-
     ownerId = null,
-
     sessionId = null,
-
     metadata = {},
-
     confirmations = {},
-
     stopOnFailure = true,
   } = {}) {
     if (
@@ -860,33 +1262,21 @@ class AgentAssistantCore {
     ) {
       return {
         success: false,
-
-        status:
-          STATUS.UNAVAILABLE,
-
-        route:
-          ROUTES.AUTONOMOUS,
-
+        status: STATUS.UNAVAILABLE,
+        route: ROUTES.AUTONOMOUS,
         error:
           "Autonomous capability is unavailable.",
       };
     }
 
     const normalizedGoal =
-      stringValue(
-        goal
-      );
+      stringValue(goal);
 
     if (!normalizedGoal) {
       return {
         success: false,
-
-        status:
-          STATUS.NEEDS_CLARIFICATION,
-
-        route:
-          ROUTES.AUTONOMOUS,
-
+        status: STATUS.NEEDS_CLARIFICATION,
+        route: ROUTES.AUTONOMOUS,
         error:
           "Autonomous task goal is required.",
       };
@@ -895,33 +1285,23 @@ class AgentAssistantCore {
     try {
       const result =
         await this.capabilityHub.runAutonomous({
-          goal:
-            normalizedGoal,
-
+          goal: normalizedGoal,
           ownerId,
 
           sessionId:
-            normalizeSessionId(
-              sessionId
-            ),
+            normalizeSessionId(sessionId),
 
           metadata:
-            objectValue(
-              metadata
-            ),
+            objectValue(metadata),
 
           confirmations:
-            objectValue(
-              confirmations
-            ),
+            objectValue(confirmations),
 
           stopOnFailure:
             stopOnFailure !== false,
         });
 
-      this._recordResult(
-        result
-      );
+      this._recordResult(result);
 
       return result;
     } catch (error) {
@@ -929,17 +1309,9 @@ class AgentAssistantCore {
 
       return {
         success: false,
-
-        status:
-          STATUS.FAILED,
-
-        route:
-          ROUTES.AUTONOMOUS,
-
-        error:
-          getErrorMessage(
-            error
-          ),
+        status: STATUS.FAILED,
+        route: ROUTES.AUTONOMOUS,
+        error: getErrorMessage(error),
       };
     }
   }
@@ -950,21 +1322,13 @@ class AgentAssistantCore {
 
   async computer({
     ownerId = null,
-
     sessionId = null,
-
     goal = "",
-
     agentToken = "",
-
     tool = "",
-
     args = {},
-
     confirmed = false,
-
     confirmationReason = "",
-
     metadata = {},
   } = {}) {
     if (
@@ -975,13 +1339,8 @@ class AgentAssistantCore {
     ) {
       return {
         success: false,
-
-        status:
-          STATUS.UNAVAILABLE,
-
-        route:
-          ROUTES.TOOL,
-
+        status: STATUS.UNAVAILABLE,
+        route: ROUTES.TOOL,
         error:
           "Computer capability is unavailable.",
       };
@@ -993,13 +1352,8 @@ class AgentAssistantCore {
     if (!normalizedTool) {
       return {
         success: false,
-
-        status:
-          STATUS.NEEDS_CLARIFICATION,
-
-        route:
-          ROUTES.TOOL,
-
+        status: STATUS.NEEDS_CLARIFICATION,
+        route: ROUTES.TOOL,
         error:
           "Computer tool is required.",
       };
@@ -1011,45 +1365,31 @@ class AgentAssistantCore {
           ownerId,
 
           sessionId:
-            normalizeSessionId(
-              sessionId
-            ),
+            normalizeSessionId(sessionId),
 
           goal:
-            stringValue(
-              goal
-            ),
+            stringValue(goal),
 
           agentToken:
-            stringValue(
-              agentToken
-            ),
+            stringValue(agentToken),
 
           tool:
             normalizedTool,
 
           args:
-            objectValue(
-              args
-            ),
+            objectValue(args),
 
           confirmed:
             confirmed === true,
 
           confirmationReason:
-            stringValue(
-              confirmationReason
-            ),
+            stringValue(confirmationReason),
 
           metadata:
-            objectValue(
-              metadata
-            ),
+            objectValue(metadata),
         });
 
-      this._recordResult(
-        result
-      );
+      this._recordResult(result);
 
       return result;
     } catch (error) {
@@ -1057,17 +1397,9 @@ class AgentAssistantCore {
 
       return {
         success: false,
-
-        status:
-          STATUS.FAILED,
-
-        route:
-          ROUTES.TOOL,
-
-        error:
-          getErrorMessage(
-            error
-          ),
+        status: STATUS.FAILED,
+        route: ROUTES.TOOL,
+        error: getErrorMessage(error),
       };
     }
   }
@@ -1089,8 +1421,7 @@ class AgentAssistantCore {
       } catch (error) {
         console.warn(
           "[ALEX] Capability discovery failed:",
-          error?.message ||
-            error
+          error?.message || error
         );
 
         return [];
@@ -1114,45 +1445,27 @@ class AgentAssistantCore {
           item?.available === true
       ).length;
 
-    let status =
-      "unavailable";
+    let status = "unavailable";
 
     if (
       capabilities.length > 0 &&
-      available ===
-        capabilities.length
+      available === capabilities.length
     ) {
       status = "healthy";
-    } else if (
-      available > 0
-    ) {
+    } else if (available > 0) {
       status = "degraded";
     }
 
     return {
       success: true,
-
       status,
-
-      name:
-        this.name,
-
-      version:
-        this.version,
-
+      name: this.name,
+      version: this.version,
       capabilities,
-
-      availableCapabilities:
-        available,
-
-      totalCapabilities:
-        capabilities.length,
-
-      stats:
-        this.getStats(),
-
-      timestamp:
-        new Date().toISOString(),
+      availableCapabilities: available,
+      totalCapabilities: capabilities.length,
+      stats: this.getStats(),
+      timestamp: new Date().toISOString(),
     };
   }
 
@@ -1162,9 +1475,7 @@ class AgentAssistantCore {
 
   _recordResult(result) {
     const route =
-      stringValue(
-        result?.route
-      ).toLowerCase();
+      stringValue(result?.route).toLowerCase();
 
     switch (route) {
       case ROUTES.CHAT:
@@ -1202,9 +1513,7 @@ class AgentAssistantCore {
       this.stats.confirmations += 1;
     }
 
-    if (
-      result?.success === false
-    ) {
+    if (result?.success === false) {
       this.stats.failures += 1;
     }
   }
@@ -1212,32 +1521,21 @@ class AgentAssistantCore {
   getStats() {
     return {
       ...this.stats,
-
-      version:
-        this.version,
+      version: this.version,
     };
   }
 
   resetStats() {
     this.stats = {
       total: 0,
-
       messages: 0,
-
       chat: 0,
-
       memory: 0,
-
       tools: 0,
-
       research: 0,
-
       autonomous: 0,
-
       clarification: 0,
-
       failures: 0,
-
       confirmations: 0,
     };
 
@@ -1251,28 +1549,13 @@ class AgentAssistantCore {
   getInfo() {
     return {
       success: true,
-
-      name:
-        this.name,
-
-      version:
-        this.version,
+      name: this.name,
+      version: this.version,
 
       architecture: {
-        conversation:
-          Boolean(
-            this.conversation
-          ),
-
-        goalRouter:
-          Boolean(
-            this.goalRouter
-          ),
-
-        capabilityHub:
-          Boolean(
-            this.capabilityHub
-          ),
+        conversation: Boolean(this.conversation),
+        goalRouter: Boolean(this.goalRouter),
+        capabilityHub: Boolean(this.capabilityHub),
       },
 
       routes: {
@@ -1297,22 +1580,14 @@ class AgentAssistantCore {
 
 let singleton = null;
 
-function createAgentAssistantCore(
-  options = {}
-) {
-  return new AgentAssistantCore(
-    options
-  );
+function createAgentAssistantCore(options = {}) {
+  return new AgentAssistantCore(options);
 }
 
-function getAgentAssistantCore(
-  options = {}
-) {
+function getAgentAssistantCore(options = {}) {
   if (!singleton) {
     singleton =
-      createAgentAssistantCore(
-        options
-      );
+      createAgentAssistantCore(options);
   }
 
   return singleton;
@@ -1322,17 +1597,12 @@ function resetAgentAssistantCore() {
   singleton = null;
 }
 
-function isAgentAssistantCore(
-  value
-) {
+function isAgentAssistantCore(value) {
   return Boolean(
     value &&
-    typeof value.ask ===
-      "function" &&
-    typeof value.plan ===
-      "function" &&
-    typeof value.inspect ===
-      "function"
+    typeof value.ask === "function" &&
+    typeof value.plan === "function" &&
+    typeof value.inspect === "function"
   );
 }
 
@@ -1342,18 +1612,11 @@ function isAgentAssistantCore(
 
 module.exports = {
   VERSION,
-
   STATUS,
-
   ROUTES,
-
   AgentAssistantCore,
-
   createAgentAssistantCore,
-
   getAgentAssistantCore,
-
   resetAgentAssistantCore,
-
   isAgentAssistantCore,
 };
