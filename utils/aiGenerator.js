@@ -22,7 +22,25 @@ require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const { keyManager, envStatus } = require("../config/geminiKeys");
-const { geminiGenerate } = require("../config/geminiClient");
+const geminiClientModule = require("../config/geminiClient");
+
+let geminiGenerate = geminiClientModule.geminiGenerate;
+let getAlexGeminiClient = geminiClientModule.getAlexGeminiClient;
+
+// Fallback: ALEX client alag file mein ho sakta hai.
+if (
+  typeof geminiGenerate !== "function" &&
+  typeof getAlexGeminiClient !== "function"
+) {
+  try {
+    const alexModule = require("../config/alexGeminiClient");
+
+    geminiGenerate = alexModule.geminiGenerate;
+    getAlexGeminiClient = alexModule.getAlexGeminiClient;
+  } catch {
+    // Neeche callGemini mein clear error milega.
+  }
+}
 
 const MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
@@ -81,8 +99,49 @@ function clearCache(category, difficulty) {
 
 // ================= GEMINI CALL =================
 async function callGemini(prompt, timeoutMs = 60000) {
-  const text = await geminiGenerate(prompt, timeoutMs);
-  return text;
+  if (typeof geminiGenerate === "function") {
+    const result = await geminiGenerate(prompt, timeoutMs);
+
+    if (typeof result === "string" && result.trim()) {
+      return result;
+    }
+
+    if (result && typeof result.text === "string" && result.text.trim()) {
+      return result.text;
+    }
+
+    throw new Error("Gemini client ne empty response diya");
+  }
+
+  if (typeof getAlexGeminiClient === "function") {
+    const client = getAlexGeminiClient();
+
+    if (!client || typeof client.call !== "function") {
+      throw new Error("ALEX Gemini client ka call() method nahi mila");
+    }
+
+    const result = await client.call(prompt, {
+      timeoutMs,
+      maxOutputTokens: 8192,
+      responseMimeType: "application/json",
+    });
+
+    if (result?.error) {
+      throw new Error(
+        result.message || "Gemini request fail hui"
+      );
+    }
+
+    if (typeof result?.text === "string" && result.text.trim()) {
+      return result.text;
+    }
+
+    throw new Error("Gemini client ne empty response diya");
+  }
+
+  throw new Error(
+    "Gemini client export mismatch: geminiGenerate() ya getAlexGeminiClient() nahi mila"
+  );
 }
 
 // ---------- JSON PARSING ----------
