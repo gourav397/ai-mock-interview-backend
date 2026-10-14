@@ -22,7 +22,16 @@ class AlexGeminiClient {
       errors: 0,
     }));
 
-    this.model = config.ai?.model || "gemini-3.5-flash";
+    const configuredModel =
+      process.env.ALEX_GEMINI_MODEL ||
+      process.env.GEMINI_MODEL ||
+      config.ai?.model ||
+      "gemini-3.8-flash";
+
+    this.model =
+      /^(gemini-3\.5-flash|gemini-3\.7-flash)$/i.test(configuredModel)
+        ? "gemini-3.8-flash"
+        : configuredModel;
     this.lastError = null;
     this.available = this.keys.length > 0;
     this.keyIdx = 0;
@@ -108,12 +117,32 @@ class AlexGeminiClient {
       temperature = 0.3,
       timeoutMs = 45000,
       maxOutputTokens = 2048,
+      responseMimeType,
+      chatMode = false,
+      model,
     } = options;
 
-    const maxRetries = 5;
+    const modelCandidates = [
+      ...new Set([
+        model || this.model,
+        "gemini-3.8-flash",
+        "gemini-3.5-flash-lite",
+      ]),
+    ];
+
+    const maxRetries = chatMode
+      ? modelCandidates.length
+      : Math.max(5, modelCandidates.length);
     let lastError = null;
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
+      const requestModel =
+        modelCandidates[Math.min(attempt, modelCandidates.length - 1)];
+
+      console.log(
+        `🤖 [ALEX] Gemini attempt ${attempt + 1}/${maxRetries} | model: ${requestModel}`
+      );
+
       const keyIdx = this._getReadyKey();
 
       if (keyIdx === -1) {
@@ -151,7 +180,7 @@ class AlexGeminiClient {
       try {
         const url =
           `https://generativelanguage.googleapis.com/v1beta/models/` +
-          `${this.model}:generateContent`;
+          `${requestModel}:generateContent`;
 
         const requestBody = {
           contents: [
@@ -167,7 +196,11 @@ class AlexGeminiClient {
             temperature,
             topP: 0.95,
             maxOutputTokens,
-            responseMimeType: "application/json",
+            ...(responseMimeType
+              ? { responseMimeType }
+              : chatMode
+                ? {}
+                : { responseMimeType: "application/json" }),
           },
         };
 
