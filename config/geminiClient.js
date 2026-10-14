@@ -3,11 +3,10 @@
 // Uses centralized geminiKeys.js for key rotation/state
 //
 // IMPORTANT:
-// - Gemini 3.8 compatible request
-// - No deprecated temperature/topP sampling params
+// - Gemini model fallback
 // - Automatic API-key rotation
 // - Automatic retry / backoff
-// - Handles 429 / 401 / 403 / 5xx / timeout / network errors
+// - Handles 429 / 401 / 403 / 404 / 5xx / timeout / network errors
 // - Preserves centralized keyManager state
 // ============================================================
 
@@ -84,44 +83,37 @@ class AlexGeminiClient {
     return base + jitter;
   }
 
-   _getMaxAttempts(chatMode, options) {
+  _getMaxAttempts(chatMode, options) {
     const keyCount = Math.max(
       1,
       Number(keyManager.count) || 1
     );
 
     /*
-     * IMPORTANT:
-     *
      * options.retries caller ki retry preference hai.
      * Ye available Gemini keys ki total attempts
      * ko kam nahi karega.
      *
      * Example:
-     *
      * 15 Gemini keys + retries: 4
-     *        ↓
-     * ALEX can still use up to 15 attempts.
-     *
-     * Isse AgentGoalRouter ka retries: 4
-     * accidentally 4 total attempts nahi banega.
+     * ALEX can still use up to 15 attempts
      */
 
-    
-if (chatMode) {
-  const requestedRetries =
-    typeof options.retries === "number"
-      ? Math.max(0, Math.floor(options.retries))
-      : 2;
+    if (chatMode) {
+      const requestedRetries =
+        typeof options.retries === "number"
+          ? Math.max(
+              0,
+              Math.floor(options.retries)
+            )
+          : 2;
 
-  // Normal chat: maximum 3 attempts.
-  // Retries cannot make a chat request run indefinitely.
-  return Math.min(
-    3,
-    Math.max(1, requestedRetries + 1)
-  );
-}
-
+      // Normal chat: maximum 3 attempts.
+      return Math.min(
+        3,
+        Math.max(1, requestedRetries + 1)
+      );
+    }
 
     const requestedRetries =
       typeof options.retries === "number"
@@ -143,11 +135,8 @@ if (chatMode) {
     responseMimeType,
   }) {
     /*
-     * Gemini 3.8:
-     * Do NOT send deprecated sampling parameters
-     * such as temperature/topP/topK.
-     *
-     * Keep only supported output controls.
+     * Keep the generation configuration compatible
+     * with the selected Gemini model.
      */
     const config = {
       maxOutputTokens,
@@ -207,6 +196,24 @@ if (chatMode) {
       options.model ||
       this.model;
 
+    /*
+     * Model fallback order:
+     * 1. Model requested by caller or environment
+     * 2. gemini-3.6-flash
+     * 3. gemini-3.5-flash-lite
+     *
+     * Duplicate model names are removed.
+     */
+    const modelCandidates = [
+      ...new Set(
+        [
+          model,
+          "gemini-3.6-flash",
+          "gemini-3.5-flash-lite",
+        ].filter(Boolean)
+      ),
+    ];
+
     const safePrompt =
       String(prompt || "").trim();
 
@@ -235,11 +242,39 @@ if (chatMode) {
 
     let consecutiveNoKeyAttempts = 0;
 
+    const failedModels = new Set();
+
     for (
       let attempt = 0;
       attempt < maxAttempts;
       attempt++
     ) {
+      /*
+       * Select a model for this attempt.
+       * If a model returns 404, the next attempt
+       * will try another configured candidate.
+       */
+      const availableModels =
+        modelCandidates.filter(
+          (candidate) =>
+            !failedModels.has(candidate)
+        );
+
+      if (availableModels.length === 0) {
+        lastError =
+          lastError ||
+          new Error(
+            "All configured Gemini models failed"
+          );
+
+        break;
+      }
+
+      const requestModel =
+        availableModels[
+          attempt % availableModels.length
+        ];
+
       let keyObj = null;
 
       try {
@@ -313,7 +348,7 @@ if (chatMode) {
       try {
         const url =
           `https://generativelanguage.googleapis.com/v1beta/models/` +
-          `${encodeURIComponent(model)}:generateContent`;
+          `${encodeURIComponent(requestModel)}:generateContent`;
 
         const body = {
           contents: [
@@ -337,7 +372,7 @@ if (chatMode) {
         console.log(
           `🤖 [ALEX] Gemini request — attempt ${
             attempt + 1
-          }/${maxAttempts} | model: ${model} | key #${
+          }/${maxAttempts} | model: ${requestModel} | key #${
             keyObj.index + 1
           }`
         );
@@ -422,7 +457,7 @@ if (chatMode) {
             }
 
             console.log(
-              `✅ [ALEX] Gemini response received — ${text.length} chars`
+              `✅ [ALEX] Gemini response received — model: ${requestModel} | ${text.length} chars`
             );
 
             return {
@@ -449,7 +484,7 @@ if (chatMode) {
             );
 
           console.log(
-            `⚠️ [ALEX] Gemini returned no usable text — attempt ${
+            `⚠️ [ALEX] Gemini returned no usable text — model: ${requestModel} — attempt ${
               attempt + 1
             }/${maxAttempts}`
           );
@@ -463,10 +498,6 @@ if (chatMode) {
             // Ignore key-manager reporting failure.
           }
 
-          /*
-           * Try another key/request rather than
-           * returning an error immediately.
-           */
           if (
             attempt <
             maxAttempts - 1
@@ -495,7 +526,7 @@ if (chatMode) {
             );
 
           console.log(
-            `⏸️ [ALEX] Gemini 429 — key #${
+            `⏸️ [ALEX] Gemini 429 — model: ${requestModel} — key #${
               keyObj.index + 1
             } — ${
               isDaily
@@ -570,9 +601,7 @@ if (chatMode) {
               `Gemini API key rejected (${res.status})`
             );
 
-          /*
-           * Immediately rotate to another key.
-           */
+          // Immediately rotate to another key.
           continue;
         }
 
@@ -582,8 +611,10 @@ if (chatMode) {
 
         if (res.status === 404) {
           console.log(
-            `⚠️ [ALEX] Gemini model not found: ${model}`
+            `⚠️ [ALEX] Gemini model not found: ${requestModel}; trying fallback model if available`
           );
+
+          failedModels.add(requestModel);
 
           try {
             keyManager.reportFailure(
@@ -596,14 +627,36 @@ if (chatMode) {
 
           lastError =
             new Error(
-              `Gemini model "${model}" not found`
+              `Gemini model "${requestModel}" not found`
             );
 
-          /*
-           * Rotating API keys cannot fix a missing
-           * model. Stop this attempt cleanly.
-           */
-          break;
+          const remainingModels =
+            modelCandidates.filter(
+              (candidateModel) =>
+                !failedModels.has(
+                  candidateModel
+                )
+            );
+
+          if (
+            remainingModels.length > 0 &&
+            attempt < maxAttempts - 1
+          ) {
+            // Move to the next available model.
+            continue;
+          }
+
+          if (
+            remainingModels.length === 0
+          ) {
+            console.log(
+              "❌ [ALEX] All fallback Gemini models returned 404"
+            );
+
+            break;
+          }
+
+          continue;
         }
 
         // ====================================================
@@ -614,7 +667,7 @@ if (chatMode) {
           console.log(
             `🔴 [ALEX] Gemini server error ${
               res.status
-            } — attempt ${
+            } — model: ${requestModel} — attempt ${
               attempt + 1
             }/${maxAttempts}`
           );
@@ -628,9 +681,17 @@ if (chatMode) {
             // Ignore key-manager reporting failure.
           }
 
+          const providerMessage =
+            responseBody?.error?.message ||
+            responseText.slice(0, 300);
+
           lastError =
             new Error(
-              `Gemini HTTP ${res.status}`
+              `Gemini HTTP ${res.status}${
+                providerMessage
+                  ? `: ${providerMessage}`
+                  : ""
+              }`
             );
 
           if (
@@ -662,7 +723,7 @@ if (chatMode) {
           `Gemini HTTP ${res.status}`;
 
         console.log(
-          `⚠️ [ALEX] Gemini HTTP ${res.status} — rotating/retrying`
+          `⚠️ [ALEX] Gemini HTTP ${res.status} — model: ${requestModel} — rotating/retrying`
         );
 
         lastError =
@@ -706,7 +767,7 @@ if (chatMode) {
           "AbortError"
         ) {
           console.log(
-            `⏱️ [ALEX] Gemini timeout (${timeoutMs}ms) — attempt ${
+            `⏱️ [ALEX] Gemini timeout (${timeoutMs}ms) — model: ${requestModel} — attempt ${
               attempt + 1
             }/${maxAttempts}`
           );
@@ -739,9 +800,9 @@ if (chatMode) {
         // ====================================================
 
         console.log(
-          `🔴 [ALEX] Gemini network error — attempt ${
+          `🔴 [ALEX] Gemini network error — model: ${requestModel} — attempt ${
             attempt + 1
-          }/${maxAttempts}`
+          }/${maxAttempts}: ${error?.message || "unknown error"}`
         );
 
         try {
