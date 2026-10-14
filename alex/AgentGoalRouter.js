@@ -1400,60 +1400,178 @@ Now answer the user's message directly.
   // HEALTH CHECK
   // ==========================================================
 
-  async _handleHealth({
-    sessionId,
-    intent,
-  }) {
-    try {
-      const runtime =
-        this.runtime ||
-        getAgentRuntime();
+ 
+async _handleHealth({ sessionId, intent }) {
+  const timestamp = new Date().toISOString();
+  const checks = [];
 
-      if (
-        !runtime ||
-        typeof runtime.health !==
-          "function"
-      ) {
-        return {
-          success: false,
-          route: ROUTE.TOOL,
-          status: "failed",
-          intent,
-          sessionId,
-          error:
-            "Agent Runtime health capability unavailable.",
-        };
-      }
+  const addCheck = (name, status, details) => {
+    checks.push({ name, status, details });
+  };
 
-      const health =
-        await runtime.health();
+  // 1. Backend process
+  addCheck(
+    "Backend process",
+    typeof process !== "undefined" ? "PASS" : "FAIL",
+    "Diagnostic handler is executing."
+  );
 
-      return {
-        success:
-          health?.success !== false,
-        route: ROUTE.TOOL,
-        status:
-          health?.success === false
-            ? "failed"
-            : "completed",
-        intent,
-        sessionId,
-        result: health,
-      };
+  // 2. Runtime components
+  let runtimeReport = null;
 
-    } catch (error) {
-      return {
-        success: false,
-        route: ROUTE.TOOL,
-        status: "failed",
-        intent,
-        sessionId,
-        error:
-          error?.message ||
-          String(error),
-      };
-    }
+  try {
+   
+const runtimeInstance =
+  this.runtime || getAgentRuntime();
+
+if (
+  !runtimeInstance ||
+  typeof runtimeInstance.health !== "function"
+) {
+  throw new Error(
+    "Agent runtime health method is unavailable."
+  );
+}
+
+runtimeReport = await runtimeInstance.health();
+
+
+    const components = runtimeReport?.components || {};
+    const entries = Object.entries(components);
+    const allPresent =
+      entries.length > 0 &&
+      entries.every(([, available]) => available === true);
+
+    addCheck(
+      "Agent runtime components",
+      allPresent ? "PASS" : "FAIL",
+      entries.length
+        ? entries
+            .map(([name, available]) =>
+              `${name}: ${available === true ? "present" : "missing"}`
+            )
+            .join(", ")
+        : "Runtime did not return component details."
+    );
+  } catch (error) {
+    addCheck(
+      "Agent runtime components",
+      "FAIL",
+      error?.message || String(error)
+    );
   }
+
+  // 3. Database connection (read-only state inspection)
+  try {
+    const mongoose = require("mongoose");
+    const state = mongoose.connection?.readyState;
+    const stateNames = {
+      0: "disconnected",
+      1: "connected",
+      2: "connecting",
+      3: "disconnecting"
+    };
+
+    if (state === 1) {
+      addCheck("Database connection", "PASS", "Mongoose reports connected.");
+    } else if (state === undefined) {
+      addCheck("Database connection", "NOT CHECKED", "Connection state unavailable.");
+    } else {
+      addCheck(
+        "Database connection",
+        process.env.MONGODB_URI ? "FAIL" : "NOT CHECKED",
+        `Mongoose state: ${stateNames[state] || state}.`
+      );
+    }
+  } catch (error) {
+    addCheck(
+      "Database connection",
+      "NOT CHECKED",
+      `Could not inspect database state: ${error?.message || String(error)}`
+    );
+  }
+
+  // 4. Gemini: configuration only, not a live API test
+  const hasGeminiKey = Boolean(
+    process.env.GEMINI_API_KEYS ||
+    process.env.GEMINI_API_KEY
+  );
+
+  addCheck(
+    "Gemini configuration",
+    hasGeminiKey ? "WARNING" : "FAIL",
+    hasGeminiKey
+      ? "API key configuration exists; live Gemini connectivity was not tested."
+      : "No GEMINI_API_KEYS or GEMINI_API_KEY environment variable found."
+  );
+
+  // 5. Windows Agent tools: registration only
+  try {
+    const { TOOL_DEFINITIONS } = require("./AgentToolRegistry");
+    const names = Object.keys(TOOL_DEFINITIONS || {});
+
+    addCheck(
+      "Registered Windows Agent tools",
+      names.length > 0 ? "PASS" : "WARNING",
+      `${names.length} tool definitions registered. This does not prove the Windows Agent is connected.`
+    );
+  } catch (error) {
+    addCheck(
+      "Registered Windows Agent tools",
+      "NOT CHECKED",
+      error?.message || String(error)
+    );
+  }
+
+  // These checks are intentionally NOT run by this handler.
+  addCheck("API endpoint response tests", "NOT CHECKED",
+    "Individual endpoint requests were not executed.");
+  addCheck("Windows Agent live connectivity", "NOT CHECKED",
+    "No live Windows Agent request was made.");
+  addCheck("Security scan", "NOT CHECKED",
+    "No security scanner was executed.");
+  addCheck("Recent logs and failed checks", "NOT CHECKED",
+    "Log files were not inspected.");
+  addCheck("Test suite", "NOT CHECKED",
+    "No test command was executed.");
+
+  const hasFailure = checks.some(c => c.status === "FAIL");
+  const hasUnverified = checks.some(
+    c => c.status === "WARNING" || c.status === "NOT CHECKED"
+  );
+
+  const reportStatus = hasFailure
+    ? "failed"
+    : hasUnverified
+      ? "degraded"
+      : "healthy";
+
+  const report = {
+    healthy: reportStatus === "healthy",
+    status: reportStatus,
+    version: "1.0.0",
+    timestamp,
+    checks,
+    runtime: runtimeReport,
+    summary: {
+      total: checks.length,
+      pass: checks.filter(c => c.status === "PASS").length,
+      fail: checks.filter(c => c.status === "FAIL").length,
+      warning: checks.filter(c => c.status === "WARNING").length,
+      notChecked: checks.filter(c => c.status === "NOT CHECKED").length
+    }
+  };
+
+  return {
+    success: report.healthy,
+    route: ROUTE.TOOL,
+    status: reportStatus === "failed" ? "failed" : "completed",
+    intent,
+    sessionId,
+    result: report
+  };
+}
+
 
   // ==========================================================
   // AGENT FILE INSPECTION

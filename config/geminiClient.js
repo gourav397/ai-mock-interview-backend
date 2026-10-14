@@ -107,15 +107,21 @@ class AlexGeminiClient {
      * accidentally 4 total attempts nahi banega.
      */
 
-    if (chatMode) {
-      return Math.min(
-        15,
-        Math.max(
-          5,
-          keyCount
-        )
-      );
-    }
+    
+if (chatMode) {
+  const requestedRetries =
+    typeof options.retries === "number"
+      ? Math.max(0, Math.floor(options.retries))
+      : 2;
+
+  // Normal chat: maximum 3 attempts.
+  // Retries cannot make a chat request run indefinitely.
+  return Math.min(
+    3,
+    Math.max(1, requestedRetries + 1)
+  );
+}
+
 
     const requestedRetries =
       typeof options.retries === "number"
