@@ -233,7 +233,7 @@ async function callGemini(prompt, options = {}) {
         temperature,
         maxOutputTokens,
         timeoutMs,
-        retries: 0,
+        retries: chatMode ? 2 : 0,
         responseMimeType,
         chatMode,
       });
