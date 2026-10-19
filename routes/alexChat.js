@@ -39,6 +39,58 @@ const getAgentAssistantAPI =
 const config = require("../alex/config");
 
 // ============================================================
+// OPENAI IMAGE GENERATION CLIENT
+// ============================================================
+
+const OpenAI = require("openai");
+
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+    })
+  : null;
+
+function getImagePrompt(message) {
+  const text = String(message || "").trim();
+
+  const imageIntent =
+    /\b(generate|genrate|generat|create|draw|make|image|picture|pic|photo|illustration|tasveer)\b|image\s*bana|photo\s*bana|pic\s*bana|tasveer\s*bana|चित्र\s*बना|फोटो\s*बना/i.test(
+      text
+    );
+
+  if (!imageIntent) {
+    return null;
+  }
+
+  const prompt = text
+    .replace(
+      /^(alex[\s,:-]*)?(please\s+)?(mujhe|muje|mere\s+liye|make\s+me|create\s+me|generate\s+me)?\s*(ek\s+)?(acchi\s+si\s+|achhi\s+si\s+|good\s+|beautiful\s+|best\s+)?(image|picture|pic|photo|illustration|tasveer)\s*(generate|genrate|generat|create|bana|banao|bana\s*do|kar\s*ke\s*de|karke\s*de)?\s*(of\s*)?/i,
+      ""
+    )
+    .replace(
+      /\b(please|plz|bana\s*do|banao|bana|generate|genrate|generat|create|karke\s*de|ker\s*k\s*de|kar\s*ke\s*de|de\s*do|mere\s*liye|ek|acchi\s*si|achhi\s*si)\b/gi,
+      " "
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (prompt.length < 3) {
+    return null;
+  }
+
+  return `Create a high-quality, visually appealing image of: ${prompt}`.slice(
+    0,
+    4000
+  );
+}
+
+
+// ============================================================
+// OPENAI IMAGE GENERATION
+// Image client and getImagePrompt() are already defined above.
+// Do not declare OpenAI, openai, or getImagePrompt() again.
+// ============================================================
+// ============================================================
 // REEL GENERATOR
 // ============================================================
 
@@ -479,6 +531,40 @@ function formatAlexResponse(result) {
     if (chatReply) {
       return String(chatReply);
     }
+  }
+
+
+    // ==========================================================
+  // HEALTH CHECK REPORT
+  // ==========================================================
+
+  const healthReport =
+    result.result &&
+    typeof result.result === "object" &&
+    (
+      typeof result.result.healthy === "boolean" ||
+      result.result.name === "Agent Assistant API" ||
+      result.result.availableCapabilities !== undefined
+    )
+      ? result.result
+      : null;
+
+  if (
+    healthReport &&
+    (
+      result.route === "tool" ||
+      result.intent?.intent === "HEALTH_CHECK"
+    )
+  ) {
+    return (
+      `## ALEX Health Check\n\n` +
+      `- **Overall status:** ${healthReport.status || "unknown"}\n` +
+      `- **Healthy:** ${healthReport.healthy === true ? "Yes" : healthReport.healthy === false ? "No" : "Not reported"}\n` +
+      `- **Timestamp:** ${healthReport.timestamp || "Not reported"}\n\n` +
+      `**Full report:**\n\`\`\`json\n` +
+      JSON.stringify(healthReport, null, 2).slice(0, 3500) +
+      `\n\`\`\``
+    );
   }
 
   // ==========================================================
@@ -1031,6 +1117,81 @@ router.post(
       });
 
       session.metrics.totalMessages++;
+
+      // ======================================================
+// OPENAI IMAGE GENERATION
+// ======================================================
+
+const imagePrompt = getImagePrompt(trimmedMessage);
+
+if (imagePrompt) {
+  if (!openai) {
+    return res.status(503).json({
+      success: false,
+      sessionId: session.id,
+      response:
+        "Image generation abhi configure nahi hai. Backend environment mein OPENAI_API_KEY set karo.",
+    });
+  }
+
+  try {
+    console.log("[ALEX IMAGE] Generating image...");
+
+    const imageResult = await openai.images.generate({
+      model: "gpt-image-1",
+      prompt: imagePrompt,
+      size: "1024x1024",
+    });
+
+    const imageBase64 = imageResult?.data?.[0]?.b64_json;
+
+    if (!imageBase64) {
+      throw new Error("Image API returned no image data.");
+    }
+
+    const imageUrl = `data:image/png;base64,${imageBase64}`;
+
+    const alexResponse = "Image generate ho gayi!";
+
+    session.messages.push({
+      role: "alex",
+      type: "image",
+      content: alexResponse,
+      imageUrl,
+      timestamp: new Date().toISOString(),
+    });
+
+    session.context.lastAction = "generate-image";
+
+    session.metrics.commandsExecuted++;
+
+    return res.json({
+      success: true,
+      sessionId: session.id,
+      response: alexResponse,
+      imageUrl,
+      result: {
+        success: true,
+        status: "completed",
+        action: "generate-image",
+      },
+      metrics: session.metrics,
+    });
+  } catch (error) {
+    console.error(
+      "[ALEX IMAGE ERROR]",
+      error?.status || "",
+      error?.message || "Unknown image generation error"
+    );
+
+    return res.status(502).json({
+      success: false,
+      sessionId: session.id,
+      response:
+        "Image generate nahi ho payi. OpenAI API key, API access aur billing check karo.",
+    });
+  }
+}
 
       // ======================================================
       // CONFIRMATION
