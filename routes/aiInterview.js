@@ -1,3 +1,4 @@
+
 const express = require("express");
 const {
   generateBank,
@@ -12,32 +13,49 @@ const router = express.Router();
 
 const PRACTICE_DIFFICULTIES = ["Medium", "Hard"];
 const BANK_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_QUESTIONS = 50;
 const warming = new Map();
 
-function shuffle(arr) {
-  const a = [...arr];
+function shuffle(items) {
+  const result = [...items];
 
-  for (let i = a.length - 1; i > 0; i--) {
+  for (let i = result.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
+    [result[i], result[j]] = [result[j], result[i]];
   }
 
-  return a;
+  return result;
 }
 
-function qKey(q) {
-  return String(q?.question || "")
+function qKey(question) {
+  return String(question?.question || "")
     .split(" / ")[0]
+    .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
 }
 
-function normalizeDifficulty(d) {
-  const s = String(d || "Medium").trim();
+function uniqueQuestions(questions) {
+  const clean = sanitizeBank(Array.isArray(questions) ? questions : []);
+  const seen = new Set();
+  const result = [];
 
-  if (!s) return "Medium";
+  for (const question of clean) {
+    const key = qKey(question);
+    if (!key || seen.has(key)) continue;
 
-  return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+    seen.add(key);
+    result.push(question);
+  }
+
+  return result;
+}
+
+function normalizeDifficulty(value) {
+  const text = String(value || "Medium").trim();
+  if (!text) return "Medium";
+
+  return text.charAt(0).toUpperCase() + text.slice(1).toLowerCase();
 }
 
 function isBankFresh(bank) {
@@ -47,10 +65,8 @@ function isBankFresh(bank) {
 
   const updatedAt = new Date(bank.updatedAt).getTime();
 
-  return (
-    Number.isFinite(updatedAt) &&
-    Date.now() - updatedAt < BANK_TTL_MS
-  );
+  return Number.isFinite(updatedAt) &&
+    Date.now() - updatedAt < BANK_TTL_MS;
 }
 
 function isTechnicalCategory(category) {
@@ -66,16 +82,18 @@ function buildExtraHint(category, techStack, experience) {
   const technical = isTechnicalCategory(selectedCategory);
 
   let hint = [
-    `The user's selected category is "${selectedCategory}".`,
-    `Generate questions strictly relevant to "${selectedCategory}".`,
-    "Do not change the selected category.",
-    "Do not invent facts or make ambiguous questions.",
-    "Return valid multiple-choice questions with exactly four options.",
-    "Every question must have one correct answer matching an option exactly.",
+    `The user's requested category is exactly "${selectedCategory}".`,
+    `Generate every question strictly about "${selectedCategory}".`,
+    "The category may be any subject, topic, profession, exam, skill, hobby, or niche, including a category that does not exist in any stored question bank.",
+    "Never substitute a different category just because the requested category is unfamiliar.",
+    "Do not ask the user to choose from a predefined category list.",
+    "Generate original, accurate, non-duplicate multiple-choice questions.",
+    "Every question must have exactly four options and one unambiguous correct answer matching an option.",
+    "Return the same question format and bilingual English/Hindi style expected by the application.",
   ].join(" ");
 
   if (technical && stack) {
-    hint += ` Technical stack: ${stack}.`;
+    hint += ` Relevant technical stack: ${stack}.`;
   }
 
   if (exp) {
@@ -84,19 +102,79 @@ function buildExtraHint(category, techStack, experience) {
 
   if (!technical) {
     hint +=
-      " This is not a technical programming interview unless the selected category explicitly requires it. Ignore unrelated technology stack values.";
+      " Ignore unrelated technology-stack values. Do not turn a non-technical subject into a programming interview.";
   }
 
   return hint;
 }
 
+async function saveBank(category, difficulty, questions) {
+  const incoming = uniqueQuestions(questions);
+  if (!incoming.length) return [];
+
+  const existingBank = await QuestionBank.findOne({
+    category,
+    difficulty,
+  });
+
+  const existing = uniqueQuestions(existingBank?.questions || []);
+  const seen = new Set(existing.map(qKey));
+  const additions = incoming.filter((question) => {
+    const key = qKey(question);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const merged = [...existing, ...additions];
+
+  if (merged.length) {
+    await QuestionBank.findOneAndUpdate(
+      { category, difficulty },
+      {
+        $set: {
+          questions: merged,
+          updatedAt: new Date(),
+        },
+      },
+      { upsert: true, new: true }
+    );
+  }
+
+  return merged;
+}
+
+async function generateAndSave(category, difficulty, count, extraHint = "") {
+  const amount = Math.min(Math.max(Number(count) || 1, 1), MAX_QUESTIONS);
+
+  console.log(
+    `[AI-INTERVIEW] AI generation started: category="${category}" difficulty="${difficulty}" count=${amount}`
+  );
+
+  const generated = await withGenLock(() =>
+    generateInterviewQuestions(category, difficulty, amount, extraHint)
+  );
+
+  const valid = uniqueQuestions(generated);
+
+  console.log(
+    `[AI-INTERVIEW] AI generation finished: category="${category}" difficulty="${difficulty}" requested=${amount} valid=${valid.length}`
+  );
+
+  if (!valid.length) {
+    throw new Error(
+      `AI returned zero valid questions for category "${category}" and difficulty "${difficulty}".`
+    );
+  }
+
+  return saveBank(category, difficulty, valid);
+}
+
 async function warmCategory(category, difficulty = "Medium") {
   const diff = normalizeDifficulty(difficulty);
-  const key = `warm-${category}-${diff}`;
+  const lockKey = `warm-${category}-${diff}`;
 
-  if (warming.has(key)) {
-    return warming.get(key);
-  }
+  if (warming.has(lockKey)) return warming.get(lockKey);
 
   const job = (async () => {
     try {
@@ -105,55 +183,32 @@ async function warmCategory(category, difficulty = "Medium") {
         difficulty: diff,
       });
 
-      if (
-        existing &&
-        Array.isArray(existing.questions) &&
-        existing.questions.length >= 50
-      ) {
-        console.log(
-          `✅ ${category}/${diff} bank ready (${existing.questions.length})`
-        );
-
+      if (uniqueQuestions(existing?.questions || []).length >= 50) {
         return existing.questions.length;
       }
 
-      console.log(`🌡️ Warm: ${category}/${diff} ...`);
+      console.log(`[AI-INTERVIEW] Background warm: ${category}/${diff}`);
 
-      const questions = await withGenLock(() =>
-        generateBank(category, diff, 150)
+      const merged = await generateAndSave(
+        category,
+        diff,
+        50,
+        buildExtraHint(category, "", "")
       );
 
-      if (!Array.isArray(questions) || questions.length === 0) {
-        console.warn(`⚠️ Warm produced no questions: ${category}/${diff}`);
-        return 0;
-      }
-
-      await QuestionBank.findOneAndUpdate(
-        { category, difficulty: diff },
-        {
-          $set: {
-            questions,
-            updatedAt: new Date(),
-          },
-        },
-        { upsert: true, new: true }
+      return merged.length;
+    } catch (error) {
+      console.error(
+        `[AI-INTERVIEW] Background warm failed ${category}/${diff}:`,
+        error.message
       );
-
-      console.log(
-        `✅ Warm done: ${category}/${diff} (${questions.length})`
-      );
-
-      return questions.length;
-    } catch (e) {
-      console.error(`❌ Warm fail ${category}/${diff}:`, e.message);
       return 0;
     } finally {
-      warming.delete(key);
+      warming.delete(lockKey);
     }
   })();
 
-  warming.set(key, job);
-
+  warming.set(lockKey, job);
   return job;
 }
 
@@ -165,68 +220,31 @@ function warmMixCategory(category) {
 
 async function refreshBankInBackground(category, difficulty = "Medium") {
   const diff = normalizeDifficulty(difficulty);
-  const key = `refresh-${category}-${diff}`;
+  const lockKey = `refresh-${category}-${diff}`;
 
-  if (warming.has(key)) return;
+  if (warming.has(lockKey)) return;
 
   const job = (async () => {
     try {
-      console.log(`♻️ Refreshing bank: ${category}/${diff}`);
+      console.log(`[AI-INTERVIEW] Background refresh: ${category}/${diff}`);
 
-      const questions = await withGenLock(() =>
-        generateBank(category, diff, 150)
-      );
-
-      if (!Array.isArray(questions) || questions.length === 0) {
-        console.warn(`⚠️ Refresh returned no questions: ${category}/${diff}`);
-        return;
-      }
-
-      const existing = await QuestionBank.findOne({
+      await generateAndSave(
         category,
-        difficulty: diff,
-      });
-
-      const oldQuestions = Array.isArray(existing?.questions)
-        ? existing.questions
-        : [];
-
-      const seen = new Set(oldQuestions.map(qKey));
-
-      const uniqueNew = questions.filter((q) => {
-        const key = qKey(q);
-
-        if (!key || seen.has(key)) return false;
-
-        seen.add(key);
-        return true;
-      });
-
-      const merged = [...oldQuestions, ...uniqueNew];
-
-      await QuestionBank.findOneAndUpdate(
-        { category, difficulty: diff },
-        {
-          $set: {
-            questions: merged,
-            updatedAt: new Date(),
-          },
-        },
-        { upsert: true, new: true }
+        diff,
+        30,
+        buildExtraHint(category, "", "")
       );
-
-      console.log(
-        `✅ Refresh done: ${category}/${diff}; total=${merged.length}`
+    } catch (error) {
+      console.error(
+        `[AI-INTERVIEW] Background refresh failed ${category}/${diff}:`,
+        error.message
       );
-    } catch (e) {
-      console.error(`❌ Refresh fail ${category}/${diff}:`, e.message);
     } finally {
-      warming.delete(key);
+      warming.delete(lockKey);
     }
   })();
 
-  warming.set(key, job);
-
+  warming.set(lockKey, job);
   return job;
 }
 
@@ -236,86 +254,53 @@ async function getMixBank(category) {
     difficulty: { $in: PRACTICE_DIFFICULTIES },
   });
 
-  const all = [];
-
-  banks.forEach((bank) => {
-    if (Array.isArray(bank.questions)) {
-      all.push(...bank.questions);
-    }
-  });
-
-  const seen = new Set();
-
-  const unique = all.filter((q) => {
-    const key = qKey(q);
-
-    if (!key || seen.has(key)) return false;
-
-    seen.add(key);
-    return true;
-  });
-
-  return sanitizeBank(unique);
+  return uniqueQuestions(
+    banks.flatMap((bank) =>
+      Array.isArray(bank.questions) ? bank.questions : []
+    )
+  );
 }
 
 async function expandBank(category, difficulty = "Medium", targetSize = 150) {
   const diff = normalizeDifficulty(difficulty);
+  const lockKey = `expand-${category}-${diff}`;
 
-  if (warming.has(`refresh-${category}-${diff}`)) {
-    return;
-  }
+  if (warming.has(lockKey)) return;
 
-  const bank = await QuestionBank.findOne({
-    category,
-    difficulty: diff,
-  });
+  const job = (async () => {
+    try {
+      const bank = await QuestionBank.findOne({
+        category,
+        difficulty: diff,
+      });
 
-  const existing = sanitizeBank(
-    Array.isArray(bank?.questions) ? bank.questions : []
-  );
+      const existing = uniqueQuestions(bank?.questions || []);
+      const needed = Math.min(targetSize - existing.length, 30);
 
-  const existingKeys = new Set(existing.map(qKey));
-  const need = targetSize - existing.length;
+      if (needed <= 0) return;
 
-  if (need <= 0) return existing.length;
-
-  console.log(
-    `🌱 Expand ${category}/${diff}: generating up to ${need} questions`
-  );
-
-  try {
-    const fresh = await withGenLock(() =>
-      generateBank(category, diff, Math.min(need, 50))
-    );
-
-    const unique = (Array.isArray(fresh) ? fresh : []).filter((q) => {
-      const key = qKey(q);
-
-      if (!key || existingKeys.has(key)) return false;
-
-      existingKeys.add(key);
-      return true;
-    });
-
-    const merged = [...existing, ...unique];
-
-    if (merged.length > 0) {
-      await QuestionBank.findOneAndUpdate(
-        { category, difficulty: diff },
-        { $set: { questions: merged } },
-        { upsert: true, new: true }
+      console.log(
+        `[AI-INTERVIEW] Background expansion: category="${category}" difficulty="${diff}" need=${needed}`
       );
+
+      await generateAndSave(
+        category,
+        diff,
+        needed,
+        buildExtraHint(category, "", "")
+      );
+    } catch (error) {
+      console.error(
+        `[AI-INTERVIEW] Background expansion failed ${category}/${diff}:`,
+        error.message
+      );
+    } finally {
+      warming.delete(lockKey);
     }
+  })();
 
-    console.log(
-      `✅ Bank ${category}/${diff} now contains ${merged.length} questions`
-    );
-
-    return merged.length;
-  } catch (e) {
-    console.error(`❌ Expand fail ${category}/${diff}:`, e.message);
-    return existing.length;
-  }
+  warming.set(lockKey, job);
+  return job;
 }
 
 async function getSeenRecord(userId, category) {
@@ -331,46 +316,31 @@ async function getSeenRecord(userId, category) {
         category,
         seen: [],
       });
-    } catch (e) {
-      // Another simultaneous request may have created the record.
+    } catch (error) {
       record = await SeenQuestions.findOne({
         user: userId,
         category,
       });
 
-      if (!record) throw e;
+      if (!record) throw error;
     }
   }
 
   return record;
 }
 
-function chooseQuestions(pool, finalCount, seenSet) {
-  const validPool = sanitizeBank(Array.isArray(pool) ? pool : []);
-  const uniquePool = [];
-  const uniqueKeys = new Set();
+function chooseQuestions(pool, count, seenSet) {
+  const uniquePool = uniqueQuestions(pool);
+  const unseen = uniquePool.filter((question) => !seenSet.has(qKey(question)));
+  const previouslySeen = uniquePool.filter((question) => seenSet.has(qKey(question)));
 
-  for (const q of validPool) {
-    const key = qKey(q);
+  const picked = shuffle(unseen).slice(0, count);
+  const repeats = [];
 
-    if (!key || uniqueKeys.has(key)) continue;
-
-    uniqueKeys.add(key);
-    uniquePool.push(q);
-  }
-
-  const available = uniquePool.filter((q) => !seenSet.has(qKey(q)));
-  let picked = shuffle(available).slice(0, finalCount);
-  let repeats = [];
-
-  if (picked.length < finalCount) {
-    const remainingNeeded = finalCount - picked.length;
-
-    repeats = shuffle(
-      uniquePool.filter((q) => seenSet.has(qKey(q)))
-    ).slice(0, remainingNeeded);
-
-    picked = [...picked, ...repeats];
+  if (picked.length < count) {
+    const needed = count - picked.length;
+    repeats.push(...shuffle(previouslySeen).slice(0, needed));
+    picked.push(...repeats);
   }
 
   return {
@@ -380,44 +350,36 @@ function chooseQuestions(pool, finalCount, seenSet) {
   };
 }
 
-// GET /api/ai-interview/generate
 router.get("/generate", async (req, res) => {
   const startedAt = Date.now();
 
   try {
-    const {
-      category,
-      difficulty,
-      count,
-      techStack,
-      experience,
-    } = req.query;
+    const category = String(req.query.category || "").trim();
+    const rawDifficulty = String(req.query.difficulty || "").trim();
+    const techStack = String(req.query.techStack || "").trim();
+    const experience = String(req.query.experience || "").trim();
 
-    const requestedCategory = String(category || "").trim();
-
-    if (!requestedCategory) {
+    if (!category) {
       return res.status(400).json({
         success: false,
         code: "CATEGORY_REQUIRED",
-        message: "Category required",
+        message: "Please provide a question category.",
       });
     }
 
-    const finalCount = Math.min(
-      Math.max(parseInt(count, 10) || 50, 1),
-      50
+    const requested = Math.min(
+      Math.max(parseInt(req.query.count, 10) || 50, 1),
+      MAX_QUESTIONS
     );
 
-    const rawDiff = String(difficulty || "").trim();
+    const mixMode =
+      !rawDifficulty || ["mix", "all"].includes(rawDifficulty.toLowerCase());
 
-    const isMixMode =
-      !rawDiff || ["mix", "all"].includes(rawDiff.toLowerCase());
-
-    const diff = isMixMode ? null : normalizeDifficulty(rawDiff);
+    const difficulty = mixMode ? null : normalizeDifficulty(rawDifficulty);
 
     if (
-      !isMixMode &&
-      !["Easy", "Medium", "Hard"].includes(diff)
+      !mixMode &&
+      !["Easy", "Medium", "Hard"].includes(difficulty)
     ) {
       return res.status(400).json({
         success: false,
@@ -426,197 +388,123 @@ router.get("/generate", async (req, res) => {
       });
     }
 
+    const extraHint = buildExtraHint(category, techStack, experience);
     let pool = [];
-    let servedDifficulty = diff || "Mix";
+    let servedDifficulty = difficulty || "Mix";
     let fromBank = false;
 
-    if (isMixMode) {
-      const mixQuestions = await getMixBank(requestedCategory);
+    if (mixMode) {
+      pool = await getMixBank(category);
 
-      if (mixQuestions.length < 1) {
-        // Start warming in the background, but don't block this request
-        // for several minutes while trying to create a complete bank.
-        warmMixCategory(requestedCategory);
+      if (pool.length < requested) {
+        warmMixCategory(category);
 
-        console.warn(
-          `[AI-INTERVIEW] No practice bank for "${requestedCategory}"`
-        );
-
-        return res.status(503).json({
-          success: false,
-          code: "PRACTICE_BANK_NOT_READY",
-          message:
-            "Question bank is being prepared. Please retry shortly, or start an interview using a specific difficulty.",
-          category: requestedCategory,
-          difficulty: "Mix",
-          requested: finalCount,
-          generated: 0,
-        });
+        if (pool.length === 0) {
+          return res.status(503).json({
+            success: false,
+            code: "PRACTICE_BANK_NOT_READY",
+            message:
+              "This category's practice bank is being prepared. Choose Easy, Medium, or Hard to generate questions directly with AI, or retry shortly.",
+            category,
+            difficulty: "Mix",
+            requested,
+            generated: 0,
+          });
+        }
       }
 
       const banks = await QuestionBank.find({
-        category: requestedCategory,
+        category,
         difficulty: { $in: PRACTICE_DIFFICULTIES },
       });
 
-      banks.forEach((bank) => {
+      for (const bank of banks) {
         if (!isBankFresh(bank)) {
-          refreshBankInBackground(
-            requestedCategory,
-            bank.difficulty
-          ).catch(() => {});
+          refreshBankInBackground(category, bank.difficulty).catch(() => {});
         }
-      });
+      }
 
-      pool = mixQuestions;
-      servedDifficulty = "Mix";
       fromBank = true;
     } else {
       const bank = await QuestionBank.findOne({
-        category: requestedCategory,
-        difficulty: diff,
+        category,
+        difficulty,
       });
 
-      const bankQuestions = sanitizeBank(
-        Array.isArray(bank?.questions) ? bank.questions : []
-      );
+      const bankQuestions = uniqueQuestions(bank?.questions || []);
 
-      if (bankQuestions.length >= finalCount) {
+      if (bankQuestions.length >= requested) {
         pool = bankQuestions;
-        servedDifficulty = diff;
         fromBank = true;
+
+        console.log(
+          `[AI-INTERVIEW] Bank hit: category="${category}" difficulty="${difficulty}" bankSize=${pool.length}`
+        );
 
         if (!isBankFresh(bank)) {
-          refreshBankInBackground(requestedCategory, diff).catch(
-            () => {}
-          );
+          refreshBankInBackground(category, difficulty).catch(() => {});
         }
-
-        console.log(
-          `⚡ Interview cache HIT: ${requestedCategory}/${diff} (${pool.length})`
-        );
-      } else if (bankQuestions.length >= 5) {
-        // Preserve an existing usable bank rather than risking losing it
-        // because a fresh Gemini request is temporarily unavailable.
-        pool = bankQuestions;
-        servedDifficulty = diff;
-        fromBank = true;
-
-        console.log(
-          `⚡ Partial bank: ${pool.length} questions for ${requestedCategory}/${diff}`
-        );
-
-        expandBank(requestedCategory, diff, 150).catch(() => {});
       } else {
+        /*
+         * IMPORTANT:
+         * Never return a small bank immediately just because it contains
+         * five or more questions. First ask the AI to generate the requested
+         * category and difficulty. This also works for categories that have
+         * never existed in the database.
+         */
         console.log(
-          `⚡ Generating ${finalCount} questions for "${requestedCategory}" / ${diff}`
+          `[AI-INTERVIEW] Bank insufficient: category="${category}" difficulty="${difficulty}" existing=${bankQuestions.length} requested=${requested}; generating with AI`
         );
-
-        const extraHint = buildExtraHint(
-          requestedCategory,
-          techStack,
-          experience
-        );
-
-        let freshQuestions = [];
 
         try {
-          freshQuestions = await generateInterviewQuestions(
-            requestedCategory,
-            diff,
-            finalCount,
+          const merged = await generateAndSave(
+            category,
+            difficulty,
+            requested,
             extraHint
           );
 
-          freshQuestions = sanitizeBank(
-            Array.isArray(freshQuestions) ? freshQuestions : []
+          pool = uniqueQuestions(merged);
+          fromBank = false;
+
+          console.log(
+            `[AI-INTERVIEW] Generated/merged pool: category="${category}" difficulty="${difficulty}" total=${pool.length}`
           );
-
-          // One valid question is better than discarding partial success.
-          if (freshQuestions.length > 0) {
-            const existingKeys = new Set(bankQuestions.map(qKey));
-            const merged = [...bankQuestions];
-
-            for (const q of freshQuestions) {
-              const key = qKey(q);
-
-              if (key && !existingKeys.has(key)) {
-                existingKeys.add(key);
-                merged.push(q);
-              }
-            }
-
-            // Keep old valid questions and add newly generated ones.
-            QuestionBank.findOneAndUpdate(
-              { category: requestedCategory, difficulty: diff },
-              {
-                $set: {
-                  questions: merged,
-                  updatedAt: new Date(),
-                },
-              },
-              { upsert: true, new: true }
-            ).catch((e) => {
-              console.error(
-                "[AI-INTERVIEW] Bank save failed:",
-                e.message
-              );
-            });
-
-            pool = merged;
-            servedDifficulty = diff;
-            fromBank = bankQuestions.length > 0;
-
-            console.log(
-              `✅ Generation returned ${freshQuestions.length} valid questions; pool=${pool.length}`
-            );
-          } else {
-            throw new Error(
-              "Generator returned zero valid questions after validation"
-            );
-          }
-        } catch (genError) {
+        } catch (generationError) {
           console.error(
-            `[AI-INTERVIEW GENERATION FAILED] category="${requestedCategory}" difficulty="${diff}" requested=${finalCount}`,
-            genError?.stack || genError?.message || genError
+            `[AI-INTERVIEW] Generation failed: category="${category}" difficulty="${difficulty}"`,
+            generationError?.stack || generationError?.message || generationError
           );
 
-          // If Gemini failed, use every valid question already in the bank.
-          if (bankQuestions.length > 0) {
-            pool = bankQuestions;
-            servedDifficulty = diff;
-            fromBank = true;
+          // If AI is temporarily unavailable, preserve and serve valid bank data.
+          pool = bankQuestions;
+          fromBank = pool.length > 0;
 
+          if (pool.length > 0) {
             console.warn(
-              `⚠️ Fallback: serving ${pool.length} existing questions`
+              `[AI-INTERVIEW] Using bank fallback: category="${category}" difficulty="${difficulty}" questions=${pool.length}`
             );
-          } else {
-            return res.status(503).json({
-              success: false,
-              code: "QUESTION_GENERATION_UNAVAILABLE",
-              message:
-                "AI could not generate valid questions for this category right now. Please retry shortly.",
-              category: requestedCategory,
-              difficulty: diff,
-              requested: finalCount,
-              generated: 0,
-            });
           }
+        }
+
+        // Continue building the bank after returning a usable partial result.
+        if (pool.length < requested) {
+          expandBank(category, difficulty, 150).catch(() => {});
         }
       }
     }
 
-    pool = sanitizeBank(Array.isArray(pool) ? pool : []);
+    pool = uniqueQuestions(pool);
 
-    if (pool.length === 0) {
+    if (!pool.length) {
       return res.status(503).json({
         success: false,
-        code: "NO_VALID_QUESTIONS",
+        code: "QUESTION_GENERATION_UNAVAILABLE",
         message:
-          "No valid questions are currently available for this category. Please retry shortly.",
-        category: requestedCategory,
+          "AI could not generate valid questions for this category right now. Please retry shortly.",
+        category,
         difficulty: servedDifficulty,
-        requested: finalCount,
+        requested,
         generated: 0,
       });
     }
@@ -626,36 +514,34 @@ router.get("/generate", async (req, res) => {
       req.user?.id?.toString() ||
       `anon:${req.ip || "unknown"}`;
 
-    const seenRec = await getSeenRecord(userId, requestedCategory);
-    const seenSet = new Set(seenRec?.seen || []);
+    const seenRecord = await getSeenRecord(userId, category);
+    const seenSet = new Set(seenRecord?.seen || []);
 
     const {
       picked,
       repeats,
       bankSize,
-    } = chooseQuestions(pool, finalCount, seenSet);
+    } = chooseQuestions(pool, requested, seenSet);
 
-    if (picked.length === 0) {
+    if (!picked.length) {
       return res.status(503).json({
         success: false,
         code: "NO_SELECTABLE_QUESTIONS",
-        message:
-          "Questions are temporarily unavailable. Please retry shortly.",
-        category: requestedCategory,
+        message: "No valid questions could be selected. Please retry.",
+        category,
         difficulty: servedDifficulty,
-        requested: finalCount,
+        requested,
         generated: 0,
       });
     }
 
-    const keys = picked.map(qKey).filter(Boolean);
-
+    const questionKeys = picked.map(qKey).filter(Boolean);
     const mergedSeen = [
-      ...new Set([...(seenRec?.seen || []), ...keys]),
+      ...new Set([...(seenRecord?.seen || []), ...questionKeys]),
     ].slice(-500);
 
     await SeenQuestions.updateOne(
-      { _id: seenRec._id },
+      { _id: seenRecord._id },
       {
         $set: {
           seen: mergedSeen,
@@ -664,31 +550,27 @@ router.get("/generate", async (req, res) => {
       }
     );
 
-    if (picked.length < finalCount) {
+    if (picked.length < requested) {
       console.warn(
-        `[AI-INTERVIEW] Partial response: requested=${finalCount} returned=${picked.length} category="${requestedCategory}" difficulty="${servedDifficulty}"`
+        `[AI-INTERVIEW] Partial response: requested=${requested} returned=${picked.length} category="${category}" difficulty="${servedDifficulty}" pool=${pool.length}`
       );
-
-      if (!isMixMode) {
-        expandBank(requestedCategory, diff, 150).catch(() => {});
-      }
     }
 
     console.log(
-      `✅ Questions served: category="${requestedCategory}" difficulty="${servedDifficulty}" returned=${picked.length}/${finalCount} repeats=${repeats.length} bankSize=${bankSize} elapsedMs=${Date.now() - startedAt}`
+      `[AI-INTERVIEW] Questions served: category="${category}" difficulty="${servedDifficulty}" returned=${picked.length}/${requested} repeats=${repeats.length} bankSize=${bankSize} fromBank=${fromBank} elapsedMs=${Date.now() - startedAt}`
     );
 
     return res.json({
       success: true,
-      category: requestedCategory,
+      category,
       difficulty: servedDifficulty,
       total: picked.length,
-      requested: finalCount,
+      requested,
       questions: picked,
       fromBank,
       repeats: repeats.length,
       bankSize,
-      partial: picked.length < finalCount,
+      partial: picked.length < requested,
     });
   } catch (error) {
     console.error(
@@ -710,7 +592,6 @@ router.get("/generate", async (req, res) => {
   }
 });
 
-// GET /api/ai-interview/bank-status
 router.get("/bank-status", async (req, res) => {
   try {
     const banks = await QuestionBank.find({}).lean();
@@ -719,15 +600,14 @@ router.get("/bank-status", async (req, res) => {
       banks.map((bank) => ({
         category: bank.category,
         difficulty: bank.difficulty,
-        questions: bank.questions?.length || 0,
+        questions: Array.isArray(bank.questions) ? bank.questions.length : 0,
         ageHours: Math.round(
-          (Date.now() - new Date(bank.updatedAt).getTime()) /
-            3600000
+          (Date.now() - new Date(bank.updatedAt).getTime()) / 3600000
         ),
       }))
     );
-  } catch (e) {
-    console.error("[BANK STATUS ERROR]", e.message);
+  } catch (error) {
+    console.error("[BANK STATUS ERROR]", error.message);
 
     return res.status(500).json({
       success: false,
