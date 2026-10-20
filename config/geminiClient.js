@@ -83,49 +83,33 @@ class AlexGeminiClient {
     return base + jitter;
   }
 
-  _getMaxAttempts(chatMode, options) {
+ 
+  _getMaxAttempts(chatMode, options = {}) {
     const keyCount = Math.max(
       1,
-      Number(keyManager.count) || 1
+      Math.min(15, Number(keyManager.count) || 1)
     );
 
-    /*
-     * options.retries caller ki retry preference hai.
-     * Ye available Gemini keys ki total attempts
-     * ko kam nahi karega.
-     *
-     * Example:
-     * 15 Gemini keys + retries: 4
-     * ALEX can still use up to 15 attempts
-     */
-
+    // Normal ALEX chat ko fast rakho.
     if (chatMode) {
       const requestedRetries =
         typeof options.retries === "number"
-          ? Math.max(
-              0,
-              Math.floor(options.retries)
-            )
+          ? Math.max(0, Math.floor(options.retries))
           : 2;
 
-      // Normal chat: maximum 3 attempts.
-      return Math.min(
-        3,
-        Math.max(1, requestedRetries + 1)
-      );
+      return Math.min(3, requestedRetries + 1);
     }
 
+    // Interview/question generation:
+    // available keys ko retry attempts mein use karo.
     const requestedRetries =
       typeof options.retries === "number"
-        ? Math.max(1, options.retries)
+        ? Math.max(0, Math.floor(options.retries))
         : 0;
 
     return Math.min(
       15,
-      Math.max(
-        requestedRetries,
-        Math.min(5, keyCount)
-      )
+      Math.max(keyCount, requestedRetries + 1)
     );
   }
 
