@@ -1,33 +1,26 @@
 // ============================================================
-// aiGenerator.js — Bilingual Exam Question Generator
-// Complete file: bank + resume-fast + interview + resume flows.
-//
-// FIXES (is version mein):
-//  - ✅ OPTION SHUFFLE: Gemini correct answer pehli position par likhta
-//    hai. normalizeQuestion() ab correctAnswer resolve karne ke baad
-//    options ko Fisher-Yates se shuffle karta hai — correct answer ki
-//    position random ho jati hai (persist hone se pehle).
-//  - ✅ CORRECT-ANSWER VALIDITY: agar correctAnswer kisi option ke text
-//    se match nahi karta to pehli option ko correct set karta hai
-//    (warna user har answer par wrong dikhta hai).
-//  - parseJsonArray: TRUNCATED-JSON repair (MAX_TOKENS cut arrays ab
-//    partially recover hote hain)
-//  - generateBankInternal: stats fix, 3 top-up rounds
-//  - generateResumeQuestionsFast: per-batch retry, top-up rounds,
-//    partial success preserve
+// aiGenerator.js — AI Interview Question Generator
+// Supports:
+// - Any user-selected category/topic
+// - English + Hindi bilingual questions
+// - Question bank generation
+// - Interview question generation with partial-result recovery
+// - Resume-based questions
+// - Gemini API error diagnostics
+// - JSON repair and duplicate filtering
 // ============================================================
 
 require("dotenv").config();
 
 const fs = require("fs");
 const path = require("path");
+
 const { keyManager, envStatus } = require("../config/geminiKeys");
 const geminiClientModule = require("../config/geminiClient");
 
 let geminiGenerate = geminiClientModule.geminiGenerate;
 let getAlexGeminiClient = geminiClientModule.getAlexGeminiClient;
 
-// Fallback: ALEX client alag file mein ho sakta hai.
 if (
   typeof geminiGenerate !== "function" &&
   typeof getAlexGeminiClient !== "function"
@@ -37,254 +30,488 @@ if (
 
     geminiGenerate = alexModule.geminiGenerate;
     getAlexGeminiClient = alexModule.getAlexGeminiClient;
-  } catch {
-    // Neeche callGemini mein clear error milega.
+  } catch (error) {
+    console.warn(
+      "[AI-GENERATOR] Optional ALEX Gemini client unavailable:",
+      error.message
+    );
   }
 }
 
 const MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
+
+const CACHE_VERSION = "bilingual-v3";
+const CACHE_DIR = path.join(__dirname, "..", "cache");
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+const DEFAULT_TIMEOUT_MS = 45000;
+const MAX_QUESTION_COUNT = 150;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isQuotaExhausted() {
-  return keyManager.isQuotaExhausted();
+  try {
+    return Boolean(keyManager?.isQuotaExhausted?.());
+  } catch {
+    return false;
+  }
 }
 
-console.log(`✅ [BILINGUAL] aiGenerator loaded — model: ${MODEL} | ${envStatus.summary}`);
+console.log(
+  `✅ [AI-GENERATOR] Loaded | model=${MODEL} | ${envStatus?.summary || "Gemini status unavailable"}`
+);
 
-// ---------- CACHE ----------
-const CACHE_VERSION = "bilingual-v2";
-const CACHE_DIR = path.join(__dirname, "..", "cache");
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+// ============================================================
+// CACHE
+// ============================================================
 
 function cacheFile(category, difficulty) {
-  const safe = category.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return path.join(CACHE_DIR, `${safe}-${difficulty}.json`);
+  const safeCategory = String(category || "general")
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 100);
+
+  const safeDifficulty = String(difficulty || "Medium")
+    .replace(/[^a-zA-Z0-9_-]/g, "_");
+
+  return path.join(
+    CACHE_DIR,
+    `${safeCategory}-${safeDifficulty}.json`
+  );
 }
 
 function getCached(category, difficulty) {
   try {
     const file = cacheFile(category, difficulty);
+
     if (!fs.existsSync(file)) return null;
+
     const data = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (!Array.isArray(data.questions) || !data.questions.length) return null;
+
     if (data.version !== CACHE_VERSION) return null;
-    if (Date.now() - data.createdAt > CACHE_TTL_MS) return null;
+
+    if (!Array.isArray(data.questions) || !data.questions.length) {
+      return null;
+    }
+
+    if (
+      !Number.isFinite(data.createdAt) ||
+      Date.now() - data.createdAt > CACHE_TTL_MS
+    ) {
+      return null;
+    }
+
     return data.questions;
-  } catch {
+  } catch (error) {
+    console.warn("[AI-GENERATOR] Cache read failed:", error.message);
     return null;
   }
 }
 
 function saveCache(category, difficulty, questions) {
   try {
-    if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+    if (!Array.isArray(questions) || questions.length === 0) return;
+
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+
     fs.writeFileSync(
       cacheFile(category, difficulty),
-      JSON.stringify({ version: CACHE_VERSION, createdAt: Date.now(), questions })
+      JSON.stringify({
+        version: CACHE_VERSION,
+        createdAt: Date.now(),
+        questions,
+      }),
+      "utf8"
     );
-  } catch (e) {
-    console.log("Cache save fail:", e.message);
+  } catch (error) {
+    console.warn("[AI-GENERATOR] Cache save failed:", error.message);
   }
 }
 
 function clearCache(category, difficulty) {
   try {
     const file = cacheFile(category, difficulty);
-    if (fs.existsSync(file)) fs.unlinkSync(file);
-  } catch {}
+
+    if (fs.existsSync(file)) {
+      fs.unlinkSync(file);
+    }
+  } catch (error) {
+    console.warn("[AI-GENERATOR] Cache clear failed:", error.message);
+  }
 }
 
-// ================= GEMINI CALL =================
-async function callGemini(prompt, timeoutMs = 60000) {
+// ============================================================
+// GEMINI CLIENT
+// ============================================================
+
+function extractGeminiText(result) {
+  if (typeof result === "string" && result.trim()) {
+    return result.trim();
+  }
+
+  if (typeof result?.text === "string" && result.text.trim()) {
+    return result.text.trim();
+  }
+
+  if (
+    typeof result?.response?.text === "function"
+  ) {
+    const text = result.response.text();
+
+    if (typeof text === "string" && text.trim()) {
+      return text.trim();
+    }
+  }
+
+  return "";
+}
+
+async function callGemini(prompt, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  if (!prompt || typeof prompt !== "string") {
+    throw new Error("Gemini prompt is empty or invalid");
+  }
+
+  let lastError = null;
+
   if (typeof geminiGenerate === "function") {
-    const result = await geminiGenerate(prompt, timeoutMs);
+    try {
+      const result = await geminiGenerate(prompt, timeoutMs);
+      const text = extractGeminiText(result);
 
-    if (typeof result === "string" && result.trim()) {
-      return result;
+      if (text) return text;
+
+      if (result?.error) {
+        throw new Error(
+          result.message || "Gemini generation returned an error"
+        );
+      }
+
+      throw new Error("Gemini returned an empty response");
+    } catch (error) {
+      lastError = error;
     }
-
-    if (result && typeof result.text === "string" && result.text.trim()) {
-      return result.text;
-    }
-
-    throw new Error("Gemini client ne empty response diya");
   }
 
   if (typeof getAlexGeminiClient === "function") {
-    const client = getAlexGeminiClient();
+    try {
+      const client = getAlexGeminiClient();
 
-    if (!client || typeof client.call !== "function") {
-      throw new Error("ALEX Gemini client ka call() method nahi mila");
+      if (!client || typeof client.call !== "function") {
+        throw new Error("Gemini client call() method is unavailable");
+      }
+
+      const result = await client.call(prompt, {
+        timeoutMs,
+        maxOutputTokens: 8192,
+        responseMimeType: "application/json",
+      });
+
+      if (result?.error) {
+        throw new Error(
+          result.message || "Gemini client request failed"
+        );
+      }
+
+      const text = extractGeminiText(result);
+
+      if (text) return text;
+
+      throw new Error("Gemini client returned an empty response");
+    } catch (error) {
+      lastError = error;
     }
-
-    const result = await client.call(prompt, {
-      timeoutMs,
-      maxOutputTokens: 8192,
-      responseMimeType: "application/json",
-    });
-
-    if (result?.error) {
-      throw new Error(
-        result.message || "Gemini request fail hui"
-      );
-    }
-
-    if (typeof result?.text === "string" && result.text.trim()) {
-      return result.text;
-    }
-
-    throw new Error("Gemini client ne empty response diya");
   }
 
-  throw new Error(
-    "Gemini client export mismatch: geminiGenerate() ya getAlexGeminiClient() nahi mila"
+  const message = String(
+    lastError?.message || "Gemini client is not configured"
   );
+
+  console.error(
+    `[AI-GENERATOR] Gemini request failed: ${message}`
+  );
+
+  throw new Error(message);
 }
 
-// ---------- JSON PARSING ----------
+// ============================================================
+// JSON PARSER AND REPAIR
+// ============================================================
+
 let jsonrepair = null;
+
 try {
   ({ jsonrepair } = require("jsonrepair"));
-} catch (e) {}
+} catch {
+  // The built-in parser and truncated-output repair remain available.
+}
 
-// Truncated JSON repair — string-aware bracket balance.
-// MAX_TOKENS par kata hua array isse close ho jaata hai.
-function repairTruncatedJson(text) {
+function repairTruncatedJson(source) {
   try {
-    let inStr = false;
-    let esc = false;
+    let text = String(source || "");
+    let inString = false;
+    let escaped = false;
     const stack = [];
+
     for (let i = 0; i < text.length; i++) {
-      const c = text[i];
-      if (inStr) {
-        if (esc) esc = false;
-        else if (c === "\\") esc = true;
-        else if (c === '"') inStr = false;
+      const char = text[i];
+
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === '"') {
+          inString = false;
+        }
+
         continue;
       }
-      if (c === '"') { inStr = true; continue; }
-      if (c === "[" || c === "{") stack.push(c === "[" ? "]" : "}");
-      else if (c === "]" || c === "}") {
-        if (stack.length && stack[stack.length - 1] === c) stack.pop();
-        else return null; // already unbalanced — repair se kuch nahi hoga
+
+      if (char === '"') {
+        inString = true;
+      } else if (char === "[") {
+        stack.push("]");
+      } else if (char === "{") {
+        stack.push("}");
+      } else if (char === "]" || char === "}") {
+        if (stack[stack.length - 1] === char) {
+          stack.pop();
+        } else {
+          return null;
+        }
       }
     }
-    let out = text;
-    if (inStr) out += '"';
-    out = out.replace(/,\s*$/, "");
-    while (stack.length) out += stack.pop();
-    return out;
+
+    if (inString) {
+      if (escaped) {
+        text = text.slice(0, -1);
+      }
+
+      text += '"';
+    }
+
+    text = text.replace(/,\s*$/, "");
+
+    while (stack.length) {
+      text = text.replace(/,\s*$/, "");
+      text += stack.pop();
+    }
+
+    return text;
   } catch {
     return null;
   }
 }
 
-function parseJsonArray(text) {
-  if (!text) return null;
-  let start = text.indexOf("[");
-  let end = text.lastIndexOf("]");
-  if (start === -1 || end <= start) {
-    // Truncated output ho sakta hai — sirf opening bracket se shuru karo
-    start = text.indexOf("[");
-    if (start === -1) return null;
-    text = text.slice(start);
-    end = -1;
-  } else {
-    text = text.slice(start, end + 1);
+function parseJsonArray(source) {
+  if (!source) return null;
+
+  let text = String(source)
+    .replace(/^\uFEFF/, "")
+    .trim();
+
+  text = text
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
+
+  const start = text.indexOf("[");
+
+  if (start < 0) {
+    console.error("[AI-GENERATOR] JSON array opening bracket missing");
+    return null;
   }
+
+  text = text.slice(start);
+
+  const end = text.lastIndexOf("]");
+
+  if (end >= 0) {
+    text = text.slice(0, end + 1);
+  }
+
   try {
-    return JSON.parse(text);
-  } catch (e) {}
+    const parsed = JSON.parse(text);
+
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    // Continue with repair methods.
+  }
+
   if (jsonrepair) {
     try {
-      return JSON.parse(jsonrepair(text));
-    } catch (e) {}
+      const repaired = jsonrepair(text);
+      const parsed = JSON.parse(repaired);
+
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      // Try built-in repair.
+    }
   }
-  // Truncation repair
+
   try {
     const repaired = repairTruncatedJson(text);
+
     if (repaired) {
       const parsed = JSON.parse(repaired);
-      if (Array.isArray(parsed) && parsed.length) return parsed;
+
+      if (Array.isArray(parsed)) return parsed;
     }
-  } catch (e) {}
-  try {
-    const fixed = text
-      .replace(/:\s*'([^']*)'/g, ': "$1"')
-      .replace(/:\s*`([^`]*)`/g, ': "$1"')
-      .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:/g, '$1"$2":');
-    return JSON.parse(fixed);
-  } catch (e) {}
-  console.error("JSON PARSE FAIL:", String(text).slice(0, 300));
+  } catch {
+    // Return a diagnostic below.
+  }
+
+  console.error(
+    "[AI-GENERATOR] JSON parsing failed:",
+    text.slice(0, 250)
+  );
+
   return null;
 }
 
-// ---------- HELPERS ----------
-const hasHindi = (t) => /[\u0900-\u097F]/.test(t || "");
-const hasEnglish = (t) => /[A-Za-z]/.test(t || "");
+// ============================================================
+// QUESTION NORMALIZATION
+// ============================================================
+
+function hasHindi(text) {
+  return /[\u0900-\u097F]/.test(String(text || ""));
+}
+
+function hasEnglish(text) {
+  return /[A-Za-z]/.test(String(text || ""));
+}
 
 function combine(en, hi) {
-  const e = (en || "").trim();
-  const h = (hi || "").trim();
-  if (e && h) return `${e} / ${h}`;
-  return e || h;
-}
+  const english = String(en || "").trim();
+  const hindi = String(hi || "").trim();
 
-function qKey(q) {
-  return (q?.question || "").split(" / ")[0].trim().toLowerCase();
-}
-
-// ✅ Fisher-Yates shuffle — correct answer ki position random karne ke liye
-function shuffleArray(arr) {
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
+  if (english && hindi) {
+    return `${english} / ${hindi}`;
   }
-  return arr;
+
+  return english || hindi;
 }
 
 function normalizeOptions(rawOptions) {
   if (!rawOptions) return [];
+
   if (!Array.isArray(rawOptions)) {
-    if (typeof rawOptions === "object") rawOptions = Object.values(rawOptions);
-    else return [];
+    if (typeof rawOptions === "object") {
+      rawOptions = Object.values(rawOptions);
+    } else {
+      return [];
+    }
   }
+
   return rawOptions
-    .map((o) => {
-      if (typeof o === "string") return { text: o.trim(), explanation: "" };
-      if (o && typeof o === "object") {
-        const text =
-          combine(o.text_en, o.text_hi) || o.text || o.option || o.value || o.label || o.answer || "";
-        const explanation =
-          combine(o.explanation_en, o.explanation_hi) ||
-          o.explanation || o.reason || o.description || o.why || "";
-        return { text: String(text).trim(), explanation: String(explanation).trim() };
+    .map((option) => {
+      if (typeof option === "string") {
+        return {
+          text: option.trim(),
+          explanation: "",
+        };
       }
-      return { text: String(o).trim(), explanation: "" };
+
+      if (!option || typeof option !== "object") {
+        return {
+          text: String(option || "").trim(),
+          explanation: "",
+        };
+      }
+
+      const text =
+        combine(option.text_en, option.text_hi) ||
+        option.text ||
+        option.option ||
+        option.value ||
+        option.label ||
+        option.answer ||
+        "";
+
+      const explanation =
+        combine(
+          option.explanation_en,
+          option.explanation_hi
+        ) ||
+        option.explanation ||
+        option.reason ||
+        option.description ||
+        "";
+
+      return {
+        text: String(text).trim(),
+        explanation: String(explanation).trim(),
+      };
     })
-    .filter((o) => o.text !== "");
+    .filter((option) => option.text);
 }
 
-function normalizeCorrectAnswer(ca, options) {
-  if (ca === null || ca === undefined) return "";
-  if (typeof ca === "number") ca = String(ca);
-  if (typeof ca !== "string") return "";
-  ca = ca.trim();
-  if (!ca) return "";
-  const letterIdx = ["A", "B", "C", "D"].indexOf(ca.toUpperCase());
-  if (letterIdx !== -1 && options[letterIdx]) return options[letterIdx].text;
-  if (/^[0-3]$/.test(ca) && options[parseInt(ca, 10)]) return options[parseInt(ca, 10)].text;
-  const exact = options.find((o) => o.text === ca);
-  if (exact) return exact.text;
-  const caEn = ca.split(" / ")[0].trim().toLowerCase();
-  if (caEn) {
-    const byEn = options.find((o) => o.text.split(" / ")[0].trim().toLowerCase() === caEn);
-    if (byEn) return byEn.text;
+function normalizeCorrectAnswer(rawAnswer, options) {
+  if (rawAnswer === null || rawAnswer === undefined) {
+    return "";
   }
-  return ca;
+
+  if (typeof rawAnswer === "number") {
+    rawAnswer = String(rawAnswer);
+  }
+
+  if (typeof rawAnswer !== "string") {
+    return "";
+  }
+
+  const answer = rawAnswer.trim();
+
+  if (!answer) return "";
+
+  const letterIndex = ["A", "B", "C", "D"].indexOf(
+    answer.toUpperCase()
+  );
+
+  if (letterIndex !== -1 && options[letterIndex]) {
+    return options[letterIndex].text;
+  }
+
+  if (/^[0-3]$/.test(answer)) {
+    const index = Number(answer);
+
+    if (options[index]) return options[index].text;
+  }
+
+  const exact = options.find(
+    (option) => option.text.toLowerCase() === answer.toLowerCase()
+  );
+
+  if (exact) return exact.text;
+
+  const englishAnswer = answer
+    .split(" / ")[0]
+    .trim()
+    .toLowerCase();
+
+  const englishMatch = options.find(
+    (option) =>
+      option.text
+        .split(" / ")[0]
+        .trim()
+        .toLowerCase() === englishAnswer
+  );
+
+  if (englishMatch) return englishMatch.text;
+
+  return "";
+}
+
+function shuffleArray(items) {
+  const result = [...items];
+
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+
+  return result;
 }
 
 function normalizeQuestion(raw) {
@@ -294,475 +521,887 @@ function normalizeQuestion(raw) {
     combine(raw.question_en, raw.question_hi) ||
     String(raw.question || raw.q || "").trim();
 
-  let options = normalizeOptions(raw.options || raw.choices || raw.answers || raw.answerOptions);
+  if (!question) return null;
 
-  let correctAnswer = normalizeCorrectAnswer(raw.correctAnswer || raw.answer, options);
+  const options = normalizeOptions(
+    raw.options ||
+      raw.choices ||
+      raw.answers ||
+      raw.answerOptions
+  );
 
-  // ✅ VALIDITY GUARD: agar correctAnswer kisi option se match nahi hota,
-  // to pehli option ko correct maano (warna question har answer par wrong dikhega)
-  if (options.length === 4 && !options.some((o) => o.text === correctAnswer)) {
-    correctAnswer = options[0].text;
-  }
+  if (options.length !== 4) return null;
 
-  // ✅ OPTION SHUFFLE (FIX): Gemini correct answer pehli position par likhta
-  // hai — options persist hone se PEHLE shuffle karo taaki correct answer ki
-  // position random ho. correctAnswer text-based hai, isliye shuffle ke baad
-  // bhi sahi option text hi "correct" rahega.
-  if (options.length === 4) {
-    options = shuffleArray(options);
-  }
+  const uniqueOptions = new Set(
+    options.map((option) => option.text.toLowerCase())
+  );
+
+  if (uniqueOptions.size !== 4) return null;
+
+  let correctAnswer = normalizeCorrectAnswer(
+    raw.correctAnswer ??
+      raw.correct_answer ??
+      raw.answer ??
+      raw.correctOption,
+    options
+  );
+
+  // Never silently invent a correct answer when the answer does not
+  // match any option. Reject the malformed question instead.
+  if (!correctAnswer) return null;
+
+  const normalizedOptions = options.map((option) => ({
+    text: option.text,
+    explanation: option.explanation || "",
+  }));
 
   return {
-    question: String(question).trim(),
+    question,
     type: raw.type || "technical",
     topic: raw.topic || "",
     page: raw.page || 1,
     difficulty: raw.difficulty || "Medium",
-    options,
+    options: shuffleArray(normalizedOptions),
     correctAnswer,
   };
 }
 
-function isBilingualQuestion(q) {
-  if (!q || !q.question) return false;
-  if (!hasHindi(q.question) || !hasEnglish(q.question)) return false;
-  if (!q.options || q.options.length !== 4) return false;
-  if (!q.correctAnswer) return false;
-  // ✅ SHUFFLE KE BAAD: correctAnswer valid option se match hona zaroori hai
-  if (!q.options.some((o) => o.text === q.correctAnswer)) return false;
-  const hiOpts = q.options.filter((o) => hasHindi(o.text));
-  return hiOpts.length >= 2;
+function isBilingualQuestion(question) {
+  if (!question?.question) return false;
+
+  if (
+    !hasHindi(question.question) ||
+    !hasEnglish(question.question)
+  ) {
+    return false;
+  }
+
+  if (!Array.isArray(question.options) || question.options.length !== 4) {
+    return false;
+  }
+
+  if (
+    !question.options.some(
+      (option) => option.text === question.correctAnswer
+    )
+  ) {
+    return false;
+  }
+
+  const bilingualOptions = question.options.filter(
+    (option) =>
+      hasHindi(option.text) &&
+      hasEnglish(option.text)
+  );
+
+  return bilingualOptions.length >= 2;
 }
 
-function buildPrompt(category, difficulty, batchCount, batchNo, totalBatches, extraHint = "") {
+function qKey(question) {
+  return String(question?.question || "")
+    .split(" / ")[0]
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ");
+}
+
+// ============================================================
+// CATEGORY-AWARE PROMPTS
+// ============================================================
+
+function buildPrompt(
+  category,
+  difficulty,
+  count,
+  batchNo = 1,
+  totalBatches = 1,
+  extraHint = ""
+) {
+  const selectedCategory = String(category || "General Knowledge").trim();
+  const selectedDifficulty = String(difficulty || "Medium").trim();
+
   return `
-You are an expert exam question generator for Indian competitive exams.
-Generate ${batchCount} HIGH QUALITY multiple choice questions for category "${category}" (difficulty: ${difficulty}).
+You are an expert question writer for AI Interview, Indian exams,
+competitive examinations, school subjects, technical interviews,
+professional interviews, and user-defined topics.
 
-🔤 LANGUAGE RULE (STRICT — MUST FOLLOW):
-Every question and every option MUST be provided in BOTH English AND Hindi (Devanagari).
-You will fill SEPARATE fields: question_en (English), question_hi (Hindi), text_en (English option), text_hi (Hindi option), explanation_en, explanation_hi.
-- Hindi must be proper Devanagari (देवनागरी लिपि), NOT Roman/Hinglish.
-- Never leave question_hi or text_hi empty. Empty Hindi = INVALID output.
+USER-SELECTED CATEGORY: "${selectedCategory}"
+DIFFICULTY: "${selectedDifficulty}"
+NUMBER OF QUESTIONS: ${count}
+BATCH: ${batchNo} of ${totalBatches}
+
+IMPORTANT CATEGORY RULES:
+1. Generate questions STRICTLY about the user's selected category.
+2. The category may be any topic, including a custom category not in
+   a predefined category list.
+3. Do not replace, reinterpret, or broaden the selected category.
+4. Ignore unrelated technology stack or role details.
+5. If the category is Haryana GK, generate Haryana GK questions.
+6. If the category is React, generate React questions.
+7. If the category is SSC GD, generate relevant SSC GD questions.
+8. For other user-provided topics, follow the actual topic.
+9. Use factual, clear, useful, non-duplicated questions.
+10. Do not claim a question appeared in a previous-year exam unless
+    you can establish that fact.
+
 ${extraHint}
-These are for a REAL EXAM PRACTICE TEST. Every question MUST be an IMPORTANT question from previous exams / previous year papers / common interview tests.
 
-This is batch ${batchNo} of ${totalBatches} — questions MUST be DIFFERENT from other batches.
+LANGUAGE REQUIREMENTS:
+- Each question must have an English version and a Hindi version.
+- Hindi must use Devanagari script.
+- Each option must have English and Hindi text.
+- Each option must include a short English and Hindi explanation.
+- Do not leave bilingual fields empty.
 
-Rules:
-1. ONLY important, frequently-asked exam questions.
-2. Every question MUST have exactly 4 options.
-3. Every option MUST have a SHORT explanation (max 12 words in English, max 12 words in Hindi).
-4. correctAnswer must EXACTLY equal one option's text_en (English only).
-5. No duplicate questions within this batch.
-6. Return ONLY valid JSON array. No markdown. No extra text.
+QUESTION REQUIREMENTS:
+- Generate exactly ${count} questions when possible.
+- Each question must have exactly four distinct options.
+- There must be exactly one correct option.
+- correctAnswer must exactly equal one option's text_en value.
+- The correct answer must be factually accurate.
+- Difficulty must match "${selectedDifficulty}".
+- Questions within this batch must be different from each other.
+- Do not output introductory text, Markdown, or code fences.
 
-JSON FORMAT:
+RETURN ONLY A JSON ARRAY USING THIS SCHEMA:
 [
- {
-  "question_en": "What is the capital of India?",
-  "question_hi": "भारत की राजधानी क्या है?",
-  "options": [
-    { "text_en": "New Delhi", "text_hi": "नई दिल्ली", "explanation_en": "It is the national capital.", "explanation_hi": "यह राष्ट्रीय राजधानी है।" },
-    { "text_en": "Mumbai", "text_hi": "मुंबई", "explanation_en": "It is the financial capital.", "explanation_hi": "यह वित्तीय राजधानी है।" },
-    { "text_en": "Kolkata", "text_hi": "कोलकाता", "explanation_en": "It is the cultural capital.", "explanation_hi": "यह सांस्कृतिक राजधानी है।" },
-    { "text_en": "Chennai", "text_hi": "चेन्नई", "explanation_en": "It is in Tamil Nadu.", "explanation_hi": "यह तमिलनाडु में है।" }
-  ],
-  "correctAnswer": "New Delhi",
-  "difficulty": "${difficulty}"
- }
+  {
+    "question_en": "What is the capital of India?",
+    "question_hi": "भारत की राजधानी क्या है?",
+    "options": [
+      {
+        "text_en": "New Delhi",
+        "text_hi": "नई दिल्ली",
+        "explanation_en": "It is India's national capital.",
+        "explanation_hi": "यह भारत की राष्ट्रीय राजधानी है।"
+      },
+      {
+        "text_en": "Mumbai",
+        "text_hi": "मुंबई",
+        "explanation_en": "It is Maharashtra's capital.",
+        "explanation_hi": "यह महाराष्ट्र की राजधानी है।"
+      },
+      {
+        "text_en": "Kolkata",
+        "text_hi": "कोलकाता",
+        "explanation_en": "It is West Bengal's capital.",
+        "explanation_hi": "यह पश्चिम बंगाल की राजधानी है।"
+      },
+      {
+        "text_en": "Chennai",
+        "text_hi": "चेन्नई",
+        "explanation_en": "It is Tamil Nadu's capital.",
+        "explanation_hi": "यह तमिलनाडु की राजधानी है।"
+      }
+    ],
+    "correctAnswer": "New Delhi",
+    "type": "general",
+    "topic": "${selectedCategory}",
+    "difficulty": "${selectedDifficulty}"
+  }
 ]
 `;
 }
 
-// ---------- CORE: bank generate with partial success ----------
-async function generateBankInternal(category, difficulty, targetSize) {
-  const BATCH_SIZE = 8;
-  const CONCURRENCY = 1;
-  const TOP_UP_ROUNDS = 3;
+// ============================================================
+// VALIDATE, DEDUPLICATE, AND PRESERVE PARTIAL RESULTS
+// ============================================================
+
+function normalizeGeneratedArray(rawArray, seen = new Set()) {
+  if (!Array.isArray(rawArray)) return [];
+
+  const result = [];
+
+  for (const raw of rawArray) {
+    const normalized = normalizeQuestion(raw);
+
+    if (!normalized) continue;
+
+    if (!isBilingualQuestion(normalized)) continue;
+
+    const key = qKey(normalized);
+
+    if (!key || seen.has(key)) continue;
+
+    seen.add(key);
+    result.push(normalized);
+  }
+
+  return result;
+}
+
+async function generateBatch(
+  category,
+  difficulty,
+  requestedCount,
+  batchNo,
+  totalBatches,
+  seen,
+  extraHint = "",
+  retry = true
+) {
+  const prompt = buildPrompt(
+    category,
+    difficulty,
+    requestedCount,
+    batchNo,
+    totalBatches,
+    extraHint
+  );
+
+  try {
+    const response = await callGemini(prompt, DEFAULT_TIMEOUT_MS);
+    const parsed = parseJsonArray(response);
+
+    const valid = normalizeGeneratedArray(
+      parsed,
+      seen
+    ).slice(0, requestedCount);
+
+    if (valid.length > 0) return valid;
+
+    console.warn(
+      `[AI-GENERATOR] Empty valid batch: category="${category}" batch=${batchNo}`
+    );
+
+    if (retry && !isQuotaExhausted()) {
+      return generateBatch(
+        category,
+        difficulty,
+        requestedCount,
+        batchNo,
+        totalBatches,
+        seen,
+        "The previous response was invalid or empty. Return only valid JSON with four options and a matching correctAnswer.",
+        false
+      );
+    }
+
+    return [];
+  } catch (error) {
+    console.error(
+      `[AI-GENERATOR] Batch failed: category="${category}" difficulty="${difficulty}" batch=${batchNo}/${totalBatches}:`,
+      error.message
+    );
+
+    if (retry && !isQuotaExhausted()) {
+      return generateBatch(
+        category,
+        difficulty,
+        requestedCount,
+        batchNo,
+        totalBatches,
+        seen,
+        "Retry the previous request. Return a valid, non-empty JSON array.",
+        false
+      );
+    }
+
+    return [];
+  }
+}
+
+// ============================================================
+// QUESTION BANK GENERATION
+// ============================================================
+
+async function generateBankInternal(
+  category,
+  difficulty,
+  targetSize
+) {
+  const requested = Math.min(
+    Math.max(Number(targetSize) || 1, 1),
+    MAX_QUESTION_COUNT
+  );
+
+  const batchSize = 8;
   const seen = new Set();
   const all = [];
 
-  const batchCounts = [];
-  let remaining = targetSize;
-  while (remaining > 0) {
-    batchCounts.push(Math.min(BATCH_SIZE, remaining));
-    remaining -= BATCH_SIZE;
-  }
-  const totalBatches = batchCounts.length;
+  const totalBatches = Math.ceil(requested / batchSize);
 
-  async function runBatch(batchNo, batchCount, tryNo = 1) {
-    if (batchCount <= 0) return [];
-    const extraHint = tryNo > 1 ? "⚠️ PREVIOUS ATTEMPT WAS REJECTED." : "";
-    const prompt = buildPrompt(category, difficulty, batchCount, batchNo, totalBatches, extraHint);
-    const text = await callGemini(prompt, 30000);
-    const arr = parseJsonArray(text);
-    if (!Array.isArray(arr)) return [];
-    const normalized = arr.map(normalizeQuestion).filter(Boolean);
-    const bilingual = normalized.filter(isBilingualQuestion);
-    const fresh = bilingual.filter((q) => {
-      const key = qKey(q);
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-    if (fresh.length < batchCount && tryNo < 2 && !isQuotaExhausted()) {
-      const more = await runBatch(batchNo, batchCount - fresh.length, 2);
-      fresh.push(...more);
+  for (let batch = 1; batch <= totalBatches; batch++) {
+    if (isQuotaExhausted()) {
+      console.warn(
+        `[AI-GENERATOR] Quota exhausted; preserving ${all.length} generated questions`
+      );
+      break;
     }
-    return fresh;
+
+    const count = Math.min(
+      batchSize,
+      requested - all.length
+    );
+
+    if (count <= 0) break;
+
+    const fresh = await generateBatch(
+      category,
+      difficulty,
+      count,
+      batch,
+      totalBatches,
+      seen
+    );
+
+    all.push(...fresh);
+
+    console.log(
+      `[AI-GENERATOR] Bank batch ${batch}/${totalBatches}: +${fresh.length}; total=${all.length}/${requested}`
+    );
+
+    if (all.length >= requested) break;
+
+    if (batch < totalBatches && !isQuotaExhausted()) {
+      await sleep(1000);
+    }
   }
 
-  let index = 0;
-  while (index < totalBatches) {
-    if (isQuotaExhausted()) break;
-    const slice = batchCounts.slice(index, index + CONCURRENCY);
-    const settled = await Promise.allSettled(slice.map((c, i) => runBatch(index + i + 1, c)));
-    settled.forEach((s, i) => {
-      if (s.status === "fulfilled") all.push(...s.value);
-      else console.log(`❌ Batch ${index + i + 1} fail: ${s.reason?.message || s.reason}`);
-    });
-    index += CONCURRENCY;
-    if (index < totalBatches && !isQuotaExhausted()) await sleep(5000);
-  }
-
+  // A small top-up is useful when the model returns fewer valid questions
+  // than requested. Never discard valid questions if the top-up fails.
   let topUpRounds = 0;
-  while (all.length < targetSize && topUpRounds < TOP_UP_ROUNDS && !isQuotaExhausted()) {
+
+  while (
+    all.length < requested &&
+    topUpRounds < 2 &&
+    !isQuotaExhausted()
+  ) {
     topUpRounds++;
-    const missing = targetSize - all.length;
-    const hint = "⚠️ These questions MUST be NEW and DIFFERENT.";
-    const prompt = buildPrompt(category, difficulty, Math.min(missing, 8), 99, 99, hint);
-    try {
-      const text = await callGemini(prompt, 30000);
-      const arr = parseJsonArray(text);
-      if (Array.isArray(arr)) {
-        const fresh = arr
-          .map(normalizeQuestion)
-          .filter(Boolean)
-          .filter(isBilingualQuestion)
-          .filter((q) => {
-            const key = qKey(q);
-            if (!key || seen.has(key)) return false;
-            seen.add(key);
-            return true;
-          });
-        all.push(...fresh.slice(0, missing));
-      }
-    } catch (e) {
-      console.log("Top-up fail:", e.message);
+
+    const missing = requested - all.length;
+    const topUpCount = Math.min(missing, 8);
+
+    const fresh = await generateBatch(
+      category,
+      difficulty,
+      topUpCount,
+      totalBatches + topUpRounds,
+      totalBatches + topUpRounds,
+      seen,
+      "Generate new questions that are different from every previous batch."
+    );
+
+    all.push(...fresh);
+
+    if (all.length < requested) {
+      await sleep(1000);
     }
-    if (!isQuotaExhausted()) await sleep(3000);
   }
+
+  console.log(
+    `[AI-GENERATOR] Bank result category="${category}" difficulty="${difficulty}" requested=${requested} valid=${all.length} quotaExhausted=${isQuotaExhausted()}`
+  );
 
   return {
-    questions: all,
+    questions: all.slice(0, requested),
     stats: {
-      requested: targetSize,
-      generated: batchCounts.reduce((a, b) => a + b, 0),
+      requested,
       valid: all.length,
-      duplicates: seen.size - all.length,
       topUpRounds,
     },
   };
 }
 
-async function generateBank(category, difficulty = "Medium", targetSize = 100) {
-  const { questions } = await generateBankInternal(category, difficulty, targetSize);
-  console.log(`🎉 Bank ready: ${questions.length}/${targetSize} unique bilingual questions`);
+async function generateBank(
+  category,
+  difficulty = "Medium",
+  targetSize = 100
+) {
+  const result = await generateBankInternal(
+    category,
+    difficulty,
+    targetSize
+  );
+
+  console.log(
+    `🎉 [AI-GENERATOR] Bank completed: ${result.questions.length}/${targetSize}`
+  );
+
+  return result.questions;
+}
+
+async function generateQuestions(
+  category,
+  difficulty = "Medium",
+  count = 50,
+  useCache = false
+) {
+  const requested = Math.min(
+    Math.max(Number(count) || 1, 1),
+    MAX_QUESTION_COUNT
+  );
+
+  if (useCache) {
+    const cached = getCached(category, difficulty);
+
+    if (cached?.length) {
+      console.log(
+        `[AI-GENERATOR] Cache hit: ${category}/${difficulty}`
+      );
+
+      return cached.slice(0, requested);
+    }
+  }
+
+  const result = await generateBankInternal(
+    category,
+    difficulty,
+    requested
+  );
+
+  const questions = result.questions.slice(0, requested);
+
+  if (!questions.length) {
+    throw new Error(
+      `No valid questions generated for "${category}" (${difficulty}). Check Gemini quota, API errors, and generation logs.`
+    );
+  }
+
+  saveCache(category, difficulty, questions);
+
   return questions;
 }
 
-async function generateQuestions(category, difficulty = "Medium", count = 50, useCache = false) {
-  if (useCache) {
-    const cached = getCached(category, difficulty);
-    if (cached && cached.length >= Math.min(count, 3)) {
-      console.log(`CACHE HIT: ${category} (${cached.length} bilingual questions)`);
-      return cached.slice(0, count);
+// ============================================================
+// INTERVIEW QUESTION GENERATION
+// ============================================================
+
+async function generateInterviewQuestions(
+  category,
+  difficulty = "Medium",
+  count = 30,
+  extraHint = ""
+) {
+  const requested = Math.min(
+    Math.max(Number(count) || 1, 1),
+    MAX_QUESTION_COUNT
+  );
+
+  const startTime = Date.now();
+  const overallTimeout = 120000;
+  const batchSize = 8;
+  const totalBatches = Math.ceil(requested / batchSize);
+
+  const seen = new Set();
+  const all = [];
+
+  console.log(
+    `[AI-INTERVIEW] Starting category="${category}" difficulty="${difficulty}" requested=${requested}`
+  );
+
+  for (let batch = 1; batch <= totalBatches; batch++) {
+    if (Date.now() - startTime >= overallTimeout) {
+      console.warn("[AI-INTERVIEW] Overall generation timeout reached");
+      break;
+    }
+
+    if (isQuotaExhausted()) {
+      console.warn("[AI-INTERVIEW] Gemini quota exhausted");
+      break;
+    }
+
+    const countForBatch = Math.min(
+      batchSize,
+      requested - all.length
+    );
+
+    if (countForBatch <= 0) break;
+
+    const fresh = await generateBatch(
+      category,
+      difficulty,
+      countForBatch,
+      batch,
+      totalBatches,
+      seen,
+      extraHint
+    );
+
+    all.push(...fresh);
+
+    console.log(
+      `[AI-INTERVIEW] Batch ${batch}/${totalBatches}: +${fresh.length}; total=${all.length}/${requested}`
+    );
+
+    if (all.length >= requested) break;
+
+    if (batch < totalBatches && !isQuotaExhausted()) {
+      await sleep(500);
     }
   }
-  clearCache(category, difficulty);
-  const { questions } = await generateBankInternal(category, difficulty, count);
-  const result = questions.slice(0, count);
-  if (!result.length) throw new Error("AI ne bilingual questions nahi diye");
-  saveCache(category, difficulty, result);
-  console.log(`🎉 TOTAL: ${result.length} bilingual questions`);
-  return result;
+
+  console.log(
+    `[AI-INTERVIEW] Finished category="${category}" difficulty="${difficulty}" requested=${requested} valid=${all.length} quotaExhausted=${isQuotaExhausted()} elapsedMs=${Date.now() - startTime}`
+  );
+
+  // Partial valid results are deliberately returned instead of discarded.
+  return all.slice(0, requested);
 }
 
 // ============================================================
-// RESUME FAST FLOW — resume snippet seedha prompt me
-// (topic-extraction call nahi)
-// FIX: per-batch retry + top-up + partial preserve
+// RESUME FAST GENERATION
 // ============================================================
 
-const RESUME_BATCH_SIZE = 8;
-const RESUME_TOP_UP_ROUNDS = 3;
-const RESUME_TIMEOUT_MS = 45000;
+function resumeBatchPrompt(
+  snippet,
+  batchCount,
+  batchNo,
+  totalBatches,
+  extraHint = ""
+) {
+  return `
+You are an expert interviewer.
 
-function resumeBatchPrompt(snippet, batchCount, batchNo, totalBatches, extraHint = "") {
-  return `You are an expert technical interviewer.
-This candidate's resume:
+Analyze the candidate resume below and create interview questions
+based on the actual skills, projects, tools, and experience mentioned.
+
+RESUME:
 """
-${snippet}
+${String(snippet || "").slice(0, 4000)}
 """
 
-Generate ${batchCount} multiple choice interview questions based on the skills/topics in this resume (batch ${batchNo} of ${totalBatches} — make questions DIFFERENT from other batches).
+Generate ${batchCount} questions.
+Batch ${batchNo} of ${totalBatches}.
+
 ${extraHint}
-🔤 LANGUAGE RULE (STRICT): Every question and option MUST be in BOTH English AND Hindi (Devanagari).
-Fields: question_en, question_hi, text_en, text_hi, explanation_en, explanation_hi. Empty Hindi = INVALID.
 
-Rules:
-1. Exactly 4 options per question.
-2. SHORT explanation per option (max 12 words each language).
-3. correctAnswer must EXACTLY equal one option's text_en.
-4. Return ONLY valid JSON array. No markdown.
+Every question and option must include English and Hindi in Devanagari.
+Each question must have exactly four distinct options.
+Each option must have a short explanation in both languages.
+correctAnswer must exactly match one option's text_en.
 
-JSON FORMAT:
+Return only a valid JSON array using this schema:
 [
- {
-  "question_en": "What does Tor primarily provide?",
-  "question_hi": "Tor मुख्य रूप से क्या प्रदान करता है?",
-  "options": [
-    { "text_en": "Anonymity", "text_hi": "गुमनामी", "explanation_en": "Tor routes traffic anonymously.", "explanation_hi": "Tor ट्रैफिक को गुमनाम रूट करता है।" },
-    { "text_en": "Speed", "text_hi": "गति", "explanation_en": "Tor is slower.", "explanation_hi": "Tor धीमा है।" },
-    { "text_en": "Encryption keys", "text_hi": "एन्क्रिप्शन कुंजियाँ", "explanation_en": "Not its purpose.", "explanation_hi": "यह इसका उद्देश्य नहीं है।" },
-    { "text_en": "Firewall", "text_hi": "फ़ायरवॉल", "explanation_en": "Tor is not a firewall.", "explanation_hi": "Tor फ़ायरवॉल नहीं है।" }
-  ],
-  "correctAnswer": "Anonymity",
-  "type": "technical",
-  "difficulty": "Medium"
- }
-]`;
+  {
+    "question_en": "What does an operating system manage?",
+    "question_hi": "ऑपरेटिंग सिस्टम किसका प्रबंधन करता है?",
+    "options": [
+      {
+        "text_en": "Computer resources",
+        "text_hi": "कंप्यूटर संसाधन",
+        "explanation_en": "It manages hardware and software resources.",
+        "explanation_hi": "यह हार्डवेयर और सॉफ्टवेयर संसाधन प्रबंधित करता है।"
+      },
+      {
+        "text_en": "Only the monitor",
+        "text_hi": "केवल मॉनिटर",
+        "explanation_en": "Its responsibilities are broader.",
+        "explanation_hi": "इसकी जिम्मेदारियाँ अधिक व्यापक हैं।"
+      },
+      {
+        "text_en": "Only the keyboard",
+        "text_hi": "केवल कीबोर्ड",
+        "explanation_en": "It manages many system resources.",
+        "explanation_hi": "यह कई सिस्टम संसाधन प्रबंधित करता है।"
+      },
+      {
+        "text_en": "Only the mouse",
+        "text_hi": "केवल माउस",
+        "explanation_en": "It manages more than input devices.",
+        "explanation_hi": "यह इनपुट डिवाइस से अधिक प्रबंधित करता है।"
+      }
+    ],
+    "correctAnswer": "Computer resources",
+    "type": "technical",
+    "difficulty": "Medium"
+  }
+]
+`;
 }
 
-// Ek resume batch ko run + normalize + dedupe karo; empty par ek retry
-async function runResumeBatch(snippet, batchNo, totalBatches, seen, tryNo = 1) {
-  const extraHint =
-    tryNo > 1
-      ? "⚠️ PREVIOUS ATTEMPT WAS EMPTY/INVALID — output MUST be a non-empty valid JSON array."
-      : "";
-  const prompt = resumeBatchPrompt(snippet, RESUME_BATCH_SIZE, batchNo, totalBatches, extraHint);
-
+async function runResumeBatch(
+  snippet,
+  batchNo,
+  totalBatches,
+  seen,
+  retry = true
+) {
   try {
-    const text = await callGemini(prompt, RESUME_TIMEOUT_MS);
-    const arr = parseJsonArray(text);
-    if (!Array.isArray(arr)) {
-      if (tryNo < 2 && !isQuotaExhausted()) {
-        console.log(`📄 [RESUME-FAST] Batch ${batchNo} empty/invalid — retry (${tryNo + 1})`);
-        return await runResumeBatch(snippet, batchNo, totalBatches, seen, tryNo + 1);
-      }
-      return [];
+    const prompt = resumeBatchPrompt(
+      snippet,
+      8,
+      batchNo,
+      totalBatches,
+      retry ? "" : "Return valid, non-empty JSON only."
+    );
+
+    const response = await callGemini(prompt, DEFAULT_TIMEOUT_MS);
+    const parsed = parseJsonArray(response);
+
+    const fresh = normalizeGeneratedArray(parsed, seen);
+
+    if (fresh.length) return fresh;
+
+    if (retry && !isQuotaExhausted()) {
+      return runResumeBatch(
+        snippet,
+        batchNo,
+        totalBatches,
+        seen,
+        false
+      );
     }
-    const fresh = arr
-      .map(normalizeQuestion)
-      .filter(Boolean)
-      .filter(isBilingualQuestion)
-      .filter((q) => {
-        const key = qKey(q);
-        if (!key || seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-    return fresh;
-  } catch (e) {
-    console.log(`📄 [RESUME-FAST] Batch ${batchNo} fail: ${e.message}`);
-    if (tryNo < 2 && !isQuotaExhausted()) {
-      return await runResumeBatch(snippet, batchNo, totalBatches, seen, tryNo + 1);
+
+    return [];
+  } catch (error) {
+    console.error(
+      `[RESUME-FAST] Batch ${batchNo} failed:`,
+      error.message
+    );
+
+    if (retry && !isQuotaExhausted()) {
+      return runResumeBatch(
+        snippet,
+        batchNo,
+        totalBatches,
+        seen,
+        false
+      );
     }
+
     return [];
   }
 }
 
-async function generateResumeQuestionsFast(resumeText, count = 30) {
-  if (!resumeText || !String(resumeText).trim()) {
-    throw new Error("Resume text empty hai");
+async function generateResumeQuestionsFast(
+  resumeText,
+  count = 30
+) {
+  if (!String(resumeText || "").trim()) {
+    throw new Error("Resume text is empty");
   }
+
+  const requested = Math.min(
+    Math.max(Number(count) || 1, 1),
+    MAX_QUESTION_COUNT
+  );
 
   const snippet = String(resumeText).slice(0, 4000);
   const seen = new Set();
   const all = [];
-  const totalBatches = Math.ceil(count / RESUME_BATCH_SIZE);
+  const batchSize = 8;
+  const totalBatches = Math.ceil(requested / batchSize);
 
-  for (let b = 1; b <= totalBatches; b++) {
+  for (let batch = 1; batch <= totalBatches; batch++) {
     if (isQuotaExhausted()) break;
 
-    const fresh = await runResumeBatch(snippet, b, totalBatches, seen);
-    all.push(...fresh);
-    console.log(`📄 [RESUME-FAST] Batch ${b}: +${fresh.length} → ${all.length}`);
+    const batchCount = Math.min(
+      batchSize,
+      requested - all.length
+    );
 
-    if (b < totalBatches && !isQuotaExhausted()) await sleep(2000);
-  }
-
-  // TOP-UP — partial success preserve karte hue missing fill karo
-  let topUpRounds = 0;
-  while (all.length < count && topUpRounds < RESUME_TOP_UP_ROUNDS && !isQuotaExhausted()) {
-    topUpRounds++;
-    const missing = count - all.length;
     const fresh = await runResumeBatch(
       snippet,
-      99 + topUpRounds,
-      99 + topUpRounds,
-      seen,
-      2
+      batch,
+      totalBatches,
+      seen
     );
-    all.push(...fresh.slice(0, missing));
-    console.log(`📄 [RESUME-FAST] Top-up ${topUpRounds}: → ${all.length}`);
-    if (!isQuotaExhausted()) await sleep(2000);
+
+    all.push(...fresh.slice(0, batchCount));
+
+    console.log(
+      `[RESUME-FAST] Batch ${batch}: total=${all.length}/${requested}`
+    );
+
+    if (all.length >= requested) break;
+
+    if (batch < totalBatches && !isQuotaExhausted()) {
+      await sleep(500);
+    }
   }
 
   if (!all.length) {
-    // REAL unrecoverable failure — abhi bhi throw, message shape same
-    throw new Error("AI se questions nahi bane (quota/model issue) — 2 min baad try karo");
+    throw new Error(
+      "No valid resume questions generated. Check Gemini API, quota, and logs."
+    );
   }
-  return all.slice(0, count);
+
+  return all.slice(0, requested);
 }
 
-// ---------- Resume flow (topics-based, slow but deeper) ----------
-async function extractResumeTopics(resumeText) {
-  const trimmed = String(resumeText || "").slice(0, 6000);
-  const prompt = `Analyze this resume and extract the TOP 8 technical/skill topics for an interview quiz.
-Return ONLY a valid JSON object: {"topics": ["topic1", "topic2", ...]}
+// ============================================================
+// RESUME TOPIC EXTRACTION
+// ============================================================
 
-RESUME:
-${trimmed}`;
+async function extractResumeTopics(resumeText) {
+  const snippet = String(resumeText || "").slice(0, 6000);
+
+  if (!snippet.trim()) {
+    return ["Technical Skills", "Problem Solving", "Core Concepts"];
+  }
+
+  const prompt = `
+Analyze this resume and extract up to 8 specific interview topics.
+
+Return only JSON:
+{"topics":["topic1","topic2","topic3"]}
+
+Resume:
+"""
+${snippet}
+"""
+`;
 
   try {
-    const text = await callGemini(prompt, 45000);
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start !== -1 && end > start) {
-      const parsed = JSON.parse(text.slice(start, end + 1));
-      if (Array.isArray(parsed.topics) && parsed.topics.length) {
-        return parsed.topics.filter((t) => typeof t === "string").slice(0, 8);
+    const response = await callGemini(prompt, DEFAULT_TIMEOUT_MS);
+
+    const start = response.indexOf("{");
+    const end = response.lastIndexOf("}");
+
+    if (start >= 0 && end > start) {
+      const parsed = JSON.parse(response.slice(start, end + 1));
+
+      if (Array.isArray(parsed.topics)) {
+        const topics = parsed.topics
+          .filter((topic) => typeof topic === "string")
+          .map((topic) => topic.trim())
+          .filter(Boolean)
+          .slice(0, 8);
+
+        if (topics.length) return topics;
       }
     }
-  } catch (e) {
-    console.log("⚠️ Topic extraction fail:", e.message);
+  } catch (error) {
+    console.warn(
+      "[RESUME] Topic extraction failed:",
+      error.message
+    );
   }
-  return ["Technical Skills", "Problem Solving", "Core Concepts"];
+
+  return [
+    "Technical Skills",
+    "Problem Solving",
+    "Core Concepts",
+  ];
 }
 
-async function generateResumeQuestions(resumeText, count = 50) {
-  if (!resumeText || !String(resumeText).trim()) {
-    throw new Error("Resume text empty hai");
+async function generateResumeQuestions(
+  resumeText,
+  count = 50
+) {
+  if (!String(resumeText || "").trim()) {
+    throw new Error("Resume text is empty");
   }
+
+  const requested = Math.min(
+    Math.max(Number(count) || 1, 1),
+    MAX_QUESTION_COUNT
+  );
 
   const topics = await extractResumeTopics(resumeText);
-  console.log(`📄 [RESUME] Topics: ${topics.join(", ")}`);
 
-  const BATCH_SIZE = 8;
+  console.log("[RESUME] Topics:", topics.join(", "));
+
   const seen = new Set();
   const all = [];
-  let topicIdx = 0;
-  let rounds = 0;
-  const maxRounds = Math.ceil(count / BATCH_SIZE) + 4;
+  const startTime = Date.now();
+  const maxRounds = Math.ceil(requested / 8) + 3;
 
-  while (all.length < count && rounds < maxRounds && !isQuotaExhausted()) {
-    rounds++;
-    const topic = topics[topicIdx % topics.length];
-    topicIdx++;
-    const batchCount = Math.min(BATCH_SIZE, count - all.length);
+  for (
+    let round = 1;
+    round <= maxRounds && all.length < requested;
+    round++
+  ) {
+    if (isQuotaExhausted()) break;
 
-    const prompt = `You are an expert technical interviewer.
-Generate ${batchCount} multiple choice interview questions about "${topic}" — relevant to this candidate's resume.
+    const topic = topics[(round - 1) % topics.length];
+    const missing = requested - all.length;
+    const batchCount = Math.min(8, missing);
 
-🔤 LANGUAGE RULE (STRICT): Every question and option MUST be in BOTH English AND Hindi (Devanagari).
-Fields: question_en, question_hi, text_en, text_hi, explanation_en, explanation_hi. Empty Hindi = INVALID.
+    const prompt = `
+You are an expert interviewer.
 
-Rules:
-1. Exactly 4 options per question.
-2. SHORT explanation per option (max 12 words each language).
-3. correctAnswer must EXACTLY equal one option's text_en.
-4. Return ONLY valid JSON array. No markdown.
+Generate ${batchCount} questions about "${topic}" based on this resume:
+"""
+${String(resumeText).slice(0, 5000)}
+"""
 
-Return valid JSON array with fields: question_en, question_hi, options[{text_en,text_hi,explanation_en,explanation_hi}], correctAnswer, type, topic, difficulty.`;
+Every question and option must be bilingual English and Hindi.
+Use Devanagari for Hindi.
+Exactly four options per question.
+Each option needs an explanation in both languages.
+correctAnswer must exactly match one option's text_en.
+Generate questions specific to the topic.
+Return only a valid JSON array.
+
+Schema:
+[
+  {
+    "question_en": "Example question?",
+    "question_hi": "उदाहरण प्रश्न?",
+    "options": [
+      {
+        "text_en": "Option A",
+        "text_hi": "विकल्प A",
+        "explanation_en": "Explanation.",
+        "explanation_hi": "व्याख्या।"
+      },
+      {
+        "text_en": "Option B",
+        "text_hi": "विकल्प B",
+        "explanation_en": "Explanation.",
+        "explanation_hi": "व्याख्या।"
+      },
+      {
+        "text_en": "Option C",
+        "text_hi": "विकल्प C",
+        "explanation_en": "Explanation.",
+        "explanation_hi": "व्याख्या।"
+      },
+      {
+        "text_en": "Option D",
+        "text_hi": "विकल्प D",
+        "explanation_en": "Explanation.",
+        "explanation_hi": "व्याख्या।"
+      }
+    ],
+    "correctAnswer": "Option A",
+    "topic": "${topic}",
+    "difficulty": "Medium"
+  }
+]
+`;
 
     try {
-      const text = await callGemini(prompt, 30000);
-      const arr = parseJsonArray(text);
-      if (Array.isArray(arr)) {
-        const fresh = arr
-          .map(normalizeQuestion)
-          .filter(Boolean)
-          .filter(isBilingualQuestion)
-          .filter((q) => {
-            const key = qKey(q);
-            if (!key || seen.has(key)) return false;
-            seen.add(key);
-            return true;
-          });
-        all.push(...fresh.slice(0, batchCount));
-        console.log(`📄 [RESUME] Round ${rounds} (${topic}): +${fresh.length} → ${all.length}`);
-      }
-    } catch (e) {
-      console.log(`📄 [RESUME] Round ${rounds} fail: ${e.message}`);
+      const response = await callGemini(prompt, DEFAULT_TIMEOUT_MS);
+      const parsed = parseJsonArray(response);
+      const fresh = normalizeGeneratedArray(parsed, seen);
+
+      all.push(...fresh.slice(0, batchCount));
+
+      console.log(
+        `[RESUME] Round ${round}: +${fresh.length}; total=${all.length}/${requested}`
+      );
+    } catch (error) {
+      console.error(
+        `[RESUME] Round ${round} failed:`,
+        error.message
+      );
     }
 
-    if (all.length < count && !isQuotaExhausted()) await sleep(3000);
+    if (all.length < requested && !isQuotaExhausted()) {
+      await sleep(500);
+    }
   }
+
+  console.log(
+    `[RESUME] Finished: valid=${all.length}/${requested}; elapsedMs=${Date.now() - startTime}`
+  );
 
   if (!all.length) {
-    throw new Error("AI ne resume-based questions generate nahi kiye");
-  }
-  return all.slice(0, count);
-}
-
-// ---------- Interview flow (fast path) ----------
-async function generateInterviewQuestions(category, difficulty = "Medium", count = 30, extraHint = "") {
-  const BATCH_SIZE = 8;
-  const MAX_CONCURRENCY = 3;
-  const PER_CALL_TIMEOUT = 30000;
-  const OVERALL_TIMEOUT = 120000;
-  const startTime = Date.now();
-  const all = [];
-  const seen = new Set();
-  const batchCounts = [];
-  let remaining = count;
-  while (remaining > 0) {
-    batchCounts.push(Math.min(BATCH_SIZE, remaining));
-    remaining -= BATCH_SIZE;
-  }
-  const totalBatches = batchCounts.length;
-  let index = 0;
-  while (index < totalBatches) {
-    if (Date.now() - startTime > OVERALL_TIMEOUT) break;
-    const slice = batchCounts.slice(index, Math.min(index + MAX_CONCURRENCY, totalBatches));
-    if (slice.length === 0) break;
-    const results = await Promise.allSettled(
-      slice.map((c, i) => {
-        const batchNo = index + i + 1;
-        const prompt = buildPrompt(category, difficulty, c, batchNo, totalBatches, extraHint);
-        return callGemini(prompt, PER_CALL_TIMEOUT)
-          .then((text) => {
-            if (!text) return [];
-            const arr = parseJsonArray(text);
-            if (!Array.isArray(arr)) return [];
-            return arr.map(normalizeQuestion).filter(Boolean).filter(isBilingualQuestion);
-          })
-          .catch((err) => {
-            console.log(`⚡ Batch ${batchNo} failed: ${String(err.message || err).slice(0, 80)}`);
-            return [];
-          });
-      })
+    throw new Error(
+      "No valid resume questions generated. Check Gemini API and quota."
     );
-    results.forEach((s) => {
-      if (s.status === "fulfilled") all.push(...s.value);
-    });
-    index += MAX_CONCURRENCY;
-    if (isQuotaExhausted()) break;
   }
-  const deduped = all.filter((q) => {
-    const key = qKey(q);
-    if (!key || seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-  return deduped.slice(0, count);
+
+  return all.slice(0, requested);
 }
 
 // ============================================================
-// EXPORTS — generateResumeQuestionsFast ZAROORI HAI
+// EXPORTS
 // ============================================================
+
 module.exports = {
   generateQuestions,
   generateResumeQuestions,
