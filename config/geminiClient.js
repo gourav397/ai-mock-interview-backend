@@ -361,42 +361,33 @@ class AlexGeminiClient {
           }`
         );
 
-        const res =
-          await fetch(url, {
-            method: "POST",
+        const res = await fetch(url, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "x-goog-api-key": keyObj.key,
+  },
+  body: JSON.stringify(body),
+  signal: controller.signal,
+});
 
-            headers: {
-              "Content-Type":
-                "application/json",
-              "x-goog-api-key":
-                keyObj.key,
-            },
+let responseText = "";
+let responseBody = null;
 
-            body:
-              JSON.stringify(body),
+try {
+  responseText = await res.text();
 
-            signal:
-              controller.signal,
-          });
-
-        clearTimeout(timer);
-
-        let responseText = "";
-        let responseBody = null;
-
-        try {
-          responseText =
-            await res.text();
-
-          if (responseText) {
-            responseBody =
-              JSON.parse(
-                responseText
-              );
-          }
-        } catch {
-          responseBody = null;
-        }
+  if (responseText) {
+    try {
+      responseBody = JSON.parse(responseText);
+    } catch {
+      responseBody = null;
+    }
+  }
+} finally {
+  // Timeout response body read hone ke baad hi clear hoga.
+  clearTimeout(timer);
+}
 
         // ====================================================
         // SUCCESS
