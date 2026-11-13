@@ -197,7 +197,8 @@ function calculateResult(questions, answers) {
 
 function getParticipant(room, userId) {
   return room.participants.find(
-    (participant) => String(participant.user) === String(userId)
+    (participant) =>
+      String(participant.user?._id || participant.user) === String(userId)
   );
 }
 
