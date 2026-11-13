@@ -128,6 +128,32 @@ function getPublicQuestion(question) {
   return copy;
 }
 
+function getAnswerReview(questions, answers) {
+  return questions.map((question, index) => {
+    const correctAnswer = getCorrectAnswer(question);
+    const yourAnswer = answers?.[String(index)] ?? "";
+
+    return {
+      questionIndex: index,
+      question: getPublicQuestion(question),
+      yourAnswer,
+      correctAnswer,
+      isCorrect:
+        yourAnswer !== "" &&
+        normalizeAnswer(yourAnswer) === normalizeAnswer(correctAnswer),
+      explanation:
+        question.explanation ||
+        question.explanation_en ||
+        question.explanation_hi ||
+        question.explain ||
+        question.solution ||
+        question.solution_en ||
+        question.solution_hi ||
+        "",
+    };
+  });
+}
+
 function calculateResult(questions, answers) {
   let correct = 0;
   let wrong = 0;
@@ -249,17 +275,22 @@ function getBattleResponse(room, userId) {
     opponent: getParticipantView(opponent, room),
 
     results: isCompleted
-      ? room.participants.map((participant) => ({
-          user: participant.user,
-          status: participant.status,
-          correctQuestions: participant.correctQuestions,
-          wrongQuestions: participant.wrongQuestions,
-          skippedQuestions: participant.skippedQuestions,
-          score: participant.score,
-          percentage: participant.percentage,
-          timeTakenSeconds: participant.timeTakenSeconds,
-        }))
-      : null,
+  ? room.participants.map((participant) => ({
+      user: participant.user,
+      status: participant.status,
+      correctQuestions: participant.correctQuestions,
+      wrongQuestions: participant.wrongQuestions,
+      skippedQuestions: participant.skippedQuestions,
+      score: participant.score,
+      percentage: participant.percentage,
+      timeTakenSeconds: participant.timeTakenSeconds,
+
+      answerReview: getAnswerReview(
+        room.questions,
+        participant.answers || {}
+      ),
+    }))
+  : null,
 
     winner,
     completedAt: room.completedAt,
