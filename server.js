@@ -149,6 +149,8 @@ app.use("/api/interview", interviewRoutes);
 app.use("/api/admin/questions", adminQuestionRoutes);
 app.use("/api/ai-interview", aiInterviewRoutes);
 app.use("/api/ai-interview", aiInterviewVoiceRoutes);
+const quizBattleRoutes = require("./routes/quizBattleRoutes");
+app.use("/api/quiz-battles", quizBattleRoutes);
 app.use("/api/results", resultRoutes);
 app.use("/api/upload", uploadRoutes);
 app.use("/api/gamification", gamificationRoutes);
@@ -334,43 +336,70 @@ app.use((err, req, res, next) => {
 });
 
 // =======================
-// START SERVER
+// START SERVER — DATABASE FIRST
 // =======================
 
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server Running On Port ${PORT}`);
-  console.log(`🌍 Health check: http://localhost:${PORT}/`);
-  console.log(`👑 Owner API:    http://localhost:${PORT}/api/owner/actions`);
-  console.log(`💬 ALEX Chat:    http://localhost:${PORT}/api/alex/chat`);
-});
-
-// =======================
-// BACKGROUND INIT — with DB connect retry
-// =======================
-
-(async () => {
-  // DB connect with retry — transient network glitches on Render/Railway
-  // should not leave the server permanently disconnected.
+async function startServer() {
   const MAX_DB_RETRIES = 5;
   let connected = false;
+
   for (let attempt = 1; attempt <= MAX_DB_RETRIES; attempt++) {
     try {
+      console.log(
+        `🔌 MongoDB connection attempt ${attempt}/${MAX_DB_RETRIES}...`
+      );
+
       await connectDB();
+
+      const mongoose = require("mongoose");
+
+      if (mongoose.connection.readyState !== 1) {
+        throw new Error("MongoDB connection is not ready");
+      }
+
       connected = true;
+      console.log("✅ MongoDB connection verified");
       break;
     } catch (err) {
-      console.error(`⚠️ DB connect attempt ${attempt}/${MAX_DB_RETRIES} failed: ${err.message}`);
-      if (attempt < MAX_DB_RETRIES) await new Promise(r => setTimeout(r, 5000 * attempt));
+      console.error(
+        `❌ MongoDB attempt ${attempt}/${MAX_DB_RETRIES} failed:`,
+        err.message
+      );
+
+      if (attempt < MAX_DB_RETRIES) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, 5000 * attempt)
+        );
+      }
     }
   }
+
   if (!connected) {
-    console.error("❌ DB connect failed after retries — server running WITHOUT database. Routes needing DB will fail until restart.");
+    console.error(
+      "❌ FATAL: MongoDB connection failed. Server will not start."
+    );
+    process.exitCode = 1;
+    return;
   }
+
+  const server = app.listen(PORT, () => {
+    console.log(`🚀 Server Running On Port ${PORT}`);
+    console.log(`🌍 Health check: http://localhost:${PORT}/`);
+    console.log(`👑 Owner API:    http://localhost:${PORT}/api/owner/actions`);
+    console.log(`💬 ALEX Chat:    http://localhost:${PORT}/api/alex/chat`);
+    console.log("✅ MongoDB connected; API is ready.");
+  });
+
+  server.on("error", (err) => {
+    console.error("❌ HTTP server error:", err.message);
+    process.exitCode = 1;
+  });
 
   try {
     startBankRefreshCron();
+    console.log("✅ Question bank refresh cron started");
   } catch (err) {
     console.error("⚠️ Cron setup warning:", err.message);
   }
@@ -379,15 +408,20 @@ app.listen(PORT, () => {
     const { initAlex } = require("./alex/index");
     await initAlex();
     console.log("🤖 ALEX is now running — monitoring all systems");
-  } catch (alexErr) {
-    console.error("⚠️ ALEX init warning (server continues):", alexErr.message);
+  } catch (err) {
+    console.error("⚠️ ALEX init warning (server continues):", err.message);
   }
 
   try {
     const filePath = path.join(__dirname, "uploads", "questions.json");
     await bulkUploader(filePath);
-    console.log("Upload Completed");
+    console.log("✅ Question bulk upload completed");
   } catch (err) {
     console.error("⚠️ Bulk upload warning:", err.message);
   }
-})();
+}
+
+startServer().catch((err) => {
+  console.error("❌ Fatal server startup error:", err);
+  process.exitCode = 1;
+});
